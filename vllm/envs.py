@@ -1412,6 +1412,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_USE_TRTLLM_ATTENTION" not in os.environ
         else os.environ["VLLM_USE_TRTLLM_ATTENTION"].lower() in ("1", "true")
     ),
+    # Optional: override TensorRT-LLM bindings path for thop attention.
+    "VLLM_TRTLLM_BINDINGS_PATH": lambda: os.getenv("VLLM_TRTLLM_BINDINGS_PATH"),
+    # Optional: TRTLLM shared library directory (libtensorrt_llm.so, etc.).
+    "VLLM_TRTLLM_LIB_DIR": lambda: os.getenv("VLLM_TRTLLM_LIB_DIR"),
+    # Disable loading TRTLLM bindings.
+    "VLLM_TRTLLM_DISABLE": lambda: bool(
+        int(os.getenv("VLLM_TRTLLM_DISABLE", "0"))
+    ),
     # If set to 1, when we use fp8 kv, we do not quantize Q to fp8
     "VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION": lambda: bool(
         int(os.getenv("VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION", "0"))
