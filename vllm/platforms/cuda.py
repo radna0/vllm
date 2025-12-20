@@ -10,10 +10,12 @@ from functools import cache, wraps
 from typing import TYPE_CHECKING, Optional, TypeVar
 
 import torch
+from packaging.version import Version
 from typing_extensions import ParamSpec
 
 # import custom ops, trigger op registration
 import vllm._C  # noqa
+import vllm.envs as envs
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
@@ -48,7 +50,7 @@ def _get_backend_priorities(
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     if use_mla:
-        if device_capability.major == 10:
+        if device_capability.major in (10, 12):
             return [
                 AttentionBackendEnum.CUTLASS_MLA,
                 AttentionBackendEnum.FLASHINFER_MLA,
@@ -66,7 +68,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
-        if device_capability.major == 10:
+        if device_capability.major in (10, 12):
             return [
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
@@ -159,6 +161,21 @@ class CudaPlatformBase(Platform):
         cache_config = vllm_config.cache_config
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = 16
+        if cache_config and cache_config.cache_dtype == "nvfp4":
+            if not cls.is_device_capability_ge(DeviceCapability(10, 0)):
+                raise ValueError(
+                    "NVFP4 KV cache requires a Blackwell-class GPU "
+                    "(compute capability >= 10.0)."
+                )
+            cuda_version = torch.version.cuda
+            if cuda_version is None or Version(cuda_version) < Version("12.8"):
+                raise ValueError(
+                    "NVFP4 KV cache requires CUDA >= 12.8."
+                )
+            if envs.VLLM_KV_CACHE_LAYOUT not in (None, "NHD"):
+                raise ValueError(
+                    "NVFP4 KV cache currently requires VLLM_KV_CACHE_LAYOUT=NHD."
+                )
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing

@@ -109,6 +109,13 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str == "nvfp4":
+            if head_size % 16 != 0:
+                raise ValueError(
+                    "NVFP4 KV cache requires head_size to be a multiple of 16."
+                )
+            packed_head_size = head_size // 8  # 8 values per uint32
+            return (2, num_blocks, block_size, num_kv_heads, packed_head_size)
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod

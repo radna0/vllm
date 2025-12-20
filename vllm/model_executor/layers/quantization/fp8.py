@@ -131,14 +131,26 @@ def get_fp8_moe_backend(
     """
     if with_lora_support:
         return Fp8MoeBackend.TRITON
-    # Prefer FlashInfer backends on supported GPUs; allow SM90 and SM100.
+    # Prefer FlashInfer backends on supported GPUs; allow SM90/SM100/SM120.
+    use_flashinfer_fp8 = envs.VLLM_USE_FLASHINFER_MOE_FP8
+    if (
+        not envs.is_set("VLLM_USE_FLASHINFER_MOE_FP8")
+        and current_platform.is_device_capability_family(120)
+    ):
+        use_flashinfer_fp8 = True
+        logger.info_once(
+            "Enabling FlashInfer FP8 MoE by default on SM120. "
+            "Set VLLM_USE_FLASHINFER_MOE_FP8=0 to disable.",
+            scope="local",
+        )
     if (
         current_platform.is_cuda()
         and (
             current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability(90)
         )
-        and envs.VLLM_USE_FLASHINFER_MOE_FP8
+        and use_flashinfer_fp8
         and has_flashinfer_moe()
     ):
         backend = get_flashinfer_moe_backend()
@@ -146,14 +158,19 @@ def get_fp8_moe_backend(
             logger.info_once("Using FlashInfer FP8 MoE TRTLLM backend for SM100")
             return Fp8MoeBackend.FLASHINFER_TRTLLM
         else:
-            if block_quant and current_platform.is_device_capability_family(100):
+            if block_quant and (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            ):
                 raise ValueError(
                     "FlashInfer FP8 MoE throughput backend does not "
                     "support block quantization. Please use "
                     "VLLM_FLASHINFER_MOE_BACKEND=latency "
                     "instead."
                 )
-            logger.info_once("Using FlashInfer FP8 MoE CUTLASS backend for SM90/SM100")
+            logger.info_once(
+                "Using FlashInfer FP8 MoE CUTLASS backend for SM90/SM100/SM120"
+            )
             return Fp8MoeBackend.FLASHINFER_CUTLASS
 
     # weight-only path for older GPUs without native FP8

@@ -13,11 +13,13 @@
   #include "quantization/w8a8/fp8/amd/quant_utils.cuh"
 #else
   #include "quantization/w8a8/fp8/nvidia/quant_utils.cuh"
+  #include "quantization/fp4/nvfp4_utils.cuh"
 #endif
 
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <type_traits>
 
 #ifdef USE_ROCM
   #include <hip/hip_bf16.h>
@@ -357,6 +359,284 @@ __global__ void reshape_and_cache_flash_kernel(
     }
   }
 }
+
+#ifndef USE_ROCM
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+template <typename scalar_t>
+__global__ void reshape_and_cache_flash_nvfp4_kernel(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    uint32_t* __restrict__ key_cache,    // [num_blocks, block_size, num_heads,
+                                         // packed_head_size]
+    uint32_t* __restrict__ value_cache,  // same as above
+    uint8_t* __restrict__ k_scale_cache,  // [num_blocks, block_size, num_heads,
+                                          // head_size/16]
+    uint8_t* __restrict__ v_scale_cache,  // same as above
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t block_stride, const int64_t page_stride,
+    const int64_t head_stride, const int64_t key_stride,
+    const int64_t value_stride, const int64_t scale_block_stride,
+    const int64_t scale_page_stride, const int64_t scale_head_stride,
+    const int num_heads, const int head_size, const int block_size) {
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int col_idx = threadIdx.x;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+  const int packed_head_size = head_size / 8;
+  const bool in_bounds = col_idx < packed_head_size;
+
+  using cuda_type = typename vllm::CUDATypeConverter<scalar_t>::Type;
+  using Packed = vllm::PackedVec<cuda_type>;
+
+  Packed key_vec{};
+  Packed value_vec{};
+  if (in_bounds) {
+    const cuda_type* __restrict__ key_src =
+        reinterpret_cast<const cuda_type*>(key + token_idx * key_stride +
+                                           head_idx * head_size + col_idx * 8);
+    const cuda_type* __restrict__ value_src =
+        reinterpret_cast<const cuda_type*>(value + token_idx * value_stride +
+                                           head_idx * head_size + col_idx * 8);
+    key_vec = reinterpret_cast<const Packed*>(key_src)[0];
+    value_vec = reinterpret_cast<const Packed*>(value_src)[0];
+  }
+
+  uint32_t* __restrict__ key_dst =
+      key_cache + block_idx * block_stride + block_offset * page_stride +
+      head_idx * head_stride;
+  uint32_t* __restrict__ value_dst =
+      value_cache + block_idx * block_stride + block_offset * page_stride +
+      head_idx * head_stride;
+
+  uint8_t* __restrict__ k_scale_dst =
+      k_scale_cache + block_idx * scale_block_stride +
+      block_offset * scale_page_stride + head_idx * scale_head_stride;
+
+  const int scale_elems = head_size / 16;
+  const int scale_idx = col_idx / 2;
+  uint8_t* k_scale_ptr =
+      (in_bounds && col_idx % 2 == 0) ? (k_scale_dst + scale_idx) : nullptr;
+  uint8_t* v_scale_ptr = nullptr;
+  if (in_bounds && col_idx % 2 == 0) {
+    const int token_group = static_cast<int>(block_offset) / 4;
+    const int token_mod = static_cast<int>(block_offset) % 4;
+    const int interleaved_idx =
+        token_group * (4 * scale_elems) + scale_idx * 4 + token_mod;
+    const int interleaved_token = interleaved_idx / scale_elems;
+    const int interleaved_scale = interleaved_idx - interleaved_token * scale_elems;
+    v_scale_ptr = v_scale_cache + block_idx * scale_block_stride +
+                  interleaved_token * scale_page_stride +
+                  head_idx * scale_head_stride + interleaved_scale;
+  }
+
+  uint32_t k_packed =
+      vllm::cvt_warp_fp16_to_fp4<cuda_type>(key_vec, 1.0f, k_scale_ptr);
+  uint32_t v_packed =
+      vllm::cvt_warp_fp16_to_fp4<cuda_type>(value_vec, 1.0f, v_scale_ptr);
+
+  if (in_bounds) {
+    key_dst[col_idx] = k_packed;
+    value_dst[col_idx] = v_packed;
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ float nvfp4_to_float(T val) {
+  if constexpr (std::is_same_v<T, half>) {
+    return __half2float(val);
+  } else {
+    return __bfloat162float(val);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ T nvfp4_from_float(float val) {
+  if constexpr (std::is_same_v<T, half>) {
+    return __float2half_rn(val);
+  } else {
+    return __float2bfloat16_rn(val);
+  }
+}
+
+template <typename T, bool IS_NEOX>
+__device__ __forceinline__ T rope_rotate_value(const T* __restrict__ base,
+                                               int idx, int rot_dim,
+                                               const T* __restrict__ cos_ptr,
+                                               const T* __restrict__ sin_ptr) {
+  if (rot_dim == 0 || idx >= rot_dim) {
+    return base[idx];
+  }
+  if constexpr (IS_NEOX) {
+    const int half = rot_dim / 2;
+    const int rot_idx = idx % half;
+    const float cos = nvfp4_to_float(cos_ptr[rot_idx]);
+    const float sin = nvfp4_to_float(sin_ptr[rot_idx]);
+    if (idx < half) {
+      const float x = nvfp4_to_float(base[idx]);
+      const float y = nvfp4_to_float(base[idx + half]);
+      return nvfp4_from_float<T>(x * cos - y * sin);
+    }
+    const float x = nvfp4_to_float(base[idx - half]);
+    const float y = nvfp4_to_float(base[idx]);
+    return nvfp4_from_float<T>(y * cos + x * sin);
+  } else {
+    const int rot_idx = idx / 2;
+    const float cos = nvfp4_to_float(cos_ptr[rot_idx]);
+    const float sin = nvfp4_to_float(sin_ptr[rot_idx]);
+    if ((idx & 1) == 0) {
+      const float x = nvfp4_to_float(base[idx]);
+      const float y = nvfp4_to_float(base[idx + 1]);
+      return nvfp4_from_float<T>(x * cos - y * sin);
+    }
+    const float x = nvfp4_to_float(base[idx - 1]);
+    const float y = nvfp4_to_float(base[idx]);
+    return nvfp4_from_float<T>(y * cos + x * sin);
+  }
+}
+
+template <typename scalar_t, bool IS_NEOX>
+__global__ void rope_and_cache_flash_nvfp4_kernel(
+    scalar_t* __restrict__ query,           // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ key,       // [num_tokens, num_kv_heads, head_size]
+    const scalar_t* __restrict__ value,     // [num_tokens, num_kv_heads, head_size]
+    uint32_t* __restrict__ key_cache,       // [num_blocks, block_size, num_kv_heads,
+                                            // packed_head_size]
+    uint32_t* __restrict__ value_cache,     // same as above
+    uint8_t* __restrict__ k_scale_cache,    // [num_blocks, block_size, num_kv_heads,
+                                            // head_size/16]
+    uint8_t* __restrict__ v_scale_cache,    // same as above
+    const int64_t* __restrict__ slot_mapping,  // [num_tokens]
+    const int64_t* __restrict__ positions,     // [num_tokens]
+    const scalar_t* __restrict__ cos_sin_cache,  // [max_pos, rot_dim]
+    const int rot_dim, const int64_t block_stride,
+    const int64_t page_stride, const int64_t head_stride,
+    const int64_t key_stride, const int64_t value_stride,
+    const int64_t query_stride, const int64_t scale_block_stride,
+    const int64_t scale_page_stride, const int64_t scale_head_stride,
+    const int num_heads, const int num_kv_heads, const int head_size,
+    const int block_size) {
+  const int64_t token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int col_idx = threadIdx.x;
+
+  const int packed_head_size = head_size / 8;
+  const bool in_bounds = col_idx < packed_head_size;
+
+  const int64_t slot_idx = slot_mapping[token_idx];
+  const bool do_token = slot_idx >= 0;
+  const bool do_query = do_token && (head_idx < num_heads);
+  const bool do_cache = do_token && (head_idx < num_kv_heads);
+
+  using cuda_type = typename vllm::CUDATypeConverter<scalar_t>::Type;
+  using Packed = vllm::PackedVec<cuda_type>;
+
+  const cuda_type* cos_ptr = nullptr;
+  const cuda_type* sin_ptr = nullptr;
+  if (do_token) {
+    const int64_t pos = positions[token_idx];
+    const cuda_type* cos_sin_ptr =
+        reinterpret_cast<const cuda_type*>(cos_sin_cache) + pos * rot_dim;
+    cos_ptr = cos_sin_ptr;
+    sin_ptr = cos_sin_ptr + (rot_dim / 2);
+  }
+
+  // Rotate query in-place using a read-then-write phase to avoid
+  // cross-thread hazards for GPT-NeoX.
+  cuda_type query_out[8];
+  if (do_query && in_bounds) {
+    const cuda_type* __restrict__ q_base =
+        reinterpret_cast<const cuda_type*>(query) +
+        token_idx * query_stride + head_idx * head_size;
+    const int base_idx = col_idx * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      query_out[i] =
+          rope_rotate_value<cuda_type, IS_NEOX>(q_base, base_idx + i, rot_dim,
+                                                cos_ptr, sin_ptr);
+    }
+  }
+  __syncthreads();
+  if (do_query && in_bounds) {
+    cuda_type* __restrict__ q_base =
+        reinterpret_cast<cuda_type*>(query) + token_idx * query_stride +
+        head_idx * head_size;
+    const int base_idx = col_idx * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      q_base[base_idx + i] = query_out[i];
+    }
+  }
+
+  Packed key_vec{};
+  Packed value_vec{};
+  if (do_cache && in_bounds) {
+    const cuda_type* __restrict__ k_base =
+        reinterpret_cast<const cuda_type*>(key) + token_idx * key_stride +
+        head_idx * head_size;
+    const cuda_type* __restrict__ v_base =
+        reinterpret_cast<const cuda_type*>(value) + token_idx * value_stride +
+        head_idx * head_size;
+    cuda_type* k_out = reinterpret_cast<cuda_type*>(&key_vec);
+    cuda_type* v_out = reinterpret_cast<cuda_type*>(&value_vec);
+    const int base_idx = col_idx * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int idx = base_idx + i;
+      k_out[i] =
+          rope_rotate_value<cuda_type, IS_NEOX>(k_base, idx, rot_dim, cos_ptr,
+                                                sin_ptr);
+      v_out[i] = v_base[idx];
+    }
+  }
+
+  uint32_t* __restrict__ key_dst = nullptr;
+  uint32_t* __restrict__ value_dst = nullptr;
+  uint8_t* __restrict__ k_scale_ptr = nullptr;
+  uint8_t* __restrict__ v_scale_ptr = nullptr;
+  if (do_cache) {
+    const int64_t block_idx = slot_idx / block_size;
+    const int64_t block_offset = slot_idx % block_size;
+    key_dst = key_cache + block_idx * block_stride +
+              block_offset * page_stride + head_idx * head_stride;
+    value_dst = value_cache + block_idx * block_stride +
+                block_offset * page_stride + head_idx * head_stride;
+
+    const int scale_elems = head_size / 16;
+    const int scale_idx = col_idx / 2;
+    if (in_bounds && (col_idx % 2 == 0)) {
+      k_scale_ptr = k_scale_cache + block_idx * scale_block_stride +
+                    block_offset * scale_page_stride +
+                    head_idx * scale_head_stride + scale_idx;
+      const int token_group = static_cast<int>(block_offset) / 4;
+      const int token_mod = static_cast<int>(block_offset) % 4;
+      const int interleaved_idx =
+          token_group * (4 * scale_elems) + scale_idx * 4 + token_mod;
+      const int interleaved_token = interleaved_idx / scale_elems;
+      const int interleaved_scale = interleaved_idx - interleaved_token * scale_elems;
+      v_scale_ptr = v_scale_cache + block_idx * scale_block_stride +
+                    interleaved_token * scale_page_stride +
+                    head_idx * scale_head_stride + interleaved_scale;
+    }
+  }
+
+  uint32_t k_packed =
+      vllm::cvt_warp_fp16_to_fp4<cuda_type>(key_vec, 1.0f, k_scale_ptr);
+  uint32_t v_packed =
+      vllm::cvt_warp_fp16_to_fp4<cuda_type>(value_vec, 1.0f, v_scale_ptr);
+
+  if (do_cache && in_bounds) {
+    key_dst[col_idx] = k_packed;
+    value_dst[col_idx] = v_packed;
+  }
+}
+#endif  // ENABLE_NVFP4_SM100 || ENABLE_NVFP4_SM120
+#endif  // USE_ROCM
 
 template <typename scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_kernel(
@@ -734,13 +1014,240 @@ void reshape_and_cache_flash(
   int64_t head_stride = key_cache.stride(2);
   TORCH_CHECK(key_cache.stride(0) == value_cache.stride(0));
 
-  dim3 grid(num_tokens);
-  dim3 block(std::min(num_heads * head_size, 512));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  if (kv_cache_dtype == "nvfp4") {
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+    TORCH_CHECK(head_size % 16 == 0,
+                "NVFP4 KV cache requires head_size to be a multiple of 16.");
+    TORCH_CHECK(block_size % 4 == 0,
+                "NVFP4 KV cache requires block_size to be a multiple of 4.");
+    int packed_head_size = head_size / 8;
+    int64_t scale_block_stride = k_scale.stride(0);
+    int64_t scale_page_stride = k_scale.stride(1);
+    int64_t scale_head_stride = k_scale.stride(2);
+    TORCH_CHECK(k_scale.stride(3) == 1 && v_scale.stride(3) == 1,
+                "NVFP4 scale tensor must be contiguous in the last dimension.");
+    TORCH_CHECK(k_scale.stride(0) == v_scale.stride(0));
+    TORCH_CHECK(k_scale.stride(1) == v_scale.stride(1));
+    TORCH_CHECK(k_scale.stride(2) == v_scale.stride(2));
+    TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Int,
+                "NVFP4 key_cache must be int32.");
+    TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Int,
+                "NVFP4 value_cache must be int32.");
+    TORCH_CHECK(packed_head_size <= 32,
+                "NVFP4 packed head size must be <= 32.");
+
+    dim3 grid(num_tokens, num_heads);
+    dim3 block(32);
+    VLLM_DISPATCH_HALF_TYPES(key.scalar_type(),
+                             "reshape_and_cache_flash_nvfp4_kernel", [&] {
+                               vllm::reshape_and_cache_flash_nvfp4_kernel<
+                                   scalar_t>
+                                   <<<grid, block, 0, stream>>>(
+                                       reinterpret_cast<scalar_t*>(
+                                           key.data_ptr()),
+                                       reinterpret_cast<scalar_t*>(
+                                           value.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           key_cache.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           value_cache.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           k_scale.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           v_scale.data_ptr()),
+                                       slot_mapping.data_ptr<int64_t>(),
+                                       block_stride, page_stride, head_stride,
+                                       key_stride, value_stride,
+                                       scale_block_stride, scale_page_stride,
+                                       scale_head_stride, num_heads, head_size,
+                                       block_size);
+                             });
+#else
+    TORCH_CHECK_NOT_IMPLEMENTED(
+        false, "NVFP4 KV cache kernels are not compiled.");
+#endif
+    return;
+  }
+
+  dim3 grid(num_tokens);
+  dim3 block(std::min(num_heads * head_size, 512));
   DISPATCH_BY_KV_CACHE_DTYPE(key.dtype(), kv_cache_dtype,
                              CALL_RESHAPE_AND_CACHE_FLASH);
+}
+
+void fused_rope_and_cache_flash_nvfp4(
+    torch::Tensor& query,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key,        // [num_tokens, num_kv_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_kv_heads, head_size]
+    torch::Tensor& key_cache,  // [num_blocks, block_size, num_kv_heads,
+                               // packed_head_size]
+    torch::Tensor& value_cache,  // same as above
+    torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
+    torch::Tensor& positions,     // [num_tokens]
+    torch::Tensor& cos_sin_cache,  // [max_pos, rot_dim]
+    bool is_neox, torch::Tensor& k_scale, torch::Tensor& v_scale) {
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
+              "query, key, and value must be on CUDA");
+  TORCH_CHECK(query.is_contiguous() && key.is_contiguous() &&
+                  value.is_contiguous(),
+              "query, key, and value must be contiguous");
+  TORCH_CHECK(positions.device() == query.device() &&
+                  slot_mapping.device() == query.device() &&
+                  cos_sin_cache.device() == query.device() &&
+                  key_cache.device() == query.device() &&
+                  value_cache.device() == query.device() &&
+                  k_scale.device() == query.device() &&
+                  v_scale.device() == query.device(),
+              "positions, slot_mapping, and cos_sin_cache must be on the same device as query");
+  TORCH_CHECK(query.dim() == 3 && key.dim() == 3 && value.dim() == 3,
+              "query, key, and value must be 3D tensors");
+  TORCH_CHECK(query.scalar_type() == key.scalar_type() &&
+                  key.scalar_type() == value.scalar_type(),
+              "query, key, and value must have the same dtype");
+  TORCH_CHECK(query.scalar_type() == at::ScalarType::Half ||
+                  query.scalar_type() == at::ScalarType::BFloat16,
+              "NVFP4 fused RoPE requires FP16 or BF16 inputs");
+  TORCH_CHECK(cos_sin_cache.scalar_type() == query.scalar_type(),
+              "cos_sin_cache must match query dtype");
+  TORCH_CHECK(positions.scalar_type() == at::ScalarType::Long,
+              "positions must be int64");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Long,
+              "slot_mapping must be int64");
+  TORCH_CHECK(slot_mapping.is_contiguous(), "slot_mapping must be contiguous");
+  TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
+  TORCH_CHECK(cos_sin_cache.is_contiguous(),
+              "cos_sin_cache must be contiguous");
+  TORCH_CHECK(cos_sin_cache.dim() == 2,
+              "cos_sin_cache must be 2D");
+
+  int num_tokens = slot_mapping.size(0);
+  TORCH_CHECK(positions.numel() == num_tokens,
+              "positions and slot_mapping must have the same number of tokens");
+
+  int num_heads = query.size(1);
+  int num_kv_heads = key.size(1);
+  int head_size = query.size(2);
+  TORCH_CHECK(key.size(2) == head_size && value.size(2) == head_size,
+              "key/value head_size must match query head_size");
+
+  int rot_dim = cos_sin_cache.size(1);
+  TORCH_CHECK(rot_dim <= head_size,
+              "rotary dimension must be <= head_size");
+  TORCH_CHECK(rot_dim % 2 == 0,
+              "rotary dimension must be even");
+
+  int block_size = key_cache.size(1);
+  TORCH_CHECK(head_size % 16 == 0,
+              "NVFP4 KV cache requires head_size to be a multiple of 16.");
+  TORCH_CHECK(head_size <= 256,
+              "NVFP4 KV cache requires head_size <= 256.");
+  TORCH_CHECK(block_size % 4 == 0,
+              "NVFP4 KV cache requires block_size to be a multiple of 4.");
+  TORCH_CHECK(query.stride(1) == head_size && key.stride(1) == head_size &&
+                  value.stride(1) == head_size,
+              "query/key/value must be contiguous in head dimension");
+
+  TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Int,
+              "NVFP4 key_cache must be int32.");
+  TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Int,
+              "NVFP4 value_cache must be int32.");
+
+  TORCH_CHECK(k_scale.scalar_type() == at::ScalarType::Float8_e4m3fn &&
+                  v_scale.scalar_type() == at::ScalarType::Float8_e4m3fn,
+              "NVFP4 scale tensors must be float8_e4m3fn");
+  TORCH_CHECK(k_scale.stride(3) == 1 && v_scale.stride(3) == 1,
+              "NVFP4 scale tensor must be contiguous in the last dimension.");
+  TORCH_CHECK(k_scale.stride(0) == v_scale.stride(0));
+  TORCH_CHECK(k_scale.stride(1) == v_scale.stride(1));
+  TORCH_CHECK(k_scale.stride(2) == v_scale.stride(2));
+
+  int64_t query_stride = query.stride(0);
+  int64_t key_stride = key.stride(0);
+  int64_t value_stride = value.stride(0);
+  int64_t block_stride = key_cache.stride(0);
+  int64_t page_stride = key_cache.stride(1);
+  int64_t head_stride = key_cache.stride(2);
+  int64_t scale_block_stride = k_scale.stride(0);
+  int64_t scale_page_stride = k_scale.stride(1);
+  int64_t scale_head_stride = k_scale.stride(2);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  int grid_heads = std::max(num_heads, num_kv_heads);
+  dim3 grid(num_tokens, grid_heads);
+  dim3 block(32);
+
+  VLLM_DISPATCH_HALF_TYPES(query.scalar_type(),
+                           "rope_and_cache_flash_nvfp4_kernel", [&] {
+                             if (is_neox) {
+                               vllm::rope_and_cache_flash_nvfp4_kernel<
+                                   scalar_t, true>
+                                   <<<grid, block, 0, stream>>>(
+                                       reinterpret_cast<scalar_t*>(
+                                           query.data_ptr()),
+                                       reinterpret_cast<const scalar_t*>(
+                                           key.data_ptr()),
+                                       reinterpret_cast<const scalar_t*>(
+                                           value.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           key_cache.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           value_cache.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           k_scale.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           v_scale.data_ptr()),
+                                       slot_mapping.data_ptr<int64_t>(),
+                                       positions.data_ptr<int64_t>(),
+                                       reinterpret_cast<const scalar_t*>(
+                                           cos_sin_cache.data_ptr()),
+                                       rot_dim, block_stride, page_stride,
+                                       head_stride, key_stride, value_stride,
+                                       query_stride, scale_block_stride,
+                                       scale_page_stride, scale_head_stride,
+                                       num_heads, num_kv_heads, head_size,
+                                       block_size);
+                             } else {
+                               vllm::rope_and_cache_flash_nvfp4_kernel<
+                                   scalar_t, false>
+                                   <<<grid, block, 0, stream>>>(
+                                       reinterpret_cast<scalar_t*>(
+                                           query.data_ptr()),
+                                       reinterpret_cast<const scalar_t*>(
+                                           key.data_ptr()),
+                                       reinterpret_cast<const scalar_t*>(
+                                           value.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           key_cache.data_ptr()),
+                                       reinterpret_cast<uint32_t*>(
+                                           value_cache.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           k_scale.data_ptr()),
+                                       reinterpret_cast<uint8_t*>(
+                                           v_scale.data_ptr()),
+                                       slot_mapping.data_ptr<int64_t>(),
+                                       positions.data_ptr<int64_t>(),
+                                       reinterpret_cast<const scalar_t*>(
+                                           cos_sin_cache.data_ptr()),
+                                       rot_dim, block_stride, page_stride,
+                                       head_stride, key_stride, value_stride,
+                                       query_stride, scale_block_stride,
+                                       scale_page_stride, scale_head_stride,
+                                       num_heads, num_kv_heads, head_size,
+                                       block_size);
+                             }
+                           });
+#else
+  TORCH_CHECK_NOT_IMPLEMENTED(
+      false, "NVFP4 KV cache kernels are not compiled.");
+#endif
 }
 
 // KV_T is the data type of key and value tensors.

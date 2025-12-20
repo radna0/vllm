@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+import time
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -8,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import (
     CompilationMode,
@@ -76,6 +78,12 @@ class EagleProposer:
         self.num_speculative_tokens = self.speculative_config.num_speculative_tokens
         self.max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.token_arange_np = np.arange(self.max_num_tokens)
+        self._trace_enabled = envs.VLLM_SPEC_DECODE_TRACE
+        self._trace_interval_s = envs.VLLM_SPEC_DECODE_TRACE_INTERVAL
+        self._trace_sync = envs.VLLM_SPEC_DECODE_TRACE_SYNC
+        self._trace_last_log = time.monotonic()
+        self._trace_draft_s = 0.0
+        self._trace_draft_calls = 0
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
@@ -222,6 +230,33 @@ class EagleProposer:
         else:
             self.positions[:num_tokens] = positions
 
+    def _record_draft_latency(self, start_time: float | None) -> None:
+        if not self._trace_enabled or start_time is None:
+            return
+        if self._trace_sync:
+            torch.cuda.synchronize()
+        duration = time.perf_counter() - start_time
+        self._trace_draft_s += duration
+        self._trace_draft_calls += 1
+        now = time.monotonic()
+        if self._trace_interval_s > 0 and (
+            now - self._trace_last_log
+        ) < self._trace_interval_s:
+            return
+        avg_ms = (
+            (self._trace_draft_s / self._trace_draft_calls) * 1e3
+            if self._trace_draft_calls
+            else 0.0
+        )
+        logger.info(
+            "EAGLE draft latency: avg=%.3f ms over %d calls",
+            avg_ms,
+            self._trace_draft_calls,
+        )
+        self._trace_last_log = now
+        self._trace_draft_s = 0.0
+        self._trace_draft_calls = 0
+
     def propose(
         self,
         # [num_tokens]
@@ -237,6 +272,12 @@ class EagleProposer:
         sampling_metadata: SamplingMetadata,
         mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        trace_start = None
+        if self._trace_enabled:
+            if self._trace_sync:
+                torch.cuda.synchronize()
+            trace_start = time.perf_counter()
+
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
 
@@ -347,6 +388,7 @@ class EagleProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
+            self._record_draft_latency(trace_start)
             return draft_token_ids.view(-1, 1)
 
         if self.uses_mrope:
@@ -373,6 +415,7 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
+            self._record_draft_latency(trace_start)
             return torch.cat(draft_token_ids_list, dim=1)
 
         draft_token_ids = logits.argmax(dim=-1)
@@ -528,6 +571,7 @@ class EagleProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        self._record_draft_latency(trace_start)
         return draft_token_ids
 
     def prepare_next_token_ids_cpu(

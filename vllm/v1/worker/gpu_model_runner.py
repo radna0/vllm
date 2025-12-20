@@ -266,6 +266,95 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
 
 
+class _SpecDecodeTrace:
+    def __init__(self, interval_s: float, sync_cuda: bool) -> None:
+        self.interval_s = interval_s
+        self.sync_cuda = sync_cuda
+        self._reset()
+
+    def _reset(self, now: float | None = None) -> None:
+        if now is None:
+            now = time.monotonic()
+        self.last_log_time = now
+        self.verify_s = 0.0
+        self.draft_s = 0.0
+        self.bookkeep_s = 0.0
+        self.sync_s = 0.0
+        self.num_draft_tokens = 0
+        self.num_accept_tokens = 0
+        self.num_output_tokens = 0
+        self.num_steps = 0
+        self.num_draft_calls = 0
+
+    def sync(self) -> float:
+        if not self.sync_cuda:
+            return 0.0
+        start = time.perf_counter()
+        torch.cuda.synchronize()
+        return time.perf_counter() - start
+
+    def observe_verify(self, duration_s: float) -> None:
+        self.verify_s += duration_s
+
+    def observe_draft(self, duration_s: float) -> None:
+        self.draft_s += duration_s
+        self.num_draft_calls += 1
+
+    def observe_bookkeep(self, duration_s: float) -> None:
+        self.bookkeep_s += duration_s
+
+    def observe_sync(self, duration_s: float) -> None:
+        self.sync_s += duration_s
+
+    def observe_tokens(
+        self, draft_tokens: int, accepted_tokens: int, output_tokens: int
+    ) -> None:
+        self.num_steps += 1
+        self.num_draft_tokens += draft_tokens
+        self.num_accept_tokens += accepted_tokens
+        self.num_output_tokens += output_tokens
+
+    def maybe_log(self, attn_backends: str) -> None:
+        now = time.monotonic()
+        elapsed = now - self.last_log_time
+        if elapsed < self.interval_s:
+            return
+        if self.num_steps == 0:
+            self._reset(now)
+            return
+        output_tps = self.num_output_tokens / elapsed if elapsed > 0 else 0.0
+        accepted_tps = self.num_accept_tokens / elapsed if elapsed > 0 else 0.0
+        draft_tps = self.num_draft_tokens / elapsed if elapsed > 0 else 0.0
+        acceptance_rate = (
+            (self.num_accept_tokens / self.num_draft_tokens) * 100.0
+            if self.num_draft_tokens > 0
+            else float("nan")
+        )
+        verify_ms = (self.verify_s / self.num_steps) * 1e3
+        draft_ms = (
+            (self.draft_s / self.num_draft_calls) * 1e3
+            if self.num_draft_calls
+            else 0.0
+        )
+        bookkeep_ms = (self.bookkeep_s / self.num_steps) * 1e3
+        sync_ms = (self.sync_s / self.num_steps) * 1e3
+        logger.info(
+            "SpecDecode trace: backends=%s steps=%d output_tps=%.2f "
+            "accepted_tps=%.2f draft_tps=%.2f accept_rate=%.1f%% "
+            "verify_ms=%.3f draft_ms=%.3f bookkeep_ms=%.3f sync_ms=%.3f",
+            attn_backends,
+            self.num_steps,
+            output_tps,
+            accepted_tps,
+            draft_tps,
+            acceptance_rate,
+            verify_ms,
+            draft_ms,
+            bookkeep_ms,
+            sync_ms,
+        )
+        self._reset(now)
+
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
@@ -284,6 +373,13 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._spec_decode_trace: _SpecDecodeTrace | None = None
+        self._spec_decode_trace_attn_backends: str | None = None
+        if envs.VLLM_SPEC_DECODE_TRACE and self.speculative_config is not None:
+            self._spec_decode_trace = _SpecDecodeTrace(
+                interval_s=envs.VLLM_SPEC_DECODE_TRACE_INTERVAL,
+                sync_cuda=envs.VLLM_SPEC_DECODE_TRACE_SYNC,
+            )
 
         from vllm.model_executor.models.utils import set_cpu_offload_max_bytes
 
@@ -365,6 +461,8 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        # Map of layer_name -> (k_scale_cache, v_scale_cache) for NVFP4 KV cache.
+        self.kv_cache_scales: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -3089,6 +3187,8 @@ class GPUModelRunner(
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+                spec_trace = self._spec_decode_trace
+                trace_active = spec_trace is not None and use_spec_decode
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
                 (attn_metadata, spec_decode_common_attn_metadata) = (
@@ -3124,6 +3224,12 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
+
+        verify_start = None
+        verify_sync_s = 0.0
+        if trace_active:
+            verify_sync_s += spec_trace.sync()
+            verify_start = time.perf_counter()
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3206,6 +3312,11 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if trace_active and verify_start is not None:
+            verify_sync_s += spec_trace.sync()
+            spec_trace.observe_sync(verify_sync_s)
+            spec_trace.observe_verify(time.perf_counter() - verify_start)
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -3266,9 +3377,19 @@ class GPUModelRunner(
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self.input_batch.prev_sampled_token_ids = None
+        spec_trace = self._spec_decode_trace
+        trace_active = (
+            spec_trace is not None
+            and len(scheduler_output.scheduled_spec_decode_tokens) > 0
+        )
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
+            draft_start = None
+            draft_sync_s = 0.0
+            if trace_active:
+                draft_sync_s += spec_trace.sync()
+                draft_start = time.perf_counter()
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
@@ -3280,6 +3401,10 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                 )
+            if trace_active and draft_start is not None:
+                draft_sync_s += spec_trace.sync()
+                spec_trace.observe_sync(draft_sync_s)
+                spec_trace.observe_draft(time.perf_counter() - draft_start)
 
         spec_config = self.speculative_config
         use_padded_batch_for_eagle = (
@@ -3325,6 +3450,11 @@ class GPUModelRunner(
                     next_token_ids, valid_sampled_tokens_count
                 )
 
+        bookkeep_start = None
+        bookkeep_sync_s = 0.0
+        if trace_active:
+            bookkeep_sync_s += spec_trace.sync()
+            bookkeep_start = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -3342,6 +3472,10 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
                 spec_decode_metadata,
             )
+        if trace_active and bookkeep_start is not None:
+            bookkeep_sync_s += spec_trace.sync()
+            spec_trace.observe_sync(bookkeep_sync_s)
+            spec_trace.observe_bookkeep(time.perf_counter() - bookkeep_start)
 
         if (
             self.speculative_config
@@ -3351,6 +3485,25 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        if trace_active and valid_sampled_token_ids:
+            num_draft_tokens = sum(
+                len(tokens)
+                for tokens in scheduler_output.scheduled_spec_decode_tokens.values()
+            )
+            num_accepted_tokens = 0
+            num_output_tokens = 0
+            for req_id in scheduler_output.scheduled_spec_decode_tokens:
+                out_idx = req_id_to_index_output_copy.get(req_id)
+                if out_idx is None:
+                    continue
+                out_tokens = valid_sampled_token_ids[out_idx]
+                num_output_tokens += len(out_tokens)
+                num_accepted_tokens += max(len(out_tokens) - 1, 0)
+            spec_trace.observe_tokens(
+                num_draft_tokens, num_accepted_tokens, num_output_tokens
+            )
+            spec_trace.maybe_log(self._get_spec_decode_attn_backend_names())
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -4813,6 +4966,17 @@ class GPUModelRunner(
         for i, attn_backend_map in enumerate(attention_backend_maps):
             self.attn_groups.append(create_attn_groups(attn_backend_map, i))
 
+    def _get_spec_decode_attn_backend_names(self) -> str:
+        if self._spec_decode_trace_attn_backends is None:
+            names: set[str] = set()
+            for attn_group in self.attn_groups:
+                module, qualname = attn_group.backend.full_cls_name()
+                names.add(f"{module}.{qualname}")
+            self._spec_decode_trace_attn_backends = (
+                ",".join(sorted(names)) if names else "unknown"
+            )
+        return self._spec_decode_trace_attn_backends
+
     def initialize_metadata_builders(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
     ) -> None:
@@ -5248,39 +5412,104 @@ class GPUModelRunner(
                         kv_cache_spec.block_size // kernel_block_size
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
+                    if kv_cache_spec.cache_dtype_str == "nvfp4":
+                        num_kv_heads = kv_cache_spec.num_kv_heads
+                        head_size = kv_cache_spec.head_size
+                        if head_size % 16 != 0:
+                            raise ValueError(
+                                "NVFP4 KV cache requires head_size to be a "
+                                "multiple of 16."
+                            )
+                        total_tokens = kernel_num_blocks * kernel_block_size
+                        data_bytes = total_tokens * num_kv_heads * head_size
+                        scale_elems_per_token = head_size // 16
+                        scale_bytes = (
+                            total_tokens * num_kv_heads * 2 * scale_elems_per_token
+                        )
+                        total_bytes = data_bytes + scale_bytes
+                        assert raw_tensor.numel() == total_bytes, (
+                            "NVFP4 KV cache size mismatch: "
+                            f"raw={raw_tensor.numel()} vs expected {total_bytes}"
+                        )
 
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
-                        kernel_num_blocks,
-                        kernel_block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
-                    )
-                    dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    # The allocation respects the backend-defined stride order
-                    # to ensure the semantic remains consistent for each
-                    # backend. We first obtain the generic kv cache shape and
-                    # then permute it according to the stride order which could
-                    # result in a non-contiguous tensor.
-                    kv_cache_shape = tuple(
-                        kv_cache_shape[i] for i in kv_cache_stride_order
-                    )
-                    # Maintain original KV shape view.
-                    inv_order = [
-                        kv_cache_stride_order.index(i)
-                        for i in range(len(kv_cache_stride_order))
-                    ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                        data_tensor = raw_tensor[:data_bytes].view(
+                            kv_cache_spec.dtype
+                        )
+                        scale_tensor = raw_tensor[data_bytes:total_bytes].view(
+                            torch.uint8
+                        ).view(torch.float8_e4m3fn)
+                        kv_cache_shape = attn_backend.get_kv_cache_shape(
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            num_kv_heads,
+                            head_size,
+                            cache_dtype_str=kv_cache_spec.cache_dtype_str,
+                        )
+                        try:
+                            kv_cache_stride_order = (
+                                attn_backend.get_kv_cache_stride_order()
+                            )
+                            assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                        except (AttributeError, NotImplementedError):
+                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                        kv_cache_shape = tuple(
+                            kv_cache_shape[i] for i in kv_cache_stride_order
+                        )
+                        inv_order = [
+                            kv_cache_stride_order.index(i)
+                            for i in range(len(kv_cache_stride_order))
+                        ]
+                        kv_caches[layer_name] = (
+                            data_tensor.view(kv_cache_shape).permute(*inv_order)
+                        )
+                        scale_shape = (
+                            2,
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            num_kv_heads,
+                            scale_elems_per_token,
+                        )
+                        scale_shape = tuple(
+                            scale_shape[i] for i in kv_cache_stride_order
+                        )
+                        scale_tensor = scale_tensor.view(scale_shape).permute(*inv_order)
+                        self.kv_cache_scales[layer_name] = (
+                            scale_tensor[0],
+                            scale_tensor[1],
+                        )
+                    else:
+                        kv_cache_shape = attn_backend.get_kv_cache_shape(
+                            kernel_num_blocks,
+                            kernel_block_size,
+                            kv_cache_spec.num_kv_heads,
+                            kv_cache_spec.head_size,
+                            cache_dtype_str=self.cache_config.cache_dtype,
+                        )
+                        dtype = kv_cache_spec.dtype
+                        try:
+                            kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
+                            assert len(kv_cache_stride_order) == len(kv_cache_shape)
+                        except (AttributeError, NotImplementedError):
+                            kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                        # The allocation respects the backend-defined stride order
+                        # to ensure the semantic remains consistent for each
+                        # backend. We first obtain the generic kv cache shape and
+                        # then permute it according to the stride order which could
+                        # result in a non-contiguous tensor.
+                        kv_cache_shape = tuple(
+                            kv_cache_shape[i] for i in kv_cache_stride_order
+                        )
+                        # Maintain original KV shape view.
+                        inv_order = [
+                            kv_cache_stride_order.index(i)
+                            for i in range(len(kv_cache_stride_order))
+                        ]
+                        kv_caches[layer_name] = (
+                            kv_cache_raw_tensors[layer_name]
+                            .view(dtype)
+                            .view(kv_cache_shape)
+                            .permute(*inv_order)
+                        )
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
@@ -5355,6 +5584,7 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
 
+        self.kv_cache_scales = {}
         # Try creating KV caches optimized for kv-connector transfers
         cache_dtype = self.cache_config.cache_dtype
         if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
@@ -5383,6 +5613,10 @@ class GPUModelRunner(
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
+            if target_layer_name in self.kv_cache_scales:
+                self.kv_cache_scales[layer_name] = self.kv_cache_scales[
+                    target_layer_name
+                ]
 
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
@@ -5393,6 +5627,12 @@ class GPUModelRunner(
             self.kv_caches,
             num_attn_module,
         )
+        if self.kv_cache_scales:
+            for layer_name, scales in self.kv_cache_scales.items():
+                layer = self.compilation_config.static_forward_context.get(layer_name)
+                if layer is None:
+                    continue
+                layer.kv_cache_k_scale, layer.kv_cache_v_scale = scales
         return kv_caches
 
     def maybe_add_kv_sharing_layers_to_kv_cache_groups(
@@ -5482,6 +5722,7 @@ class GPUModelRunner(
                     num_kv_heads=attn_module.num_kv_heads,
                     head_size=attn_module.head_size,
                     dtype=self.kv_cache_dtype,
+                    cache_dtype_str=self.cache_config.cache_dtype,
                 )
                 encoder_only_attn_specs[attn_spec].append(layer_name)
                 self.runner_only_attn_layers.add(layer_name)

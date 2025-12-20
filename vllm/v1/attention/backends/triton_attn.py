@@ -263,6 +263,7 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -287,6 +288,13 @@ class TritonAttentionBackend(AttentionBackend):
     ) -> tuple[int, ...]:
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str == "nvfp4":
+            if head_size % 16 != 0:
+                raise ValueError(
+                    "NVFP4 KV cache requires head_size to be a multiple of 16."
+                )
+            packed_head_size = head_size // 8
+            return (num_blocks, 2, block_size, num_kv_heads, packed_head_size)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -312,6 +320,25 @@ class TritonAttentionBackend(AttentionBackend):
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return True
+
+    @classmethod
+    def supports_combination(
+        cls,
+        head_size: int,
+        dtype: torch.dtype,
+        kv_cache_dtype: CacheDType | None,
+        block_size: int,
+        use_mla: bool,
+        has_sink: bool,
+        use_sparse: bool,
+        device_capability: DeviceCapability,
+    ) -> str | None:
+        if kv_cache_dtype == "nvfp4":
+            if head_size % 16 != 0:
+                return "nvfp4 requires head_size to be a multiple of 16"
+            if head_size // 8 > 32:
+                return "nvfp4 requires head_size <= 256"
+        return None
 
 
 class TritonAttentionImpl(AttentionImpl):
@@ -426,22 +453,44 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            if self.kv_cache_dtype.startswith("fp8"):
+            if self.kv_cache_dtype == "nvfp4":
+                torch.ops._C_cache_ops.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer.kv_cache_k_scale,
+                    layer.kv_cache_v_scale,
+                )
+            elif self.kv_cache_dtype.startswith("fp8"):
                 key_cache = key_cache.view(self.fp8_dtype)
                 value_cache = value_cache.view(self.fp8_dtype)
                 # triton kernel does not support uint8 kv_cache
                 #  (because some explicit casts (e.g. float8_e4m3fnuz)
                 #   are not supported)
-            triton_reshape_and_cache_flash(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
-                layer._k_scale,
-                layer._v_scale,
-            )
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
+            else:
+                triton_reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.slot_mapping,
+                    self.kv_cache_dtype,
+                    layer._k_scale,
+                    layer._v_scale,
+                )
 
         if self.kv_cache_dtype.startswith("fp8"):
             if key_cache.dtype != self.fp8_dtype:
@@ -464,6 +513,13 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+        use_nvfp4 = self.kv_cache_dtype == "nvfp4"
+        k_scale_cache = getattr(layer, "kv_cache_k_scale", None)
+        v_scale_cache = getattr(layer, "kv_cache_v_scale", None)
+        if use_nvfp4:
+            assert k_scale_cache is not None and v_scale_cache is not None, (
+                "NVFP4 KV cache requires k/v scale tensors."
+            )
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
 
         unified_attention(
@@ -492,6 +548,9 @@ class TritonAttentionImpl(AttentionImpl):
             sinks=self.sinks,
             output_scale=output_scale,
             mm_prefix_range=mm_prefix_range_tensor,
+            use_nvfp4=use_nvfp4,
+            k_scale_cache=k_scale_cache,
+            v_scale_cache=v_scale_cache,
         )
 
         return output

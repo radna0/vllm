@@ -53,7 +53,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutlass_fused_moe
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -118,11 +118,33 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
             return Mxfp4Backend.SM90_FI_MXFP4_BF16
         elif (
-            current_platform.is_device_capability_family(100)
+            current_platform.is_device_capability_family(120)
+            and has_flashinfer()
+            and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16
+        ):
+            logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM120")
+            return Mxfp4Backend.SM100_FI_MXFP4_BF16
+        elif (
+            (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
             and has_flashinfer()
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
         ):
-            logger.info_once("Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100")
+            logger.info_once(
+                "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM100/SM120"
+            )
+            return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
+        elif (
+            current_platform.is_device_capability_family(120)
+            and has_flashinfer()
+            and has_flashinfer_cutlass_fused_moe()
+        ):
+            logger.info_once(
+                "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM120 by default. "
+                "Set VLLM_USE_FLASHINFER_MOE_MXFP4_BF16=1 to force BF16."
+            )
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
         elif (
             current_platform.is_device_capability_family(100)
@@ -130,16 +152,20 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
         ):
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
-        elif current_platform.is_device_capability_family(100) and has_flashinfer():
+        elif (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        ) and has_flashinfer():
             logger.info_once(
-                "Using FlashInfer MXFP4 BF16 backend for SM100, "
-                "For faster performance on SM100, consider setting "
-                "VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1, though this may impact "
-                "accuracy."
+                "Using FlashInfer MXFP4 BF16 backend for SM100/SM120. "
+                "For SM100, consider VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 "
+                "(TRTLLM MXFP8, may impact accuracy). "
+                "For SM120, try VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1."
             )
             return Mxfp4Backend.SM100_FI_MXFP4_BF16
         elif (
             current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability(90)
         ) and not has_flashinfer():
             logger.warning_once(

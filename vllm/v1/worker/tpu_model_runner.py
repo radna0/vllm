@@ -618,6 +618,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            cache_dtype_str=cache_dtype_str,
                             sliding_window=attn_module.sliding_window,
                         )
                     else:
@@ -626,6 +627,7 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                             num_kv_heads=attn_module.num_kv_heads,
                             head_size=attn_module.head_size,
                             dtype=self.kv_cache_dtype,
+                            cache_dtype_str=cache_dtype_str,
                         )
                 elif attn_module.attn_type in (
                     AttentionType.ENCODER,

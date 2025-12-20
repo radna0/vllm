@@ -44,6 +44,9 @@ if TYPE_CHECKING:
     VLLM_LOGGING_STREAM: str = "ext://sys.stdout"
     VLLM_LOGGING_CONFIG_PATH: str | None = None
     VLLM_LOGGING_COLOR: str = "auto"
+    VLLM_SPEC_DECODE_TRACE: bool = False
+    VLLM_SPEC_DECODE_TRACE_INTERVAL: float = 10.0
+    VLLM_SPEC_DECODE_TRACE_SYNC: bool = False
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
@@ -211,6 +214,9 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_USE_TRTLLM_ATTENTION: str | None = None
+    VLLM_TRTLLM_BINDINGS_PATH: str | None = None
+    VLLM_TRTLLM_LIB_DIR: str | None = None
+    VLLM_TRTLLM_DISABLE: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
@@ -661,6 +667,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_LOG_STATS_INTERVAL": lambda: val
     if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
     else 10.0,
+    # Spec decode tracing (timings, acceptance, throughput)
+    "VLLM_SPEC_DECODE_TRACE": lambda: os.getenv("VLLM_SPEC_DECODE_TRACE", "0") == "1",
+    "VLLM_SPEC_DECODE_TRACE_INTERVAL": lambda: float(
+        os.getenv("VLLM_SPEC_DECODE_TRACE_INTERVAL", "10.")
+    ),
+    "VLLM_SPEC_DECODE_TRACE_SYNC": lambda: os.getenv("VLLM_SPEC_DECODE_TRACE_SYNC", "0")
+    == "1",
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -1679,6 +1692,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_SPEC_DECODE_TRACE",
+        "VLLM_SPEC_DECODE_TRACE_INTERVAL",
+        "VLLM_SPEC_DECODE_TRACE_SYNC",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

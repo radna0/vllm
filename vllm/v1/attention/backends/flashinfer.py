@@ -311,6 +311,13 @@ class FlashInferBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            if head_size % 16 != 0:
+                raise ValueError(
+                    "NVFP4 KV cache requires head_size to be a multiple of 16."
+                )
+            packed_head_size = head_size // 8
+            return (num_blocks, 2, block_size, num_kv_heads, packed_head_size)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -356,7 +363,7 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        """FlashInfer supports sinks when TRTLLM attention is available (SM100)."""
+        """FlashInfer supports sinks when TRTLLM attention is available (SM100/SM120)."""
         from vllm.utils.flashinfer import (
             force_use_trtllm_attention,
             supports_trtllm_attention,
@@ -375,7 +382,7 @@ class FlashInferBackend(AttentionBackend):
         from vllm.platforms import current_platform
 
         capability = current_platform.get_device_capability()
-        if capability is not None and capability.major == 10:
+        if capability is not None and capability.major in (10, 12):
             return "HND"
         return None
 
@@ -600,6 +607,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "sinks, please use trtllm on blackwell or flash attention on "
                 "earlier GPUs."
             )
+        if self.logits_soft_cap not in (None, 0.0) and self.use_trtllm_decode_attention:
+            if self.attention_config.use_trtllm_attention:
+                logger.warning_once(
+                    "TRTLLM decode attention does not support logits soft cap; "
+                    "falling back to FlashInfer decode."
+                )
+            self.use_trtllm_decode_attention = False
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
         # Preparing persistent buffers
         self.pin_memory = is_pin_memory_available()
         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
@@ -609,7 +624,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.paged_kv_indices = self._make_buffer(max_num_pages)
         self.paged_kv_last_page_len = self._make_buffer(max_num_reqs)
 
-        if self.head_dim == 256 and current_platform.is_device_capability_family(100):
+        if self.head_dim == 256 and (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        ):
             # https://github.com/flashinfer-ai/flashinfer/issues/1993 reports that
             # head size 256 and block size 16 is not supported on blackwell.
             assert kv_cache_spec.block_size != 16, (
@@ -810,6 +828,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.cache_dtype,
             self.q_data_type,
             is_prefill=True,
+            logits_soft_cap=self.logits_soft_cap,
             force_use_trtllm=self.attention_config.use_trtllm_attention,
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
@@ -1167,6 +1186,10 @@ class FlashInferImpl(AttentionImpl):
             self.sinks = sinks
 
         self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
+        if current_platform.is_device_capability_family(100):
+            self.trtllm_decode_backend = "trtllm-gen"
+        else:
+            self.trtllm_decode_backend = "xqa"
         vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = (
             self.support_trtllm_attn
@@ -1539,6 +1562,7 @@ class FlashInferImpl(AttentionImpl):
                     o_sf_scale=self.o_sf_scale,
                     out=out,
                     q_len_per_req=q_len_per_req,
+                    backend=self.trtllm_decode_backend,
                 )
         return output_padded
 

@@ -66,9 +66,25 @@ class AttentionSpec(KVCacheSpec):
     num_kv_heads: int
     head_size: int
     dtype: torch.dtype
+    cache_dtype_str: str | None = None
 
     @property
     def page_size_bytes(self) -> int:
+        if self.cache_dtype_str == "nvfp4":
+            if self.head_size % 16 != 0:
+                raise ValueError(
+                    "NVFP4 KV cache requires head_size to be a multiple of 16."
+                )
+            if self.head_size > 256:
+                raise ValueError("NVFP4 KV cache requires head_size <= 256.")
+            packed_head_size = self.head_size // 2  # two FP4 values per byte
+            data_bytes = (
+                2 * self.block_size * self.num_kv_heads * packed_head_size
+            )
+            scale_bytes = (
+                2 * self.block_size * self.num_kv_heads * cdiv(self.head_size, 16)
+            )
+            return data_bytes + scale_bytes
         return (
             2
             * self.block_size
@@ -140,6 +156,7 @@ class FullAttentionSpec(AttentionSpec):
             num_kv_heads=specs[0].num_kv_heads,
             head_size=specs[0].head_size,
             dtype=specs[0].dtype,
+            cache_dtype_str=specs[0].cache_dtype_str,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
         )
@@ -160,9 +177,6 @@ class FullAttentionSpec(AttentionSpec):
 
 @dataclass(frozen=True)
 class MLAAttentionSpec(FullAttentionSpec):
-    # TODO(Lucas/Chen): less hacky way to do this
-    cache_dtype_str: str | None = None
-
     @property
     def page_size_bytes(self) -> int:
         if self.cache_dtype_str == "fp8_ds_mla":
@@ -197,9 +211,12 @@ class MLAAttentionSpec(FullAttentionSpec):
 
 @dataclass(frozen=True)
 class ChunkedLocalAttentionSpec(AttentionSpec):
-    attention_chunk_size: int
+    attention_chunk_size: int = 0
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        assert self.attention_chunk_size > 0, (
+            "attention_chunk_size must be set for ChunkedLocalAttentionSpec"
+        )
         max_model_len = vllm_config.model_config.max_model_len
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
 
@@ -216,9 +233,12 @@ class ChunkedLocalAttentionSpec(AttentionSpec):
 
 @dataclass(frozen=True)
 class SlidingWindowSpec(AttentionSpec):
-    sliding_window: int
+    sliding_window: int = 0
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        assert self.sliding_window > 0, (
+            "sliding_window must be set for SlidingWindowSpec"
+        )
         assert vllm_config.parallel_config.decode_context_parallel_size == 1, (
             "DCP not support sliding window."
         )

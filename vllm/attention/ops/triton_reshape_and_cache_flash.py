@@ -110,6 +110,10 @@ def triton_reshape_and_cache_flash(
     head_stride = key_cache.stride()[2]
     assert head_stride == head_size, "only continous heads are supported"
 
+    if kv_cache_dtype == "nvfp4":
+        raise NotImplementedError(
+            "NVFP4 KV cache is not supported by Triton reshape_and_cache_flash."
+        )
     assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )

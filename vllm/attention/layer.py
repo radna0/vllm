@@ -284,8 +284,8 @@ class Attention(nn.Module, AttentionLayerBase):
     def forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
         # For some alternate attention backends like MLA the attention output
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
@@ -300,8 +300,12 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
-        if self.calculate_kv_scales:
+        if self.calculate_kv_scales and key is not None and value is not None:
             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+        if (key is None or value is None) and not self.use_direct_call:
+            raise RuntimeError(
+                "key/value cannot be None when using opaque attention op"
+            )
         output_dtype = query.dtype
         if self.query_quant is not None:
             # quantizing with a simple torch operation enables
@@ -395,6 +399,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=self.kv_cache_dtype,
                 sliding_window=self.sliding_window,
             )
         else:
@@ -403,6 +408,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
                 dtype=self.kv_cache_torch_dtype,
+                cache_dtype_str=self.kv_cache_dtype,
             )
 
 

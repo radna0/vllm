@@ -38,6 +38,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8": torch.uint8,
     "fp8_e4m3": torch.uint8,
     "fp8_e5m2": torch.uint8,
+    "nvfp4": torch.int32,
     "int8": torch.int8,
     "fp8_inc": torch.float8_e4m3fn,
     "fp8_ds_mla": torch.uint8,
@@ -58,6 +59,7 @@ MODELOPT_TO_VLLM_KV_CACHE_DTYPE_MAP = {
     # mappings here when it supported by some attention backend
     # (for example supports nvfp4).
     "fp8": "fp8_e4m3",
+    "nvfp4": "nvfp4",
 }
 
 T = TypeVar("T")
@@ -313,6 +315,8 @@ def create_kv_caches_with_random_flash(
             key_value_cache.uniform_(-scale, scale)
         elif cache_dtype == "fp8":
             _generate_random_fp8(key_value_cache, -scale, scale)
+        elif cache_dtype == "nvfp4":
+            raise ValueError("Random NVFP4 KV cache generation is unsupported.")
         else:
             raise ValueError(f"Does not support key cache of type {cache_dtype}")
         key_caches.append(key_value_cache[:, 0])

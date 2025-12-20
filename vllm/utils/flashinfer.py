@@ -189,6 +189,9 @@ def has_flashinfer_trtllm_fused_moe() -> bool:
     """Return `True` if FlashInfer TRTLLM fused MoE is available."""
     if not has_flashinfer_moe():
         return False
+    if not current_platform.is_device_capability_family(100):
+        # FlashInfer TRTLLM fused MoE is currently built for SM100 only.
+        return False
     required_functions = [
         ("flashinfer.fused_moe", "trtllm_fp8_block_scale_moe"),
         ("flashinfer.fused_moe", "trtllm_fp8_per_tensor_scale_moe"),
@@ -273,16 +276,20 @@ def has_nvidia_artifactory() -> bool:
 @functools.cache
 def supports_trtllm_attention() -> bool:
     """
-    TRTLLM attention is supported if the platform is SM100,
+    TRTLLM attention is supported if the platform is SM100/SM120,
     NVIDIA artifactory is accessible, and batch-invariant mode is not enabled.
     """
     # Batch-invariant mode disables TRTLLM attention
     if vllm_is_batch_invariant():
         return False
 
-    # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
+    # Requires SM100/SM120 and NVIDIA artifactory to be accessible to download cubins
     return (
-        current_platform.is_device_capability_family(100) and has_nvidia_artifactory()
+        (
+            current_platform.is_device_capability_family(100)
+            or current_platform.is_device_capability_family(120)
+        )
+        and has_nvidia_artifactory()
     )
 
 
@@ -328,6 +335,7 @@ def use_trtllm_attention(
     kv_cache_dtype: str,
     q_dtype: torch.dtype,
     is_prefill: bool,
+    logits_soft_cap: float | None = None,
     # None means auto-detection, True means force on, False means force off
     force_use_trtllm: bool | None = None,
     has_sinks: bool = False,
@@ -345,6 +353,23 @@ def use_trtllm_attention(
             "Trtllm does not support returning LSE and as a result "
             "does not support DCP, reverting to FlashInfer"
         )
+        return False
+
+    if logits_soft_cap not in (None, 0.0):
+        if force_use_trtllm:
+            logger.warning_once(
+                "TRTLLM attention does not support logits soft cap; "
+                "falling back to FlashInfer."
+            )
+        return False
+
+    # TRTLLM prefill currently relies on trtllm-gen FMHA kernels (SM100-only).
+    if is_prefill and current_platform.is_device_capability_family(120):
+        if force_use_trtllm:
+            logger.warning_once(
+                "TRTLLM prefill attention is not supported on SM120 yet; "
+                "falling back to FlashInfer prefill."
+            )
         return False
 
     # The platform is not supported

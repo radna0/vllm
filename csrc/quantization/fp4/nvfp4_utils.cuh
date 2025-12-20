@@ -18,6 +18,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>
 
 #define ELTS_PER_THREAD 8
 
@@ -81,44 +82,34 @@ struct PackedVec<__nv_fp8_e4m3> {
 
 // Convert 8 float32 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float (&array)[8]) {
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0]), "f"(array[1]), "f"(array[2]), "f"(array[3]),
-        "f"(array[4]), "f"(array[5]), "f"(array[6]), "f"(array[7]));
-  return val;
+  const __nv_fp4x2_storage_t b0 = __nv_cvt_float2_to_fp4x2(
+      make_float2(array[0], array[1]), __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b1 = __nv_cvt_float2_to_fp4x2(
+      make_float2(array[2], array[3]), __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b2 = __nv_cvt_float2_to_fp4x2(
+      make_float2(array[4], array[5]), __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b3 = __nv_cvt_float2_to_fp4x2(
+      make_float2(array[6], array[7]), __NV_E2M1, cudaRoundNearest);
+  return static_cast<uint32_t>(b0) |
+         (static_cast<uint32_t>(b1) << 8) |
+         (static_cast<uint32_t>(b2) << 16) |
+         (static_cast<uint32_t>(b3) << 24);
 }
 
 // Convert 4 float2 values into 8 e2m1 values (represented as one uint32_t).
 inline __device__ uint32_t fp32_vec_to_e2m1(float2 (&array)[4]) {
-  uint32_t val;
-  asm volatile(
-      "{\n"
-      ".reg .b8 byte0;\n"
-      ".reg .b8 byte1;\n"
-      ".reg .b8 byte2;\n"
-      ".reg .b8 byte3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte0, %2, %1;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte1, %4, %3;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte2, %6, %5;\n"
-      "cvt.rn.satfinite.e2m1x2.f32   byte3, %8, %7;\n"
-      "mov.b32 %0, {byte0, byte1, byte2, byte3};\n"
-      "}"
-      : "=r"(val)
-      : "f"(array[0].x), "f"(array[0].y), "f"(array[1].x), "f"(array[1].y),
-        "f"(array[2].x), "f"(array[2].y), "f"(array[3].x), "f"(array[3].y));
-  return val;
+  const __nv_fp4x2_storage_t b0 =
+      __nv_cvt_float2_to_fp4x2(array[0], __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b1 =
+      __nv_cvt_float2_to_fp4x2(array[1], __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b2 =
+      __nv_cvt_float2_to_fp4x2(array[2], __NV_E2M1, cudaRoundNearest);
+  const __nv_fp4x2_storage_t b3 =
+      __nv_cvt_float2_to_fp4x2(array[3], __NV_E2M1, cudaRoundNearest);
+  return static_cast<uint32_t>(b0) |
+         (static_cast<uint32_t>(b1) << 8) |
+         (static_cast<uint32_t>(b2) << 16) |
+         (static_cast<uint32_t>(b3) << 24);
 }
 
 // Fast reciprocal.

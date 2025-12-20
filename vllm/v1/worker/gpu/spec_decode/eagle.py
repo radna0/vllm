@@ -6,11 +6,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.utils import AttentionMetadataBuilder
@@ -20,7 +22,10 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.metadata import SamplingMetadata
-from vllm.v1.worker.gpu.spec_decode.eagle_cudagraph import EagleCudaGraphManager
+from vllm.v1.worker.gpu.spec_decode.eagle_cudagraph import (
+    EagleCudaGraphManager,
+    EaglePrefillCudaGraphManager,
+)
 
 logger = init_logger(__name__)
 
@@ -80,8 +85,13 @@ class EagleSpeculator:
             dtype=torch.int64,
             device=device,
         )
+        self._num_valid_reqs = torch.zeros((), dtype=torch.int32, device=device)
 
         self.cudagraph_manager = EagleCudaGraphManager(vllm_config, device)
+        self.prefill_cudagraph_manager = EaglePrefillCudaGraphManager(
+            vllm_config, device
+        )
+        self._decode_attn_metadata_cache: dict[int, dict[str, Any]] = {}
 
     def load_model(self, target_model: nn.Module) -> None:
         from vllm.compilation.backends import set_model_tag
@@ -169,11 +179,24 @@ class EagleSpeculator:
                     self.max_model_len,
                 )
                 self.block_tables.compute_slot_mappings(query_start_loc, pos)
+                mask_slot_mappings(
+                    self.block_tables.slot_mappings, num_reqs, self._num_valid_reqs
+                )
 
     def capture_model(self) -> None:
         if self.num_speculative_steps == 1:
             return
         logger.info("Capturing model for Eagle speculator...")
+        if self.prefill_cudagraph_manager.cudagraph_sizes:
+            self.prefill_cudagraph_manager.capture(
+                model=self.model,
+                input_buffers=self.input_buffers,
+                input_hidden_states=self.hidden_states,
+                block_tables=self.block_tables,
+                attn_metadata_builders=self.attn_metadata_builders,
+                kv_cache_config=self.kv_cache_config,
+                method=self.method,
+            )
         self.cudagraph_manager.capture(
             self.generate_draft,
             self.input_buffers,
@@ -181,6 +204,52 @@ class EagleSpeculator:
             self.attn_metadata_builders,
             self.kv_cache_config,
         )
+
+    def _sync_prefill_metadata(self, input_batch: InputBatch) -> None:
+        num_reqs = input_batch.num_reqs
+        num_tokens = input_batch.num_tokens
+
+        self.input_buffers.query_start_loc.np[: num_reqs + 1] = (
+            input_batch.query_start_loc_np
+        )
+        self.input_buffers.query_start_loc.np[num_reqs + 1 :] = num_tokens
+        self.input_buffers.query_start_loc.copy_to_gpu()
+
+        self.input_buffers.seq_lens[:num_reqs].copy_(input_batch.seq_lens)
+        self.input_buffers.seq_lens[num_reqs:] = 0
+
+        query_start_loc_gpu = self.input_buffers.query_start_loc.gpu[: num_reqs + 1]
+        self.block_tables.compute_slot_mappings(
+            query_start_loc_gpu, self.input_buffers.positions[:num_tokens]
+        )
+
+    def _get_decode_attn_metadata(
+        self,
+        num_reqs: int,
+        query_start_loc_gpu: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        slot_mappings: torch.Tensor,
+    ) -> dict[str, Any]:
+        cached = self._decode_attn_metadata_cache.get(num_reqs)
+        if cached is not None:
+            return cached
+        seq_lens_np = np.full(num_reqs, self.max_model_len, dtype=np.int32)
+        block_tables = [x[:num_reqs] for x in self.block_tables.input_block_tables]
+        attn_metadata = build_attn_metadata(
+            attn_metadata_builders=self.attn_metadata_builders,
+            num_reqs=num_reqs,
+            num_tokens=num_reqs,
+            query_start_loc_gpu=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=self.input_buffers.seq_lens[:num_reqs],
+            seq_lens_np=seq_lens_np,
+            num_computed_tokens_cpu=None,  # FIXME
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            kv_cache_config=self.kv_cache_config,
+        )
+        self._decode_attn_metadata_cache[num_reqs] = attn_metadata
+        return attn_metadata
 
     @torch.inference_mode()
     def propose(
@@ -226,23 +295,30 @@ class EagleSpeculator:
             next_prefill_tokens,
         )
 
-        # Prefill: Run the eagle speculator with eager mode.
-        # TODO(woosuk): Support CUDA graph for prefill.
-        last_hidden_states, hidden_states = self.run_model(
-            num_tokens,
-            input_batch.attn_metadata,
-            num_tokens_across_dp=None,  # FIXME
+        prefill_cudagraph_size = (
+            self.prefill_cudagraph_manager.get_cudagraph_size(num_tokens)
+            if self.prefill_cudagraph_manager.cudagraph_sizes
+            else None
         )
+        if prefill_cudagraph_size == num_tokens:
+            self._sync_prefill_metadata(input_batch)
+            last_hidden_states, hidden_states = self.prefill_cudagraph_manager.run(
+                num_tokens
+            )
+        else:
+            # Prefill: Run the eagle speculator with eager mode.
+            last_hidden_states, hidden_states = self.run_model(
+                num_tokens,
+                input_batch.attn_metadata,
+                num_tokens_across_dp=None,  # FIXME
+            )
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
 
         num_reqs = input_batch.num_reqs
         cu_num_logits = input_batch.cu_num_logits[:num_reqs]
-        # NOTE(woosuk): For draft sampling, we only consider the temperature
-        # and ignore the other sampling parameters such as top_k and top_p,
-        # for simplicity and performance.
-        # While this may slightly degrade the acceptance rate, it does not
-        # affect the output distribution after rejection sampling.
+        # NOTE: For draft sampling, we default to temperature-only, but we
+        # optionally apply top-k/top-p when configured to improve acceptance.
         temperature = self.temperature[:num_reqs]
         seeds = self.seeds[:num_reqs]
         pos = self.input_buffers.positions[:num_reqs]
@@ -250,6 +326,20 @@ class EagleSpeculator:
         torch.gather(sampling_metadata.temperature, 0, cu_num_logits, out=temperature)
         torch.gather(sampling_metadata.seeds, 0, cu_num_logits, out=seeds)
         torch.gather(input_batch.positions, 0, last_token_indices, out=pos)
+        top_k = None
+        top_p = None
+        if sampling_metadata.top_k is not None:
+            top_k = torch.empty(
+                num_reqs, dtype=torch.int32, device=logits.device
+            )
+            torch.gather(sampling_metadata.top_k, 0, cu_num_logits, out=top_k)
+        if sampling_metadata.top_p is not None:
+            top_p = torch.empty(
+                num_reqs, dtype=torch.float32, device=logits.device
+            )
+            torch.gather(sampling_metadata.top_p, 0, cu_num_logits, out=top_p)
+        if top_k is not None or top_p is not None:
+            logits = apply_top_k_top_p(logits, top_k, top_p)
         # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
         # used for draft and target sampling.
         draft_tokens = gumbel_sample(
@@ -258,6 +348,14 @@ class EagleSpeculator:
         if self.num_speculative_steps == 1:
             # Early exit.
             return draft_tokens.view(-1, 1)
+
+        cudagraph_size = self.cudagraph_manager.get_cudagraph_size(num_reqs)
+        decode_num_reqs = cudagraph_size or num_reqs
+        if decode_num_reqs < num_reqs:
+            decode_num_reqs = num_reqs
+        pad_token_id = self.vllm_config.model_config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = 0
 
         # Save the draft tokens for the first step.
         self.draft_tokens[:num_reqs, 0] = draft_tokens
@@ -272,14 +370,19 @@ class EagleSpeculator:
             self.hidden_states,
             self.max_model_len,
             self.max_num_reqs,
+            pad_to_num_reqs=decode_num_reqs,
+            pad_token_id=pad_token_id,
         )
         query_start_loc = self.input_buffers.query_start_loc
-        query_start_loc_gpu = query_start_loc.gpu[: num_reqs + 1]
+        query_start_loc_gpu = query_start_loc.gpu[: decode_num_reqs + 1]
+        decode_pos = self.input_buffers.positions[:decode_num_reqs]
         slot_mappings = self.block_tables.compute_slot_mappings(
-            query_start_loc_gpu, pos
+            query_start_loc_gpu, decode_pos
         )
+        if decode_num_reqs > num_reqs:
+            slot_mappings[:, num_reqs:decode_num_reqs].fill_(PAD_SLOT_ID)
+        self._num_valid_reqs.fill_(num_reqs)
 
-        cudagraph_size = self.cudagraph_manager.get_cudagraph_size(num_reqs)
         if cudagraph_size is not None:
             # Run CUDA graph.
             self.cudagraph_manager.run(cudagraph_size)
@@ -288,23 +391,12 @@ class EagleSpeculator:
         # Run eager mode.
         query_start_loc.np[: num_reqs + 1] = np.arange(num_reqs + 1)
         query_start_loc_cpu = query_start_loc.cpu[: num_reqs + 1]
-        # HACK(woosuk)
-        seq_lens_np = np.full(num_reqs, self.max_model_len, dtype=np.int32)
-        block_tables = [x[:num_reqs] for x in self.block_tables.input_block_tables]
-
         # FIXME(woosuk): This is UNSAFE!!
-        attn_metadata = build_attn_metadata(
-            attn_metadata_builders=self.attn_metadata_builders,
-            num_reqs=num_reqs,
-            num_tokens=num_reqs,
+        attn_metadata = self._get_decode_attn_metadata(
+            num_reqs,
             query_start_loc_gpu=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
-            seq_lens=self.input_buffers.seq_lens[:num_reqs],
-            seq_lens_np=seq_lens_np,
-            num_computed_tokens_cpu=None,  # FIXME
-            block_tables=block_tables,
             slot_mappings=slot_mappings,
-            kv_cache_config=self.kv_cache_config,
         )
         self.generate_draft(num_reqs, attn_metadata, num_tokens_across_dp=None)  # FIXME
         return self.draft_tokens[:num_reqs]
@@ -411,6 +503,8 @@ def _prepare_eagle_docode_kernel(
     hidden_size,
     max_model_len,
     max_num_reqs,
+    pad_to_num_reqs,
+    pad_token_id,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -418,16 +512,24 @@ def _prepare_eagle_docode_kernel(
     if req_idx == num_reqs:
         # Compute query_start_loc. Pad it with the last query_start_loc
         # for CUDA graphs.
+        pad_to_num_reqs = tl.minimum(pad_to_num_reqs, max_num_reqs)
         for i in range(0, max_num_reqs + 1, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
-            q = tl.where(block < num_reqs, block, num_reqs)
+            q = tl.where(block <= pad_to_num_reqs, block, pad_to_num_reqs)
             mask = block < max_num_reqs + 1
             tl.store(query_start_loc_ptr + block, q, mask=mask)
         # Pad seq_lens for CUDA graphs.
         for i in range(req_idx, max_num_reqs, BLOCK_SIZE):
             block = i + tl.arange(0, BLOCK_SIZE)
             mask = block < max_num_reqs
-            tl.store(seq_lens_ptr + block, 0, mask=mask)
+            pad_seq_len = tl.where(block < pad_to_num_reqs, 1, 0)
+            tl.store(seq_lens_ptr + block, pad_seq_len, mask=mask)
+        # Pad input_ids/positions for CUDA graphs.
+        for i in range(req_idx, pad_to_num_reqs, BLOCK_SIZE):
+            block = i + tl.arange(0, BLOCK_SIZE)
+            mask = block < pad_to_num_reqs
+            tl.store(input_ids_ptr + block, pad_token_id, mask=mask)
+            tl.store(positions_ptr + block, 0, mask=mask)
         return
 
     # draft token -> input id.
@@ -473,8 +575,14 @@ def prepare_eagle_decode(
     input_hidden_states: torch.Tensor,
     max_model_len: int,
     max_num_reqs: int,
+    pad_to_num_reqs: int | None = None,
+    pad_token_id: int = 0,
 ):
     num_reqs = draft_tokens.shape[0]
+    if pad_to_num_reqs is None:
+        pad_to_num_reqs = num_reqs
+    elif pad_to_num_reqs < num_reqs:
+        pad_to_num_reqs = num_reqs
     hidden_size = output_hidden_states.shape[-1]
     _prepare_eagle_docode_kernel[(num_reqs + 1,)](
         draft_tokens,
@@ -492,6 +600,46 @@ def prepare_eagle_decode(
         hidden_size,
         max_model_len,
         max_num_reqs,
+        pad_to_num_reqs,
+        pad_token_id,
+        BLOCK_SIZE=1024,
+    )
+
+
+@triton.jit
+def _mask_slot_mappings_kernel(
+    slot_mappings_ptr,
+    slot_mappings_stride,
+    num_tokens,
+    num_valid_tokens_ptr,
+    PAD_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    group_id = tl.program_id(0)
+    block_id = tl.program_id(1)
+    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_tokens
+    num_valid_tokens = tl.load(num_valid_tokens_ptr)
+    invalid = offsets >= num_valid_tokens
+    ptr = slot_mappings_ptr + group_id * slot_mappings_stride + offsets
+    values = tl.load(ptr, mask=mask, other=PAD_ID)
+    values = tl.where(invalid, PAD_ID, values)
+    tl.store(ptr, values, mask=mask)
+
+
+def mask_slot_mappings(
+    slot_mappings: torch.Tensor,
+    num_tokens: int,
+    num_valid_tokens: torch.Tensor,
+) -> None:
+    num_groups = slot_mappings.shape[0]
+    grid = (num_groups, triton.cdiv(num_tokens, 1024))
+    _mask_slot_mappings_kernel[grid](
+        slot_mappings,
+        slot_mappings.stride(0),
+        num_tokens,
+        num_valid_tokens,
+        PAD_ID=PAD_SLOT_ID,
         BLOCK_SIZE=1024,
     )
 

@@ -175,4 +175,5 @@ class CrossAttention(Attention):
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
             dtype=self.kv_cache_torch_dtype,
+            cache_dtype_str=self.kv_cache_dtype,
         )

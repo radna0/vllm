@@ -357,7 +357,10 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         else:
             kernel_block_alignment_size = 16
             if (
-                current_platform.is_device_capability_family(100)
+                (
+                    current_platform.is_device_capability_family(100)
+                    or current_platform.is_device_capability_family(120)
+                )
                 and model_config.get_head_size() == 256
                 and (
                     attention_config.backend is None

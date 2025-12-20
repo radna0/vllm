@@ -176,6 +176,8 @@ class KVConnectorModelRunnerMixin:
             True if we should use a uniform KV cache layout.
         """
 
+        if cache_dtype == "nvfp4":
+            return False
         if not has_kv_transfer_group():
             return False
         if not get_kv_transfer_group().prefer_cross_layer_blocks:

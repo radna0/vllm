@@ -112,6 +112,20 @@ class Worker(WorkerBase):
             self.profiler = None
 
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        if (
+            not self.use_v2_model_runner
+            and "VLLM_USE_V2_MODEL_RUNNER" not in os.environ
+            and self.vllm_config.speculative_config is not None
+            and self.vllm_config.speculative_config.use_eagle()
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.tensor_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+        ):
+            logger.info_once(
+                "Auto-enabling V2 model runner for EAGLE speculative decoding "
+                "on single-GPU. Set VLLM_USE_V2_MODEL_RUNNER=0 to override."
+            )
+            self.use_v2_model_runner = True
 
     def sleep(self, level: int = 1) -> None:
         from vllm.device_allocator.cumem import CuMemAllocator

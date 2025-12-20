@@ -50,7 +50,10 @@ class DeepGemmQuantScaleFMT(Enum):
 
         cls._oracle_cache = (  # type: ignore
             cls.UE8M0
-            if current_platform.is_device_capability_family(100)
+            if (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
             else cls.FLOAT32_CEIL_UE8M0
         )
 
@@ -70,6 +73,7 @@ def is_deep_gemm_supported() -> bool:
     is_supported_arch = current_platform.is_cuda() and (
         current_platform.is_device_capability(90)
         or current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
     )
     return envs.VLLM_USE_DEEP_GEMM and has_deep_gemm() and is_supported_arch
 
