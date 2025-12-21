@@ -3046,6 +3046,247 @@ void eagle_update_draft_tokens_and_scores(
       output_current_scores.stride(0));
 }
 
+__global__ void eagle_copy_scores_and_draft_token_ids_kernel(
+    int32_t layer_idx,
+    int32_t num_eagle_layers,
+    int32_t max_decoding_draft_tokens,
+    int32_t batch_size,
+    int32_t dynamic_tree_max_topk,
+    const int32_t* __restrict__ current_expand_indices,
+    const float* __restrict__ input_all_layers_scores,
+    const int32_t* __restrict__ input_all_layers_draft_ids,
+    const int32_t* __restrict__ input_all_layers_predecessor,
+    float* __restrict__ output_all_layers_scores,
+    int32_t* __restrict__ output_all_layers_draft_ids,
+    int32_t* __restrict__ output_all_layers_predecessor,
+    const float* __restrict__ first_topk_logprobs,
+    const int32_t* __restrict__ first_topk_ids) {
+  const int32_t bix =
+      static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (bix >= batch_size) {
+    return;
+  }
+  const int64_t per_batch = static_cast<int64_t>(num_eagle_layers) *
+      max_decoding_draft_tokens * max_decoding_draft_tokens;
+  const int64_t base_offset = static_cast<int64_t>(bix) * per_batch;
+  const int32_t* cur_expand_ptr =
+      current_expand_indices + static_cast<int64_t>(bix) * dynamic_tree_max_topk;
+
+  const float* in_scores = input_all_layers_scores + base_offset;
+  const int32_t* in_ids = input_all_layers_draft_ids + base_offset;
+  const int32_t* in_pred = input_all_layers_predecessor + base_offset;
+  float* out_scores = output_all_layers_scores + base_offset;
+  int32_t* out_ids = output_all_layers_draft_ids + base_offset;
+  int32_t* out_pred = output_all_layers_predecessor + base_offset;
+
+  const int32_t first_topk_offset =
+      layer_idx == 0 ? 1 : dynamic_tree_max_topk;
+  const float* first_logprobs_ptr =
+      first_topk_logprobs +
+      static_cast<int64_t>(bix) * first_topk_offset * max_decoding_draft_tokens;
+  const int32_t* first_ids_ptr =
+      first_topk_ids +
+      static_cast<int64_t>(bix) * first_topk_offset * max_decoding_draft_tokens;
+
+  const int32_t start_offset =
+      layer_idx == 0
+          ? 0
+          : (layer_idx - 1) * dynamic_tree_max_topk * dynamic_tree_max_topk +
+                dynamic_tree_max_topk;
+
+  for (int32_t ii = 0; ii < start_offset; ++ii) {
+    out_scores[ii] = in_scores[ii];
+    out_ids[ii] = in_ids[ii];
+    out_pred[ii] = in_pred[ii];
+  }
+
+  const int32_t num_expand_tokens =
+      layer_idx == 0 ? 1 : dynamic_tree_max_topk;
+  int32_t write_offset = start_offset;
+  for (int32_t ii = 0; ii < num_expand_tokens; ++ii) {
+    const int32_t pred =
+        layer_idx == 0 ? 0 : cur_expand_ptr[ii];
+    const int32_t base = ii * max_decoding_draft_tokens;
+    for (int32_t jj = 0; jj < dynamic_tree_max_topk; ++jj) {
+      out_scores[write_offset] = first_logprobs_ptr[base + jj];
+      out_ids[write_offset] = first_ids_ptr[base + jj];
+      out_pred[write_offset] = pred;
+      ++write_offset;
+    }
+  }
+}
+
+void eagle_copy_scores_and_draft_token_ids(
+    int64_t layer_idx,
+    int64_t num_eagle_layers,
+    int64_t max_decoding_draft_tokens,
+    int64_t dynamic_tree_max_topk,
+    torch::Tensor current_expand_indices,
+    torch::Tensor input_all_layers_scores,
+    torch::Tensor input_all_layers_draft_ids,
+    torch::Tensor input_all_layers_predecessor,
+    torch::Tensor output_all_layers_scores,
+    torch::Tensor output_all_layers_draft_ids,
+    torch::Tensor output_all_layers_predecessor,
+    torch::Tensor first_topk_logprobs,
+    torch::Tensor first_topk_ids) {
+  TORCH_CHECK(current_expand_indices.is_cuda(),
+              "current_expand_indices must be CUDA");
+  TORCH_CHECK(input_all_layers_scores.is_cuda(),
+              "input_all_layers_scores must be CUDA");
+  TORCH_CHECK(input_all_layers_draft_ids.is_cuda(),
+              "input_all_layers_draft_ids must be CUDA");
+  TORCH_CHECK(input_all_layers_predecessor.is_cuda(),
+              "input_all_layers_predecessor must be CUDA");
+  TORCH_CHECK(output_all_layers_scores.is_cuda(),
+              "output_all_layers_scores must be CUDA");
+  TORCH_CHECK(output_all_layers_draft_ids.is_cuda(),
+              "output_all_layers_draft_ids must be CUDA");
+  TORCH_CHECK(output_all_layers_predecessor.is_cuda(),
+              "output_all_layers_predecessor must be CUDA");
+  TORCH_CHECK(first_topk_logprobs.is_cuda(),
+              "first_topk_logprobs must be CUDA");
+  TORCH_CHECK(first_topk_ids.is_cuda(),
+              "first_topk_ids must be CUDA");
+  TORCH_CHECK(current_expand_indices.scalar_type() == torch::kInt32,
+              "current_expand_indices must be int32");
+  TORCH_CHECK(input_all_layers_scores.scalar_type() == torch::kFloat32,
+              "input_all_layers_scores must be float32");
+  TORCH_CHECK(input_all_layers_draft_ids.scalar_type() == torch::kInt32,
+              "input_all_layers_draft_ids must be int32");
+  TORCH_CHECK(input_all_layers_predecessor.scalar_type() == torch::kInt32,
+              "input_all_layers_predecessor must be int32");
+  TORCH_CHECK(output_all_layers_scores.scalar_type() == torch::kFloat32,
+              "output_all_layers_scores must be float32");
+  TORCH_CHECK(output_all_layers_draft_ids.scalar_type() == torch::kInt32,
+              "output_all_layers_draft_ids must be int32");
+  TORCH_CHECK(output_all_layers_predecessor.scalar_type() == torch::kInt32,
+              "output_all_layers_predecessor must be int32");
+  TORCH_CHECK(first_topk_logprobs.scalar_type() == torch::kFloat32,
+              "first_topk_logprobs must be float32");
+  TORCH_CHECK(first_topk_ids.scalar_type() == torch::kInt32,
+              "first_topk_ids must be int32");
+  const int32_t batch_size =
+      static_cast<int32_t>(current_expand_indices.size(0));
+  if (batch_size == 0) {
+    return;
+  }
+  const int64_t per_batch =
+      num_eagle_layers * max_decoding_draft_tokens * max_decoding_draft_tokens;
+  TORCH_CHECK(input_all_layers_scores.numel() >= per_batch * batch_size,
+              "input_all_layers_scores too small");
+  TORCH_CHECK(input_all_layers_draft_ids.numel() >= per_batch * batch_size,
+              "input_all_layers_draft_ids too small");
+  TORCH_CHECK(input_all_layers_predecessor.numel() >= per_batch * batch_size,
+              "input_all_layers_predecessor too small");
+  TORCH_CHECK(output_all_layers_scores.numel() >= per_batch * batch_size,
+              "output_all_layers_scores too small");
+  TORCH_CHECK(output_all_layers_draft_ids.numel() >= per_batch * batch_size,
+              "output_all_layers_draft_ids too small");
+  TORCH_CHECK(output_all_layers_predecessor.numel() >= per_batch * batch_size,
+              "output_all_layers_predecessor too small");
+  const int threads = 128;
+  const int blocks = (batch_size + threads - 1) / threads;
+  c10::cuda::CUDAGuard device_guard(current_expand_indices.device());
+  eagle_copy_scores_and_draft_token_ids_kernel<<<
+      blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+      static_cast<int32_t>(layer_idx),
+      static_cast<int32_t>(num_eagle_layers),
+      static_cast<int32_t>(max_decoding_draft_tokens),
+      batch_size,
+      static_cast<int32_t>(dynamic_tree_max_topk),
+      current_expand_indices.data_ptr<int32_t>(),
+      input_all_layers_scores.data_ptr<float>(),
+      input_all_layers_draft_ids.data_ptr<int32_t>(),
+      input_all_layers_predecessor.data_ptr<int32_t>(),
+      output_all_layers_scores.data_ptr<float>(),
+      output_all_layers_draft_ids.data_ptr<int32_t>(),
+      output_all_layers_predecessor.data_ptr<int32_t>(),
+      first_topk_logprobs.data_ptr<float>(),
+      first_topk_ids.data_ptr<int32_t>());
+}
+
+__global__ void eagle_copy_final_draft_tokens_kernel(
+    int32_t batch_size,
+    int32_t max_decoding_draft_tokens,
+    int32_t num_eagle_layers,
+    int32_t max_nodes_on_final_tree,
+    const int64_t* __restrict__ third_topk_output_ptrs,
+    const int32_t* __restrict__ all_layers_draft_token_ids,
+    int32_t* __restrict__ output_draft_token_ids,
+    int32_t* __restrict__ output_draft_lens) {
+  const int32_t bix =
+      static_cast<int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (bix >= batch_size) {
+    return;
+  }
+  const int32_t* third_topk_ids = reinterpret_cast<const int32_t*>(
+      static_cast<intptr_t>(third_topk_output_ptrs[bix]));
+  const int64_t per_batch = static_cast<int64_t>(num_eagle_layers) *
+      max_decoding_draft_tokens * max_decoding_draft_tokens;
+  const int32_t* all_layers_ids =
+      all_layers_draft_token_ids + static_cast<int64_t>(bix) * per_batch;
+  int32_t* out_ids =
+      output_draft_token_ids +
+      static_cast<int64_t>(bix) * max_decoding_draft_tokens;
+  for (int32_t ii = 0; ii < max_nodes_on_final_tree; ++ii) {
+    const int32_t selected_idx = third_topk_ids[ii];
+    out_ids[ii] = all_layers_ids[selected_idx];
+  }
+  output_draft_lens[bix] = max_nodes_on_final_tree;
+}
+
+void eagle_copy_final_draft_tokens(
+    torch::Tensor third_topk_output_ptrs,
+    torch::Tensor all_layers_draft_token_ids,
+    torch::Tensor output_draft_token_ids,
+    torch::Tensor output_draft_lens,
+    int64_t num_eagle_layers,
+    int64_t max_decoding_draft_tokens,
+    int64_t max_nodes_on_final_tree) {
+  TORCH_CHECK(third_topk_output_ptrs.is_cuda(),
+              "third_topk_output_ptrs must be CUDA");
+  TORCH_CHECK(all_layers_draft_token_ids.is_cuda(),
+              "all_layers_draft_token_ids must be CUDA");
+  TORCH_CHECK(output_draft_token_ids.is_cuda(),
+              "output_draft_token_ids must be CUDA");
+  TORCH_CHECK(output_draft_lens.is_cuda(),
+              "output_draft_lens must be CUDA");
+  TORCH_CHECK(third_topk_output_ptrs.scalar_type() == torch::kInt64,
+              "third_topk_output_ptrs must be int64");
+  TORCH_CHECK(all_layers_draft_token_ids.scalar_type() == torch::kInt32,
+              "all_layers_draft_token_ids must be int32");
+  TORCH_CHECK(output_draft_token_ids.scalar_type() == torch::kInt32,
+              "output_draft_token_ids must be int32");
+  TORCH_CHECK(output_draft_lens.scalar_type() == torch::kInt32,
+              "output_draft_lens must be int32");
+  const int32_t batch_size =
+      static_cast<int32_t>(third_topk_output_ptrs.numel());
+  if (batch_size == 0) {
+    return;
+  }
+  const int64_t per_batch =
+      num_eagle_layers * max_decoding_draft_tokens * max_decoding_draft_tokens;
+  TORCH_CHECK(all_layers_draft_token_ids.numel() >= per_batch * batch_size,
+              "all_layers_draft_token_ids too small");
+  TORCH_CHECK(output_draft_token_ids.numel() >=
+                  static_cast<int64_t>(batch_size) * max_decoding_draft_tokens,
+              "output_draft_token_ids too small");
+  c10::cuda::CUDAGuard device_guard(output_draft_token_ids.device());
+  const int threads = 128;
+  const int blocks = (batch_size + threads - 1) / threads;
+  eagle_copy_final_draft_tokens_kernel<<<
+      blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+      batch_size,
+      static_cast<int32_t>(max_decoding_draft_tokens),
+      static_cast<int32_t>(num_eagle_layers),
+      static_cast<int32_t>(max_nodes_on_final_tree),
+      third_topk_output_ptrs.data_ptr<int64_t>(),
+      all_layers_draft_token_ids.data_ptr<int32_t>(),
+      output_draft_token_ids.data_ptr<int32_t>(),
+      output_draft_lens.data_ptr<int32_t>());
+}
+
 template <typename scalar_t>
 __global__ void eagle_kv_cache_rewind_kernel(
     scalar_t* __restrict__ kv_cache,
@@ -4828,6 +5069,41 @@ void eagle_update_draft_tokens_and_scores(int64_t layer_idx,
       layer_idx, dynamic_tree_max_topk, cur_draft_ids, input_draft_ids,
       input_draft_lens, output_draft_ids, output_draft_lens, cur_layer_scores,
       output_current_scores);
+}
+
+void eagle_copy_scores_and_draft_token_ids(
+    int64_t layer_idx,
+    int64_t num_eagle_layers,
+    int64_t max_decoding_draft_tokens,
+    int64_t dynamic_tree_max_topk,
+    torch::Tensor current_expand_indices,
+    torch::Tensor input_all_layers_scores,
+    torch::Tensor input_all_layers_draft_ids,
+    torch::Tensor input_all_layers_predecessor,
+    torch::Tensor output_all_layers_scores,
+    torch::Tensor output_all_layers_draft_ids,
+    torch::Tensor output_all_layers_predecessor,
+    torch::Tensor first_topk_logprobs,
+    torch::Tensor first_topk_ids) {
+  vllm::eagle_copy_scores_and_draft_token_ids(
+      layer_idx, num_eagle_layers, max_decoding_draft_tokens,
+      dynamic_tree_max_topk, current_expand_indices, input_all_layers_scores,
+      input_all_layers_draft_ids, input_all_layers_predecessor,
+      output_all_layers_scores, output_all_layers_draft_ids,
+      output_all_layers_predecessor, first_topk_logprobs, first_topk_ids);
+}
+
+void eagle_copy_final_draft_tokens(torch::Tensor third_topk_output_ptrs,
+                                   torch::Tensor all_layers_draft_token_ids,
+                                   torch::Tensor output_draft_token_ids,
+                                   torch::Tensor output_draft_lens,
+                                   int64_t num_eagle_layers,
+                                   int64_t max_decoding_draft_tokens,
+                                   int64_t max_nodes_on_final_tree) {
+  vllm::eagle_copy_final_draft_tokens(
+      third_topk_output_ptrs, all_layers_draft_token_ids,
+      output_draft_token_ids, output_draft_lens, num_eagle_layers,
+      max_decoding_draft_tokens, max_nodes_on_final_tree);
 }
 
 void eagle_set_topks_from_dynamic_tree(int64_t layer_idx,

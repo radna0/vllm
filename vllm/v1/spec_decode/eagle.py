@@ -132,11 +132,21 @@ class EagleProposer:
         self._dyn_cur_scores: torch.Tensor | None = None
         self._dyn_second_topk_ids: torch.Tensor | None = None
         self._dyn_next_expand_indices: torch.Tensor | None = None
+        self._dyn_current_expand_indices: torch.Tensor | None = None
         self._dyn_draft_ids_in: torch.Tensor | None = None
         self._dyn_draft_ids_out: torch.Tensor | None = None
         self._dyn_draft_lens_in: torch.Tensor | None = None
         self._dyn_draft_lens_out: torch.Tensor | None = None
         self._dyn_output_scores: torch.Tensor | None = None
+        self._dyn_all_layers_scores: torch.Tensor | None = None
+        self._dyn_all_layers_draft_ids: torch.Tensor | None = None
+        self._dyn_all_layers_predecessor: torch.Tensor | None = None
+        self._dyn_first_topk_logprobs: torch.Tensor | None = None
+        self._dyn_first_topk_ids: torch.Tensor | None = None
+        self._dyn_third_topk_input_ptrs: torch.Tensor | None = None
+        self._dyn_third_topk_output_ptrs: torch.Tensor | None = None
+        self._dyn_third_topk_ids: torch.Tensor | None = None
+        self._dyn_third_topks: torch.Tensor | None = None
         self._dyn_candidate_scores: torch.Tensor | None = None
         self._dyn_candidate_ids: torch.Tensor | None = None
         self._dyn_second_topk_tokens: torch.Tensor | None = None
@@ -144,6 +154,7 @@ class EagleProposer:
         self._dyn_second_topk_output_ptrs: torch.Tensor | None = None
         self._dyn_second_topk_logprobs: torch.Tensor | None = None
         self._dyn_use_paths_a = True
+        self._dyn_paths_final: torch.Tensor | None = None
         self._dynamic_max_draft_tokens = 0
         self._dynamic_max_tokens = 0
         self._dynamic_max_path_len = 0
@@ -494,6 +505,9 @@ class EagleProposer:
         self._dyn_next_expand_indices = torch.empty(
             (self.max_num_reqs, dyn_k), dtype=torch.int32, device=device
         )
+        self._dyn_current_expand_indices = torch.zeros(
+            (self.max_num_reqs, dyn_k), dtype=torch.int32, device=device
+        )
         self._dyn_draft_ids_in = torch.zeros(
             (self.max_num_reqs, max_draft_tokens), dtype=torch.int32, device=device
         )
@@ -510,6 +524,52 @@ class EagleProposer:
             (self.max_num_reqs, max_draft_tokens),
             dtype=torch.float32,
             device=device,
+        )
+        all_layers_size = self._tree_depth * max_draft_tokens * max_draft_tokens
+        self._dyn_all_layers_scores = torch.full(
+            (self.max_num_reqs, all_layers_size),
+            -float("inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._dyn_all_layers_draft_ids = torch.full(
+            (self.max_num_reqs, all_layers_size),
+            PADDING_SLOT_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dyn_all_layers_predecessor = torch.full(
+            (self.max_num_reqs, all_layers_size),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dyn_first_topk_logprobs = torch.full(
+            (self.max_num_reqs * dyn_k, max_draft_tokens),
+            -float("inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._dyn_first_topk_ids = torch.full(
+            (self.max_num_reqs * dyn_k, max_draft_tokens),
+            PADDING_SLOT_ID,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dyn_third_topk_input_ptrs = torch.empty(
+            (self.max_num_reqs,), dtype=torch.int64, device=device
+        )
+        self._dyn_third_topk_output_ptrs = torch.empty(
+            (self.max_num_reqs,), dtype=torch.int64, device=device
+        )
+        self._dyn_third_topk_ids = torch.full(
+            (self.max_num_reqs, max_draft_tokens),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._dyn_third_topks = torch.empty(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
         )
         self._dyn_candidate_scores = torch.empty(
             (self.max_num_reqs * dyn_k, max_draft_tokens),
@@ -542,6 +602,12 @@ class EagleProposer:
             dtype=torch.int32,
             device=device,
         )
+        self._dyn_paths_final = torch.full(
+            (self.max_num_reqs, self._dynamic_max_tokens, self._dynamic_max_path_len),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
         self._dyn_position_offsets = torch.zeros(
             (self._dynamic_max_tokens,),
             dtype=torch.int32,
@@ -568,12 +634,32 @@ class EagleProposer:
         assert self._dyn_paths_a is not None
         assert self._dyn_paths_b is not None
         assert self._dyn_node_token_ids is not None
+        assert self._dyn_current_expand_indices is not None
+        assert self._dyn_all_layers_scores is not None
+        assert self._dyn_all_layers_draft_ids is not None
+        assert self._dyn_all_layers_predecessor is not None
+        assert self._dyn_first_topk_logprobs is not None
+        assert self._dyn_first_topk_ids is not None
+        assert self._dyn_third_topk_ids is not None
+        assert self._dyn_third_topks is not None
+        assert self._dyn_paths_final is not None
         self._dyn_prev_scores[:batch_size].fill_(-float("inf"))
         self._dyn_draft_lens_in[:batch_size].zero_()
         self._dyn_draft_lens_out[:batch_size].zero_()
         self._dyn_paths_a[:batch_size].fill_(-1)
         self._dyn_paths_b[:batch_size].fill_(-1)
+        self._dyn_paths_final[:batch_size].fill_(-1)
         self._dyn_node_token_ids[:batch_size].fill_(PADDING_SLOT_ID)
+        self._dyn_current_expand_indices[:batch_size].zero_()
+        self._dyn_all_layers_scores[:batch_size].fill_(-float("inf"))
+        self._dyn_all_layers_draft_ids[:batch_size].fill_(PADDING_SLOT_ID)
+        self._dyn_all_layers_predecessor[:batch_size].fill_(-1)
+        dyn_k = self._dynamic_topk
+        if dyn_k > 0:
+            self._dyn_first_topk_logprobs[: batch_size * dyn_k].fill_(-float("inf"))
+            self._dyn_first_topk_ids[: batch_size * dyn_k].fill_(PADDING_SLOT_ID)
+        self._dyn_third_topk_ids[:batch_size].fill_(-1)
+        self._dyn_third_topks[:batch_size].zero_()
         self._dyn_use_paths_a = True
         self._dynamic_active_topk = 0
 
@@ -613,6 +699,25 @@ class EagleProposer:
         assert self._dyn_output_scores is not None
         assert self._dyn_paths_a is not None
         assert self._dyn_paths_b is not None
+        assert self._dyn_current_expand_indices is not None
+        assert self._dyn_all_layers_scores is not None
+        assert self._dyn_all_layers_draft_ids is not None
+        assert self._dyn_all_layers_predecessor is not None
+        assert self._dyn_first_topk_logprobs is not None
+        assert self._dyn_first_topk_ids is not None
+        assert self._dyn_third_topk_input_ptrs is not None
+        assert self._dyn_third_topk_output_ptrs is not None
+        assert self._dyn_third_topk_ids is not None
+        assert self._dyn_third_topks is not None
+        assert self._dyn_paths_final is not None
+
+        use_full_dynamic = (
+            self._dynamic_tree_kernels
+            and hasattr(torch.ops.vllm, "eagle_copy_scores_and_draft_token_ids")
+            and hasattr(torch.ops.vllm, "eagle_assemble_third_topk_inputs")
+            and hasattr(torch.ops.vllm, "eagle_reconstruct_final_path")
+            and hasattr(torch.ops.vllm, "eagle_copy_final_draft_tokens")
+        )
 
         if topk_ids.dim() == 2:
             topk_ids = topk_ids[:, :dyn_k]
@@ -621,10 +726,35 @@ class EagleProposer:
             topk_ids = topk_ids[:, :dyn_k, :dyn_k]
             topk_logprobs = topk_logprobs[:, :dyn_k, :dyn_k]
 
+        max_draft_tokens = self._dynamic_max_draft_tokens
+        num_eagle_layers = self._tree_depth
+
         if level == 0:
             self._dyn_prev_scores[:batch_size, :dyn_k] = topk_logprobs.to(
                 torch.float32
             )
+            if use_full_dynamic:
+                first_logprobs = self._dyn_first_topk_logprobs[:batch_size]
+                first_ids = self._dyn_first_topk_ids[:batch_size]
+                first_logprobs.fill_(-float("inf"))
+                first_ids.fill_(PADDING_SLOT_ID)
+                first_logprobs[:, :dyn_k] = topk_logprobs.to(torch.float32)
+                first_ids[:, :dyn_k] = topk_ids.to(dtype=torch.int32)
+                torch.ops.vllm.eagle_copy_scores_and_draft_token_ids(
+                    level,
+                    num_eagle_layers,
+                    max_draft_tokens,
+                    dyn_k,
+                    self._dyn_current_expand_indices[:batch_size],
+                    self._dyn_all_layers_scores[:batch_size],
+                    self._dyn_all_layers_draft_ids[:batch_size],
+                    self._dyn_all_layers_predecessor[:batch_size],
+                    self._dyn_all_layers_scores[:batch_size],
+                    self._dyn_all_layers_draft_ids[:batch_size],
+                    self._dyn_all_layers_predecessor[:batch_size],
+                    first_logprobs,
+                    first_ids,
+                )
             prev_paths = self._dyn_paths_a if self._dyn_use_paths_a else self._dyn_paths_b
             new_paths = self._dyn_paths_b if self._dyn_use_paths_a else self._dyn_paths_a
             torch.ops.vllm.eagle_update_path(
@@ -635,6 +765,9 @@ class EagleProposer:
                 new_paths[:batch_size],
                 self._dyn_next_expand_indices[:batch_size],
             )
+            self._dyn_current_expand_indices[:batch_size] = self._dyn_next_expand_indices[
+                :batch_size
+            ]
             torch.ops.vllm.eagle_update_draft_tokens_and_scores(
                 level,
                 dyn_k,
@@ -649,6 +782,13 @@ class EagleProposer:
             self._dyn_use_paths_a = not self._dyn_use_paths_a
             self._dyn_draft_ids_in[:batch_size] = self._dyn_draft_ids_out[:batch_size]
             self._dyn_draft_lens_in[:batch_size] = self._dyn_draft_lens_out[:batch_size]
+            if use_full_dynamic and level == num_eagle_layers - 1:
+                self._finalize_dynamic_tree_paths(
+                    batch_size,
+                    dyn_k,
+                    max_draft_tokens,
+                    num_eagle_layers,
+                )
             return
 
         if topk_ids.dim() != 3:
@@ -664,7 +804,32 @@ class EagleProposer:
                 )
                 self._dynamic_tree_warned = True
             return
-        max_draft_tokens = self._dynamic_max_draft_tokens
+        if use_full_dynamic:
+            first_logprobs = self._dyn_first_topk_logprobs[: batch_size * dyn_k]
+            first_ids = self._dyn_first_topk_ids[: batch_size * dyn_k]
+            first_logprobs.fill_(-float("inf"))
+            first_ids.fill_(PADDING_SLOT_ID)
+            first_logprobs[:, :dyn_k] = topk_logprobs.to(torch.float32).reshape(
+                batch_size * dyn_k, dyn_k
+            )
+            first_ids[:, :dyn_k] = topk_ids.to(dtype=torch.int32).reshape(
+                batch_size * dyn_k, dyn_k
+            )
+            torch.ops.vllm.eagle_copy_scores_and_draft_token_ids(
+                level,
+                num_eagle_layers,
+                max_draft_tokens,
+                dyn_k,
+                self._dyn_current_expand_indices[:batch_size],
+                self._dyn_all_layers_scores[:batch_size],
+                self._dyn_all_layers_draft_ids[:batch_size],
+                self._dyn_all_layers_predecessor[:batch_size],
+                self._dyn_all_layers_scores[:batch_size],
+                self._dyn_all_layers_draft_ids[:batch_size],
+                self._dyn_all_layers_predecessor[:batch_size],
+                first_logprobs,
+                first_ids,
+            )
         candidate_scores = self._dyn_candidate_scores[
             : batch_size * dyn_k, :max_draft_tokens
         ]
@@ -702,6 +867,9 @@ class EagleProposer:
             new_paths[:batch_size],
             self._dyn_next_expand_indices[:batch_size],
         )
+        self._dyn_current_expand_indices[:batch_size] = self._dyn_next_expand_indices[
+            :batch_size
+        ]
 
         batch_arange = self.arange_int64[:batch_size].unsqueeze(1)
         use_cuda_second = (
@@ -751,6 +919,87 @@ class EagleProposer:
         self._dyn_draft_ids_in[:batch_size] = self._dyn_draft_ids_out[:batch_size]
         self._dyn_draft_lens_in[:batch_size] = self._dyn_draft_lens_out[:batch_size]
         self._dyn_prev_scores[:batch_size, :dyn_k] = self._dyn_cur_scores[:batch_size]
+        if use_full_dynamic and level == num_eagle_layers - 1:
+            self._finalize_dynamic_tree_paths(
+                batch_size,
+                dyn_k,
+                max_draft_tokens,
+                num_eagle_layers,
+            )
+
+    def _finalize_dynamic_tree_paths(
+        self,
+        batch_size: int,
+        dyn_k: int,
+        max_draft_tokens: int,
+        num_eagle_layers: int,
+    ) -> None:
+        if batch_size <= 0 or dyn_k <= 0 or max_draft_tokens <= 0:
+            return
+        assert self._dyn_all_layers_scores is not None
+        assert self._dyn_all_layers_predecessor is not None
+        assert self._dyn_all_layers_draft_ids is not None
+        assert self._dyn_third_topk_input_ptrs is not None
+        assert self._dyn_third_topk_output_ptrs is not None
+        assert self._dyn_third_topk_ids is not None
+        assert self._dyn_third_topks is not None
+        assert self._dyn_paths_final is not None
+        assert self._dyn_paths_a is not None
+        assert self._dyn_draft_ids_in is not None
+        assert self._dyn_draft_lens_in is not None
+
+        total_num_tokens = dyn_k
+        if num_eagle_layers > 1:
+            total_num_tokens += (num_eagle_layers - 1) * dyn_k * dyn_k
+        max_nodes_on_final_tree = min(max_draft_tokens, total_num_tokens)
+        if max_nodes_on_final_tree <= 0:
+            return
+
+        all_scores = self._dyn_all_layers_scores[:batch_size]
+        torch.ops.vllm.eagle_assemble_third_topk_inputs(
+            all_scores,
+            self._dyn_third_topk_input_ptrs[:batch_size],
+            self._dyn_third_topk_ids[:batch_size],
+            self._dyn_third_topk_output_ptrs[:batch_size],
+            self._dyn_third_topks[:batch_size],
+            num_eagle_layers,
+            max_nodes_on_final_tree,
+        )
+        flat_scores = all_scores.view(batch_size, -1)
+        max_nodes_on_final_tree = min(
+            max_nodes_on_final_tree, flat_scores.size(1)
+        )
+        if max_nodes_on_final_tree <= 0:
+            return
+        _, topk_ids = torch.topk(
+            flat_scores, max_nodes_on_final_tree, dim=-1
+        )
+        self._dyn_third_topk_ids[:batch_size, :max_nodes_on_final_tree] = (
+            topk_ids.to(torch.int32)
+        )
+
+        torch.ops.vllm.eagle_reconstruct_final_path(
+            self._dyn_third_topk_output_ptrs[:batch_size],
+            self._dyn_all_layers_predecessor[:batch_size],
+            self._dyn_paths_final[:batch_size],
+            dyn_k,
+            max_draft_tokens,
+            max_draft_tokens + 1,
+            self._dynamic_max_path_len,
+            num_eagle_layers,
+            max_nodes_on_final_tree,
+        )
+        torch.ops.vllm.eagle_copy_final_draft_tokens(
+            self._dyn_third_topk_output_ptrs[:batch_size],
+            self._dyn_all_layers_draft_ids[:batch_size],
+            self._dyn_draft_ids_in[:batch_size],
+            self._dyn_draft_lens_in[:batch_size],
+            num_eagle_layers,
+            max_draft_tokens,
+            max_nodes_on_final_tree,
+        )
+        self._dyn_paths_a[:batch_size].copy_(self._dyn_paths_final[:batch_size])
+        self._dyn_use_paths_a = True
 
     def _build_dynamic_tree_packed_mask(
         self, paths: torch.Tensor, tree_len: int, exclude_root: bool = False

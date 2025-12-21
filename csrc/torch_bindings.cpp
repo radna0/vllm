@@ -208,6 +208,25 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &eagle_update_draft_tokens_and_scores);
 
   ops.def(
+      "eagle_copy_scores_and_draft_token_ids(int layer_idx, int num_eagle_layers, "
+      "int max_decoding_draft_tokens, int dynamic_tree_max_topk, "
+      "Tensor current_expand_indices, Tensor input_all_layers_scores, "
+      "Tensor input_all_layers_draft_ids, Tensor input_all_layers_predecessor, "
+      "Tensor! output_all_layers_scores, Tensor! output_all_layers_draft_ids, "
+      "Tensor! output_all_layers_predecessor, Tensor first_topk_logprobs, "
+      "Tensor first_topk_ids) -> ()");
+  ops.impl("eagle_copy_scores_and_draft_token_ids", torch::kCUDA,
+           &eagle_copy_scores_and_draft_token_ids);
+
+  ops.def(
+      "eagle_copy_final_draft_tokens(Tensor third_topk_output_ptrs, "
+      "Tensor all_layers_draft_token_ids, Tensor! output_draft_token_ids, "
+      "Tensor! output_draft_lens, int num_eagle_layers, "
+      "int max_decoding_draft_tokens, int max_nodes_on_final_tree) -> ()");
+  ops.impl("eagle_copy_final_draft_tokens", torch::kCUDA,
+           &eagle_copy_final_draft_tokens);
+
+  ops.def(
       "eagle_set_topks_from_dynamic_tree(int layer_idx, Tensor! top_ks, "
       "Tensor! top_k_offsets, int dynamic_tree_max_topk, "
       "Tensor num_valid_logits) -> ()");

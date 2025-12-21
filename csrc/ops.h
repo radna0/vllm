@@ -397,6 +397,29 @@ void eagle_update_draft_tokens_and_scores(int64_t layer_idx,
                                           torch::Tensor cur_layer_scores,
                                           torch::Tensor output_current_scores);
 
+void eagle_copy_scores_and_draft_token_ids(
+    int64_t layer_idx,
+    int64_t num_eagle_layers,
+    int64_t max_decoding_draft_tokens,
+    int64_t dynamic_tree_max_topk,
+    torch::Tensor current_expand_indices,
+    torch::Tensor input_all_layers_scores,
+    torch::Tensor input_all_layers_draft_ids,
+    torch::Tensor input_all_layers_predecessor,
+    torch::Tensor output_all_layers_scores,
+    torch::Tensor output_all_layers_draft_ids,
+    torch::Tensor output_all_layers_predecessor,
+    torch::Tensor first_topk_logprobs,
+    torch::Tensor first_topk_ids);
+
+void eagle_copy_final_draft_tokens(torch::Tensor third_topk_output_ptrs,
+                                   torch::Tensor all_layers_draft_token_ids,
+                                   torch::Tensor output_draft_token_ids,
+                                   torch::Tensor output_draft_lens,
+                                   int64_t num_eagle_layers,
+                                   int64_t max_decoding_draft_tokens,
+                                   int64_t max_nodes_on_final_tree);
+
 void eagle_set_topks_from_dynamic_tree(int64_t layer_idx,
                                        torch::Tensor top_ks,
                                        torch::Tensor top_k_offsets,
