@@ -55,6 +55,12 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
+from vllm.model_executor.layers.quantization.utils.trtllm_moe import (
+    can_use_trtllm_fp4_moe,
+    trtllm_fp4_block_scale_moe,
+    trtllm_moe_enabled,
+    warn_trtllm_moe_unavailable,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     get_marlin_input_dtype,
 )
@@ -75,6 +81,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
 from vllm.model_executor.parameter import ModelWeightParameter, PerTensorScaleParameter
+from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.utils.flashinfer import (
     flashinfer_scaled_fp4_mm,
@@ -89,7 +96,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 QUANT_ALGOS = ["FP8", "NVFP4"]
-KV_CACHE_QUANT_ALGOS = ["FP8"]
+KV_CACHE_QUANT_ALGOS = ["FP8", "NVFP4"]
 
 
 class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
@@ -99,6 +106,65 @@ class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
 
     def __init__(self, quant_config: "ModelOptQuantConfigBase"):
         super().__init__(quant_config)
+
+
+class ModelOptNvFp4KVCacheMethod(BaseKVCacheMethod):
+    """Supports loading NVFP4 kv-cache scaling factors."""
+
+    def __init__(self, quant_config: "ModelOptQuantConfigBase"):
+        super().__init__(quant_config)
+
+    def create_weights(self, layer: torch.nn.Module):
+        layer.k_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
+        layer.v_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
+        layer.kv_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not hasattr(layer, "k_cache_scaling_factor"):
+            layer._k_global_scale_float = 1.0
+            layer._v_global_scale_float = 1.0
+            return
+
+        def _extract_scale(value: torch.Tensor) -> float | None:
+            if value.numel() == 0:
+                return None
+            scale_val = float(value.to("cpu").item())
+            return scale_val if scale_val > 0.0 else None
+
+        k_scale = _extract_scale(layer.k_cache_scaling_factor)
+        v_scale = _extract_scale(layer.v_cache_scaling_factor)
+        kv_scale = _extract_scale(layer.kv_cache_scaling_factor)
+        scales_found = any(scale is not None for scale in (k_scale, v_scale, kv_scale))
+
+        if k_scale is None and v_scale is None and kv_scale is not None:
+            k_scale = kv_scale
+            v_scale = kv_scale
+        elif k_scale is None and v_scale is not None:
+            k_scale = v_scale
+        elif v_scale is None and k_scale is not None:
+            v_scale = k_scale
+        elif k_scale is None and v_scale is None:
+            k_scale = 1.0
+            v_scale = 1.0
+            if not getattr(layer, "calculate_kv_scales", False):
+                logger.warning_once(
+                    "NVFP4 kv_cache_scaling_factor not found; using 1.0."
+                )
+
+        layer._k_global_scale_float = k_scale
+        layer._v_global_scale_float = v_scale
+        if scales_found:
+            layer.calculate_kv_scales = False
+
+        del layer.k_cache_scaling_factor
+        del layer.v_cache_scaling_factor
+        del layer.kv_cache_scaling_factor
 
 
 class ModelOptQuantConfigBase(QuantizationConfig):
@@ -486,7 +552,20 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
         self.cutlass_fp8_supported = cutlass_fp8_supported()
         self.flashinfer_moe_backend: FlashinferMoeBackend | None = None
-        if envs.VLLM_USE_FLASHINFER_MOE_FP8 and has_flashinfer_moe():
+        enable_flashinfer = envs.VLLM_USE_FLASHINFER_MOE_FP8
+        if (
+            not envs.is_set("VLLM_USE_FLASHINFER_MOE_FP8")
+            and current_platform.is_device_capability_family(120)
+            and has_flashinfer_moe()
+        ):
+            enable_flashinfer = True
+            logger.info_once(
+                "Defaulting to FlashInfer FP8 MoE kernels on SM120. "
+                "Set VLLM_USE_FLASHINFER_MOE_FP8=0 to disable."
+            )
+
+        has_fi_moe = has_flashinfer_moe()
+        if enable_flashinfer and has_fi_moe:
             self.flashinfer_moe_backend = get_flashinfer_moe_backend()
             if (
                 self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
@@ -500,6 +579,11 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
             logger.info_once(
                 f"Using FlashInfer {self.flashinfer_moe_backend.value} kernels"
+            )
+        elif enable_flashinfer and not has_fi_moe:
+            logger.warning_once(
+                "FlashInfer FP8 MoE requested but FlashInfer is unavailable; "
+                "falling back to non-FlashInfer MoE kernels."
             )
 
     def maybe_make_prepare_finalize(
@@ -862,6 +946,13 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
 
             self.group_size = group_size
             self.kv_cache_quant_algo = kv_cache_quant_algo
+            if (
+                kv_cache_quant_algo is not None
+                and "AFFINE" in kv_cache_quant_algo.upper()
+            ):
+                raise ValueError(
+                    "NVFP4 affine KV cache quantization is not supported."
+                )
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_fp4"
@@ -1582,6 +1673,29 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             and self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
             and not layer.enable_eplb
         ):
+            if trtllm_moe_enabled():
+                if (
+                    can_use_trtllm_fp4_moe()
+                    and not layer.moe_parallel_config.use_all2all_kernels
+                ):
+                    return trtllm_fp4_block_scale_moe(
+                        layer=layer,
+                        x=x,
+                        router_logits=router_logits,
+                        top_k=layer.top_k,
+                        global_num_experts=layer.global_num_experts,
+                        num_expert_group=layer.num_expert_group,
+                        topk_group=layer.topk_group,
+                        custom_routing_function=layer.custom_routing_function,
+                        e_score_correction_bias=layer.e_score_correction_bias,
+                    )
+                if layer.moe_parallel_config.use_all2all_kernels:
+                    logger.warning_once(
+                        "TRTLLM NVFP4 MoE custom ops do not support all2all; "
+                        "falling back to FlashInfer kernels."
+                    )
+                warn_trtllm_moe_unavailable("nvfp4-block-scale")
+
             return flashinfer_trtllm_fp4_moe(
                 layer=layer,
                 x=x,
@@ -1609,6 +1723,26 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             self.allow_flashinfer
             and self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM
         ):
+            if trtllm_moe_enabled() and can_use_trtllm_fp4_moe():
+                if layer.moe_parallel_config.use_all2all_kernels:
+                    logger.warning_once(
+                        "TRTLLM NVFP4 MoE custom ops do not support all2all; "
+                        "falling back to FlashInfer routed kernels."
+                    )
+                else:
+                    return trtllm_fp4_block_scale_moe(
+                        layer=layer,
+                        x=x,
+                        router_logits=router_logits,
+                        top_k=layer.top_k,
+                        global_num_experts=layer.global_num_experts,
+                        num_expert_group=layer.num_expert_group,
+                        topk_group=layer.topk_group,
+                        custom_routing_function=layer.custom_routing_function,
+                        e_score_correction_bias=layer.e_score_correction_bias,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                    )
             return flashinfer_trtllm_fp4_routed_moe(
                 layer=layer,
                 x=x,
@@ -1696,4 +1830,4 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
 ModelOptNvFp4Config.LinearMethodCls = ModelOptNvFp4LinearMethod
 ModelOptNvFp4Config.FusedMoEMethodCls = ModelOptNvFp4FusedMoE
-ModelOptNvFp4Config.KVCacheMethodCls = ModelOptFp8KVCacheMethod
+ModelOptNvFp4Config.KVCacheMethodCls = ModelOptNvFp4KVCacheMethod

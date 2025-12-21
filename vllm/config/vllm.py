@@ -554,14 +554,6 @@ class VllmConfig:
                         "Currently, async scheduling is only supported "
                         "with EAGLE/MTP kind of speculative decoding"
                     )
-                if self.speculative_config.disable_padded_drafter_batch:
-                    raise ValueError(
-                        "async scheduling for EAGLE/MTP kind of speculative "
-                        "decoding is enabled, but disable_padded_drafter_batch=True "
-                        "disable_padded_drafter_batch=True is not supported for "
-                        "this situation now. please set "
-                        "disable_padded_drafter_batch=Fasle"
-                    )
             if not executor_supports_async_sched:
                 raise ValueError(
                     "Currently, async scheduling only supports `mp`, `uni`, or "
@@ -571,15 +563,31 @@ class VllmConfig:
         elif self.scheduler_config.async_scheduling is None:
             # Enable async scheduling unless there is an incompatible option.
             # NOTE: we won't reach here until async scheduling is enabled by default.
-            if (
-                self.parallel_config.pipeline_parallel_size > 1
-                or self.speculative_config is not None
-            ):
+            if self.parallel_config.pipeline_parallel_size > 1:
                 logger.warning(
-                    "Async scheduling is not yet supported with speculative decoding "
-                    " or pipeline_parallel_size > 1 and will be disabled."
+                    "Async scheduling is not yet supported with "
+                    "pipeline_parallel_size > 1 and will be disabled."
                 )
                 self.scheduler_config.async_scheduling = False
+            elif self.speculative_config is not None:
+                if self.speculative_config.method in get_args(EagleModelTypes):
+                    if executor_supports_async_sched:
+                        self.scheduler_config.async_scheduling = True
+                    else:
+                        logger.warning(
+                            "Async scheduling will be disabled because it is not "
+                            "supported with the `%s` distributed executor backend "
+                            "(only `mp`, `uni`, and `external_launcher` are supported).",
+                            executor_backend,
+                        )
+                        self.scheduler_config.async_scheduling = False
+                else:
+                    logger.warning(
+                        "Async scheduling is not yet supported with speculative "
+                        "decoding (except EAGLE/MTP with padded draft batches) "
+                        "and will be disabled."
+                    )
+                    self.scheduler_config.async_scheduling = False
             elif not executor_supports_async_sched:
                 logger.warning(
                     "Async scheduling will be disabled because it is not supported "

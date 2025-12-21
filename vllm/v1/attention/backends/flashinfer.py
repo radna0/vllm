@@ -70,6 +70,16 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_gen_workspace_buffer = None
+_TRTLLM_DECODE_BACKEND_AUTO = "auto"
+_TRTLLM_DECODE_BACKEND_XQA = "xqa"
+_TRTLLM_DECODE_BACKEND_MMHA = "mmha"
+_TRTLLM_DECODE_BACKEND_TRTLLM_GEN = "trtllm-gen"
+
+
+def _normalize_trtllm_decode_backend(value: str | None) -> str:
+    if value is None:
+        return _TRTLLM_DECODE_BACKEND_AUTO
+    return value.lower()
 
 
 def _get_trtllm_gen_workspace_buffer():
@@ -280,6 +290,7 @@ class FlashInferBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
+        "bfloat16",
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
@@ -363,7 +374,7 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        """FlashInfer supports sinks when TRTLLM attention is available (SM100/SM120)."""
+        """FlashInfer supports sinks when TRTLLM-GEN is available (SM100/103/120)."""
         from vllm.utils.flashinfer import (
             force_use_trtllm_attention,
             supports_trtllm_attention,
@@ -603,9 +614,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.has_sinks = self.global_hyperparameters.has_sinks
         if self.has_sinks and not can_use_trtllm:
             raise NotImplementedError(
-                "FlashInfer backend currently does not support attention "
-                "sinks, please use trtllm on blackwell or flash attention on "
-                "earlier GPUs."
+                "FlashInfer backend does not support attention sinks on this "
+                "platform. TRTLLM-GEN sinks require SM100/103 or SM120 with "
+                "TRTLLM-GEN cubins (set VLLM_FLASHINFER_TRTLLM_SM120_ALLOW=1). "
+                "Use TRTLLM attention backend (thop) or TRITON/FLASH_ATTN instead."
             )
         if self.logits_soft_cap not in (None, 0.0) and self.use_trtllm_decode_attention:
             if self.attention_config.use_trtllm_attention:
@@ -847,9 +859,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if not all_uses_trtllm:
             if self.has_sinks:
                 raise NotImplementedError(
-                    "FlashInfer backend currently does not support attention "
-                    "sinks, please use trtllm on blackwell or flash attention "
-                    "on earlier GPUs."
+                    "FlashInfer backend does not support attention sinks on this "
+                    "platform. TRTLLM-GEN sinks require SM100/103 or SM120 with "
+                    "TRTLLM-GEN cubins (set VLLM_FLASHINFER_TRTLLM_SM120_ALLOW=1). "
+                    "Use TRTLLM attention backend (thop) or TRITON/FLASH_ATTN instead."
                 )
 
             if not self.global_hyperparameters.has_same_window_lefts:
@@ -1186,10 +1199,48 @@ class FlashInferImpl(AttentionImpl):
             self.sinks = sinks
 
         self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
-        if current_platform.is_device_capability_family(100):
-            self.trtllm_decode_backend = "trtllm-gen"
-        else:
-            self.trtllm_decode_backend = "xqa"
+        decode_backend = _normalize_trtllm_decode_backend(
+            envs.VLLM_TRTLLM_DECODE_BACKEND
+        )
+        if decode_backend == _TRTLLM_DECODE_BACKEND_AUTO:
+            if self.support_trtllm_attn and (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            ):
+                decode_backend = (
+                    _TRTLLM_DECODE_BACKEND_TRTLLM_GEN
+                    if self.num_queries_per_kv <= 16
+                    else _TRTLLM_DECODE_BACKEND_XQA
+                )
+            else:
+                decode_backend = _TRTLLM_DECODE_BACKEND_XQA
+        elif decode_backend == _TRTLLM_DECODE_BACKEND_TRTLLM_GEN:
+            if not self.support_trtllm_attn or self.num_queries_per_kv > 16:
+                logger.warning_once(
+                    "TRTLLM-GEN decode backend requested but unsupported for this "
+                    "configuration; falling back to XQA."
+                )
+                decode_backend = _TRTLLM_DECODE_BACKEND_XQA
+        elif decode_backend == _TRTLLM_DECODE_BACKEND_XQA:
+            xqa_supported = (
+                self.head_size % 16 == 0
+                and self.head_size <= 256
+                and self.num_queries_per_kv <= 32
+            )
+            if not xqa_supported:
+                logger.warning_once(
+                    "TRTLLM XQA decode backend requested but unsupported for this "
+                    "head size/KV ratio; falling back to MMHA."
+                )
+                decode_backend = _TRTLLM_DECODE_BACKEND_MMHA
+
+        if decode_backend == _TRTLLM_DECODE_BACKEND_XQA and self.window_left >= 0:
+            logger.warning_once(
+                "TRTLLM XQA selected with sliding window; kernels may fall back "
+                "to MMHA. Set VLLM_TRTLLM_DECODE_BACKEND=mmha to avoid fallback."
+            )
+
+        self.trtllm_decode_backend = decode_backend
         vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = (
             self.support_trtllm_attn
@@ -1310,13 +1361,16 @@ class FlashInferImpl(AttentionImpl):
             # and value[:num_actual_tokens] because the reshape_and_cache_flash
             # op uses the slot_mapping's shape to determine the number of
             # actual tokens.
+            kv_cache_dtype = (
+                "auto" if self.kv_cache_dtype == "bfloat16" else self.kv_cache_dtype
+            )
             torch.ops._C_cache_ops.reshape_and_cache_flash(
                 key,
                 value,
                 kv_cache[:, 0],
                 kv_cache[:, 1],
                 attn_metadata.slot_mapping,
-                self.kv_cache_dtype,
+                kv_cache_dtype,
                 layer._k_scale,
                 layer._v_scale,
             )

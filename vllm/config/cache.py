@@ -66,6 +66,9 @@ class CacheConfig:
     bfloat16 instead, this is an invalid option for models that do not default
     to fp8.
     """
+    enable_nvfp4_kv_cache: bool = True
+    """Enable NVFP4 KV cache. If False, NVFP4 cache dtype is disallowed and
+    auto selection will avoid nvfp4."""
     is_attention_free: bool = False
     """Whether the model is attention-free. This is primarily set in
     `ModelConfig` and that value should be manually duplicated here."""
@@ -104,8 +107,8 @@ class CacheConfig:
     loaded from CPU memory to GPU memory on the fly in each model forward pass.
     """
     calculate_kv_scales: bool = False
-    """This enables dynamic calculation of `k_scale` and `v_scale` when
-    kv_cache_dtype is fp8. If `False`, the scales will be loaded from the model
+    """This enables dynamic calculation of KV scales when kv_cache_dtype is
+    fp8 or nvfp4. If `False`, the scales will be loaded from the model
     checkpoint if available. Otherwise, the scales will default to 1.0."""
     cpu_kvcache_space_bytes: int | None = None
     """(CPU backend only) CPU key-value cache space."""

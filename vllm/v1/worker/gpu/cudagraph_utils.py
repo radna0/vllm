@@ -52,6 +52,7 @@ class CudaGraphManager:
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
+        self.aux_hidden_states: list[torch.Tensor] | None = None
 
     def needs_capture(self) -> bool:
         return len(self.cudagraph_sizes) > 0
@@ -99,12 +100,20 @@ class CudaGraphManager:
             cudagraph_runtime_mode=CUDAGraphMode.NONE,
             num_tokens_across_dp=num_tokens_across_dp,
         ):
-            hidden_states = model(
+            outputs = model(
                 input_ids=input_ids,
                 positions=positions,
             )
+            if isinstance(outputs, tuple):
+                hidden_states, aux_hidden_states = outputs
+            else:
+                hidden_states, aux_hidden_states = outputs, None
             if self.hidden_states is None:
                 self.hidden_states = torch.empty_like(hidden_states)
+            if aux_hidden_states is not None and self.aux_hidden_states is None:
+                self.aux_hidden_states = [
+                    torch.empty_like(aux) for aux in aux_hidden_states
+                ]
 
         # Capture the graph.
         assert num_tokens not in self.graphs
@@ -119,11 +128,19 @@ class CudaGraphManager:
             ),
             torch.cuda.graph(graph, self.pool),
         ):
-            hidden_states = model(
+            outputs = model(
                 input_ids=input_ids,
                 positions=positions,
             )
+            if isinstance(outputs, tuple):
+                hidden_states, aux_hidden_states = outputs
+            else:
+                hidden_states, aux_hidden_states = outputs, None
             self.hidden_states[:num_tokens] = hidden_states
+            if aux_hidden_states is not None:
+                assert self.aux_hidden_states is not None
+                for i, aux in enumerate(aux_hidden_states):
+                    self.aux_hidden_states[i][:num_tokens] = aux
         self.graphs[num_tokens] = graph
 
     @torch.inference_mode()
@@ -150,7 +167,10 @@ class CudaGraphManager:
         assert num_tokens in self.graphs
         self.graphs[num_tokens].replay()
         assert self.hidden_states is not None
-        return self.hidden_states[:num_tokens]
+        if self.aux_hidden_states is None:
+            return self.hidden_states[:num_tokens]
+        aux_hidden_states = [aux[:num_tokens] for aux in self.aux_hidden_states]
+        return self.hidden_states[:num_tokens], aux_hidden_states
 
 
 def get_cudagraph_sizes(

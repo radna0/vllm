@@ -481,6 +481,56 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_kv_cache_usage = make_per_engine(
             gauge_kv_cache_usage, engine_indexes, model_name
         )
+        gauge_kv_cache_bytes_total = self._gauge_cls(
+            name="vllm:kv_cache_bytes_total",
+            documentation="Total KV cache bytes (data + scale).",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_bytes_total = make_per_engine(
+            gauge_kv_cache_bytes_total, engine_indexes, model_name
+        )
+        gauge_kv_cache_bytes_used = self._gauge_cls(
+            name="vllm:kv_cache_bytes_used",
+            documentation="Used KV cache bytes (data + scale).",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_bytes_used = make_per_engine(
+            gauge_kv_cache_bytes_used, engine_indexes, model_name
+        )
+        gauge_kv_cache_bytes_data = self._gauge_cls(
+            name="vllm:kv_cache_bytes_data",
+            documentation="KV cache data bytes (excluding scale).",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_bytes_data = make_per_engine(
+            gauge_kv_cache_bytes_data, engine_indexes, model_name
+        )
+        gauge_kv_cache_bytes_scale = self._gauge_cls(
+            name="vllm:kv_cache_bytes_scale",
+            documentation="KV cache scale bytes (NVFP4 scale metadata).",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_bytes_scale = make_per_engine(
+            gauge_kv_cache_bytes_scale, engine_indexes, model_name
+        )
+        gauge_kv_cache_dtype_info = self._gauge_cls(
+            name="vllm:kv_cache_dtype_info",
+            documentation="KV cache dtype info (value 1).",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames + ["dtype"],
+        )
+        self.gauge_kv_cache_dtype_info = {
+            idx: gauge_kv_cache_dtype_info.labels(
+                model_name, str(idx), vllm_config.cache_config.cache_dtype
+            )
+            for idx in engine_indexes
+        }
+        for idx in engine_indexes:
+            self.gauge_kv_cache_dtype_info[idx].set(1)
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
@@ -1039,6 +1089,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 scheduler_stats.num_waiting_reqs
             )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_kv_cache_bytes_total[engine_idx].set(
+                scheduler_stats.kv_cache_bytes_total
+            )
+            self.gauge_kv_cache_bytes_used[engine_idx].set(
+                scheduler_stats.kv_cache_bytes_used
+            )
+            self.gauge_kv_cache_bytes_data[engine_idx].set(
+                scheduler_stats.kv_cache_bytes_data
+            )
+            self.gauge_kv_cache_bytes_scale[engine_idx].set(
+                scheduler_stats.kv_cache_bytes_scale
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

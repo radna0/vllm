@@ -1139,6 +1139,59 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
         )
     else:
         attn_str = "attn"
+
+    if name.endswith(
+        (".k_cache_scaling_factor", ".v_cache_scaling_factor", ".kv_cache_scaling_factor")
+    ):
+        if name in params_dict:
+            return name
+
+    if name.endswith(".kv_cache_scaling_factor"):
+        candidates: list[str] = [name]
+        if ".self_attn." in name:
+            candidates.append(name.replace(".self_attn.", f".{attn_str}."))
+        if ".attention." in name:
+            candidates.append(name.replace(".attention.", f".{attn_str}."))
+        if f".{attn_str}." not in name:
+            candidates.append(
+                name.replace(
+                    ".kv_cache_scaling_factor",
+                    f".{attn_str}.kv_cache_scaling_factor",
+                )
+            )
+        for remapped_name in dict.fromkeys(candidates):
+            if remapped_name in params_dict:
+                return remapped_name
+        logger.warning_once(
+            "Found kv_cache_scaling_factor in the checkpoint (e.g. %s), "
+            "but not found the expected name in the model (e.g. %s). "
+            "kv_cache_scaling_factor is not loaded.",
+            name,
+            candidates[-1],
+        )
+        return None
+
+    cache_scaling_mapping_patterns = [
+        (r"\.attention\.([kv])_cache_scaling_factor$", rf".{attn_str}.\1_cache_scaling_factor"),
+        (r"\.self_attn\.([kv])_cache_scaling_factor$", rf".{attn_str}.\1_cache_scaling_factor"),
+        (
+            r"\.attention\.([kv])_proj\.([kv])_cache_scaling_factor$",
+            rf".{attn_str}.\2_cache_scaling_factor",
+        ),
+        (
+            r"\.self_attn\.([kv])_proj\.([kv])_cache_scaling_factor$",
+            rf".self_attn.{attn_str}.\2_cache_scaling_factor",
+        ),
+        (
+            r"\.self_attn\.qkv_proj\.([kv])_cache_scaling_factor$",
+            r".self_attn.attn.\1_cache_scaling_factor",
+        ),
+        (
+            r"\.self_attn\.qkqkv_proj\.([kv])_cache_scaling_factor$",
+            r".self_attn.attn.\1_cache_scaling_factor",
+        ),
+        (r"\.([kv])_cache_scaling_factor$", r".attn.\1_cache_scaling_factor"),
+    ]
     # Define scale name mapping patterns in order of precedence
     scale_mapping_patterns = [
         # ModelOpt format: .self_attn.{k,v}_proj.{k,v}_scale ->
@@ -1175,6 +1228,28 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> str | None:
                     )
                     return None
                 return remapped_name
+
+    if name.endswith((".k_cache_scaling_factor", ".v_cache_scaling_factor")):
+        import regex as re
+
+        candidates = [name]
+        for pattern, replacement in cache_scaling_mapping_patterns:
+            if re.search(pattern, name):
+                candidates.append(re.sub(pattern, replacement, name))
+        for remapped_name in dict.fromkeys(candidates):
+            if remapped_name in params_dict:
+                return remapped_name
+        if len(candidates) > 1:
+            scale_type = name.split(".")[-1]
+            logger.warning_once(
+                "Found %s in the checkpoint (e.g. %s), but not found the "
+                "expected name in the model (e.g. %s). %s is not loaded.",
+                scale_type,
+                name,
+                candidates[-1],
+                scale_type,
+            )
+            return None
 
     # If there were no matches, return the untouched param name
     return name

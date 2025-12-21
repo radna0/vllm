@@ -14,6 +14,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     cutlass_fp4_supported,
 )
+from vllm.platforms import current_platform
 
 __all__ = ["detect_nvfp4_moe_support", "NvFp4Support"]
 
@@ -43,9 +44,14 @@ def detect_nvfp4_moe_support(class_name: str = "") -> NvFp4Support:
             "Using FlashInfer kernels for %s.", class_name or "NVFP4 path"
         )
     else:
-        if envs.VLLM_USE_FLASHINFER_MOE_FP4:
+        flashinfer_requested = (
+            envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4")
+            and envs.VLLM_USE_FLASHINFER_MOE_FP4
+        )
+        if flashinfer_requested or current_platform.is_device_capability_family(120):
             _logger.warning_once(
-                "FlashInfer kernels unavailable for %s on current platform.",
+                "FlashInfer NVFP4 MoE kernels unavailable for %s; "
+                "falling back to non-FlashInfer kernels.",
                 class_name or "NVFP4 path",
             )
 

@@ -43,6 +43,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.rope_utils import (
+    try_fused_rope_and_cache_nvfp4,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
@@ -112,8 +115,20 @@ class GPTNeoXAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.query_key_value(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
-        q, k = self.rotary_emb(position_ids, q, k)
-        attn_output = self.attn(q, k, v)
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=position_ids,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_heads,
+            head_dim=self.head_size,
+        )
+        if not use_fused_rope:
+            q, k = self.rotary_emb(position_ids, q, k)
+        attn_output = self.attn(q, None, None) if use_fused_rope else self.attn(q, k, v)
         output, _ = self.dense(attn_output)
         return output
 

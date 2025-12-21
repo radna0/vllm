@@ -30,14 +30,15 @@ void reshape_and_cache_flash(torch::Tensor& key, torch::Tensor& value,
                              torch::Tensor& value_cache,
                              torch::Tensor& slot_mapping,
                              const std::string& kv_cache_dtype,
-                             torch::Tensor& k_scale, torch::Tensor& v_scale);
+                             torch::Tensor& k_scale, torch::Tensor& v_scale,
+                             double k_global_scale, double v_global_scale);
 
 void fused_rope_and_cache_flash_nvfp4(
     torch::Tensor& query, torch::Tensor& key, torch::Tensor& value,
     torch::Tensor& key_cache, torch::Tensor& value_cache,
     torch::Tensor& slot_mapping, torch::Tensor& positions,
     torch::Tensor& cos_sin_cache, bool is_neox, torch::Tensor& k_scale,
-    torch::Tensor& v_scale);
+    torch::Tensor& v_scale, double k_global_scale, double v_global_scale);
 
 void concat_and_cache_mla(torch::Tensor& kv_c, torch::Tensor& k_pe,
                           torch::Tensor& kv_cache, torch::Tensor& slot_mapping,

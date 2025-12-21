@@ -186,10 +186,16 @@ def benchmark_decode(
 
     # Calculate percentage speedup (positive means TRT is faster)
     speedup_percent = (baseline_mean - trtllm_mean) / baseline_mean
+    trtllm_tps = batch_size / (trtllm_mean / 1000.0)
+    baseline_tps = batch_size / (baseline_mean / 1000.0)
+    kv_cache_bytes = kv_cache.numel() * kv_cache.element_size()
+    kv_cache_mb = kv_cache_bytes / (1024 * 1024)
+    kv_cache_bytes_per_token = kv_cache_bytes / (NUM_BLOCKS * block_size)
 
     print(
         f"\t{batch_size}\t{max_seq_len}\t{trtllm_mean:.3f}\t{trtllm_std.item():.3f}"
         f"\t{baseline_mean:.3f}\t{baseline_std.item():.3f}\t{speedup_percent:.3f}"
+        f"\t{trtllm_tps:.1f}\t{baseline_tps:.1f}\t{kv_cache_mb:.1f}\t{kv_cache_bytes_per_token:.1f}"
     )
 
     # Return results for CSV writing
@@ -200,6 +206,10 @@ def benchmark_decode(
         "baseline_mean": baseline_mean,
         "baseline_std": baseline_std.item(),
         "speedup_percent": speedup_percent,
+        "trtllm_tps": trtllm_tps,
+        "baseline_tps": baseline_tps,
+        "kv_cache_mb": kv_cache_mb,
+        "kv_cache_bytes_per_token": kv_cache_bytes_per_token,
         "q_dtype": str(q_quant_dtype),
         "kv_cache_dtype": str(kv_quant_dtype),
         "output_dtype": str(o_quant_dtype),
@@ -223,6 +233,10 @@ def write_results_to_csv(results, filename=None):
         "baseline_mean",
         "baseline_std",
         "speedup_percent",
+        "trtllm_tps",
+        "baseline_tps",
+        "kv_cache_mb",
+        "kv_cache_bytes_per_token",
         "q_dtype",
         "kv_cache_dtype",
         "output_dtype",
@@ -274,7 +288,8 @@ if __name__ == "__main__":
         )
         print(
             "\tbatch_size\tmax_seq_len\ttrtllm_mean\ttrtllm_std\tbaseline_mean\t"
-            "baseline_std\tspeedup_percent"
+            "baseline_std\tspeedup_percent\ttrtllm_tps\tbaseline_tps\t"
+            "kv_cache_mb\tkv_cache_bytes_per_token"
         )
         for max_seq_len in max_seq_lens:
             for bs in batch_sizes:

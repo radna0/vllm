@@ -18,6 +18,7 @@ import subprocess
 import signal
 import aiohttp
 import asyncio
+import urllib.request
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 from pathlib import Path
@@ -226,7 +227,6 @@ class EnhancedVLLMBenchmark:
                         async with aiohttp.ClientSession() as session:
                             async with session.get(health_url, timeout=5) as response:
                                 return response.status == 200
-                    return await check_health()
                     return asyncio.run(check_health())
                 else:
                     # Fallback to simple HTTP request if aiohttp not available
@@ -243,6 +243,53 @@ class EnhancedVLLMBenchmark:
             time.sleep(2)
             
         return False
+
+    def fetch_spec_decode_metrics(self) -> Dict[str, Any]:
+        """Fetch spec decode metrics from the /metrics endpoint."""
+        metrics_url = f"http://localhost:{self.server_port}/metrics"
+        try:
+            with urllib.request.urlopen(metrics_url, timeout=5) as response:
+                payload = response.read().decode("utf-8")
+        except Exception:
+            return {}
+
+        wanted = {
+            "vllm:spec_decode_num_drafts_total",
+            "vllm:spec_decode_num_draft_tokens_total",
+            "vllm:spec_decode_num_accepted_tokens_total",
+        }
+        values: Dict[str, float] = {}
+        for line in payload.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            name, value = parts
+            if name in wanted:
+                try:
+                    values[name] = float(value)
+                except ValueError:
+                    continue
+
+        if not values:
+            return {}
+
+        draft_tokens = values.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
+        accepted_tokens = values.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
+        num_drafts = values.get("vllm:spec_decode_num_drafts_total", 0.0)
+        acceptance_rate = (
+            (accepted_tokens / draft_tokens) * 100.0 if draft_tokens > 0 else None
+        )
+        mean_accept_len = (
+            1.0 + (accepted_tokens / num_drafts) if num_drafts > 0 else None
+        )
+
+        return {
+            "raw": values,
+            "acceptance_rate_pct": acceptance_rate,
+            "mean_accept_len": mean_accept_len,
+        }
 
     def stop_server(self):
         """Stop server gracefully."""
@@ -480,6 +527,7 @@ class EnhancedVLLMBenchmark:
         if not self.start_server(mode, method, num_spec_tokens, **kwargs):
             return {"error": "Failed to start server", "scenario": scenario_name}
 
+        spec_decode_metrics: Dict[str, Any] = {}
         try:
             # Generate prompts
             prompts = self.generate_prompts(batch_size, context_length)
@@ -488,6 +536,7 @@ class EnhancedVLLMBenchmark:
             results = self.run_api_benchmark_sync(
                     prompts, max_new_tokens, warmup_runs, measurement_runs
                 )
+            spec_decode_metrics = self.fetch_spec_decode_metrics()
 
         except Exception as e:
             print(f"Error during benchmark: {e}")
@@ -515,6 +564,8 @@ class EnhancedVLLMBenchmark:
             "vllm_version": self.vllm_version,
             "server_port": self.server_port,
         }
+        if spec_decode_metrics:
+            results["spec_decode_metrics"] = spec_decode_metrics
 
         # Save results
         filename = f"{scenario_name.replace(' ', '_').lower()}.json"

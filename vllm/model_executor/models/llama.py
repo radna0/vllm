@@ -32,7 +32,7 @@ from torch import nn
 from transformers import LlamaConfig
 
 from vllm.attention.backends.abstract import AttentionType
-from vllm.attention.layer import Attention, get_attention_context
+from vllm.attention.layer import Attention
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -47,7 +47,9 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+from vllm.model_executor.models.rope_utils import (
+    try_fused_rope_and_cache_nvfp4,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -240,54 +242,17 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        use_fused_rope = False
-        if (
-            self.attn.kv_cache_dtype == "nvfp4"
-            and self.attn.use_direct_call
-            and self.attn.kv_sharing_target_layer_name is None
-            and not self.attn.calculate_kv_scales
-            and positions.dim() == 1
-            and isinstance(self.rotary_emb, RotaryEmbedding)
-            and q.dtype in (torch.float16, torch.bfloat16)
-        ):
-            attn_metadata, attn_layer, kv_cache = get_attention_context(
-                self.attn.layer_name
-            )
-            if attn_metadata is not None and hasattr(attn_metadata, "slot_mapping"):
-                if (
-                    not getattr(attn_metadata, "use_cascade", False)
-                    and getattr(self.attn.impl, "dcp_world_size", 1) == 1
-                ):
-                    k_scale = getattr(attn_layer, "kv_cache_k_scale", None)
-                    v_scale = getattr(attn_layer, "kv_cache_v_scale", None)
-                    if k_scale is not None and v_scale is not None:
-                        self.rotary_emb._match_cos_sin_cache_dtype(q)
-                        q_3d = q.view(-1, self.num_heads, self.head_dim)
-                        k_3d = k.view(-1, self.num_kv_heads, self.head_dim)
-                        v_3d = v.view(-1, self.num_kv_heads, self.head_dim)
-                        if kv_cache.shape[0] == 2:
-                            key_cache, value_cache = kv_cache.unbind(0)
-                        elif kv_cache.shape[1] == 2:
-                            key_cache, value_cache = kv_cache.unbind(1)
-                        else:
-                            key_cache, value_cache = None, None
-                        if key_cache is not None and value_cache is not None:
-                            from vllm import _custom_ops as ops
-
-                            ops.fused_rope_and_cache_flash_nvfp4(
-                                q_3d,
-                                k_3d,
-                                v_3d,
-                                key_cache,
-                                value_cache,
-                                attn_metadata.slot_mapping,
-                                positions,
-                                self.rotary_emb.cos_sin_cache,
-                                self.rotary_emb.is_neox_style,
-                                k_scale,
-                                v_scale,
-                            )
-                            use_fused_rope = True
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
 
         if not use_fused_rope:
             q, k = self.rotary_emb(positions, q, k)

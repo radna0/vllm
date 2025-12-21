@@ -56,16 +56,17 @@ def get_flash_attn_version(requires_alibi: bool = False) -> int | None:
             fa_version = vllm_config.attention_config.flash_attn_version
 
         # 3. fallback for unsupported combinations
-        if device_capability.major == 10 and fa_version == 3:
+        if device_capability.major >= 10 and fa_version == 3:
             logger.warning_once(
-                "Cannot use FA version 3 on Blackwell platform "
+                "Cannot use FA version 3 on compute capability >= 10.0 "
                 "defaulting to FA version 2."
             )
             fa_version = 2
 
-        if requires_alibi and fa_version == 3:
+        if requires_alibi and fa_version in (3, 4):
             logger.warning_once(
-                "Cannot use FA version 3 with ALiBi, defaulting to FA version 2."
+                "Cannot use FA version %d with ALiBi, defaulting to FA version 2.",
+                fa_version,
             )
             fa_version = 2
 
@@ -93,7 +94,7 @@ def flash_attn_supports_sinks() -> bool:
     if current_platform.is_xpu():
         return True
     else:
-        return get_flash_attn_version() == 3
+        return get_flash_attn_version() in (3, 4)
 
 
 def flash_attn_supports_mla():

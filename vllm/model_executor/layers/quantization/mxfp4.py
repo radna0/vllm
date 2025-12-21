@@ -53,7 +53,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_s
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutlass_fused_moe
+from vllm.utils.flashinfer import (
+    has_flashinfer,
+    has_flashinfer_cutlass_fused_moe,
+    has_flashinfer_trtllm_fused_moe,
+)
 from vllm.utils.import_utils import has_triton_kernels
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import is_torch_equal_or_newer
@@ -110,16 +114,20 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
         return get_mxfp4_backend_with_lora()
 
     if current_platform.is_cuda():
+        has_fi = has_flashinfer()
+        has_fi_cutlass = has_flashinfer_cutlass_fused_moe()
+        has_fi_trtllm = has_flashinfer_trtllm_fused_moe()
+
         if (
             current_platform.is_device_capability(90)
-            and has_flashinfer()
+            and has_fi_cutlass
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16
         ):
             logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM90")
             return Mxfp4Backend.SM90_FI_MXFP4_BF16
         elif (
             current_platform.is_device_capability_family(120)
-            and has_flashinfer()
+            and has_fi_trtllm
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16
         ):
             logger.info_once("Using FlashInfer MXFP4 BF16 backend for SM120")
@@ -129,7 +137,7 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
                 current_platform.is_device_capability_family(100)
                 or current_platform.is_device_capability_family(120)
             )
-            and has_flashinfer()
+            and has_fi_cutlass
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
         ):
             logger.info_once(
@@ -138,8 +146,7 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
         elif (
             current_platform.is_device_capability_family(120)
-            and has_flashinfer()
-            and has_flashinfer_cutlass_fused_moe()
+            and has_fi_cutlass
         ):
             logger.info_once(
                 "Using FlashInfer MXFP4 MXFP8 CUTLASS backend for SM120 by default. "
@@ -147,15 +154,24 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             )
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
         elif (
-            current_platform.is_device_capability_family(100)
-            and has_flashinfer()
+            (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
+            and has_fi_trtllm
             and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8
         ):
+            logger.info_once(
+                "Using FlashInfer MXFP4 MXFP8 TRTLLM backend for SM100/SM120"
+            )
             return Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
         elif (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability_family(120)
-        ) and has_flashinfer():
+            (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
+            and has_fi_trtllm
+        ):
             logger.info_once(
                 "Using FlashInfer MXFP4 BF16 backend for SM100/SM120. "
                 "For SM100, consider VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8=1 "
@@ -167,7 +183,7 @@ def get_mxfp4_backend(with_lora_support: bool) -> Mxfp4Backend:
             current_platform.is_device_capability_family(100)
             or current_platform.is_device_capability_family(120)
             or current_platform.is_device_capability(90)
-        ) and not has_flashinfer():
+        ) and not has_fi:
             logger.warning_once(
                 "MXFP4 MoE is enabled on Hopper/Blackwell but FlashInfer "
                 "is not available. This may result in degraded performance. "
@@ -436,6 +452,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_TRTLLM
             or self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_BF16
         ):
+            packed_meta = getattr(layer, "packed_weights_meta", None)
+            prepacked = bool(
+                isinstance(packed_meta, dict)
+                and packed_meta.get("backend_prepack")
+                == "flashinfer-trtllm-mxfp4"
+            )
             from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
             from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
 
@@ -487,6 +509,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and layer.w2_bias.shape[0] == self.num_experts
                 and layer.w2_bias.shape[1] == self.hidden_size
             )
+
+            if prepacked:
+                return
+
+            def _trim_to_numel(tensor: torch.Tensor, target_numel: int) -> torch.Tensor:
+                if tensor.numel() < target_numel:
+                    raise ValueError(
+                        "Interleaved tensor is smaller than expected: "
+                        f"{tensor.numel()} < {target_numel}."
+                    )
+                if tensor.numel() == target_numel:
+                    return tensor
+                return tensor.reshape(-1)[:target_numel]
 
             w13_weight_scale = layer.w13_weight_scale.data
             w2_weight_scale = layer.w2_weight_scale.data
@@ -546,15 +581,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     epilogue_tile_m,
                     num_elts_per_sf=16,
                 )
-                gemm1_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w13_weight_scale[i]
-                        .view(torch.uint8)[
-                            permute_sf_indices.to(w13_weight_scale.device)
-                        ]
-                        .contiguous()
-                    )
+                w13_scale_perm = (
+                    w13_weight_scale[i]
+                    .view(torch.uint8)[permute_sf_indices.to(w13_weight_scale.device)]
+                    .contiguous()
                 )
+                w13_scale_perm = nvfp4_block_scale_interleave(w13_scale_perm)
+                w13_scale_perm = _trim_to_numel(w13_scale_perm, w13_weight_scale[i].numel())
+                gemm1_scales_mxfp4_shuffled.append(w13_scale_perm)
                 # w13 bias shuffling
                 permute_bias_indices = get_w2_permute_indices_with_cache(
                     self._cache_permute_indices,
@@ -585,15 +619,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     epilogue_tile_m,
                     num_elts_per_sf=16,
                 )
-                gemm2_scales_mxfp4_shuffled.append(
-                    nvfp4_block_scale_interleave(
-                        w2_weight_scale[i]
-                        .view(torch.uint8)[
-                            permute_sf_indices.to(w2_weight_scale.device)
-                        ]
-                        .contiguous()
-                    )
+                w2_scale_perm = (
+                    w2_weight_scale[i]
+                    .view(torch.uint8)[permute_sf_indices.to(w2_weight_scale.device)]
+                    .contiguous()
                 )
+                w2_scale_perm = nvfp4_block_scale_interleave(w2_scale_perm)
+                w2_scale_perm = _trim_to_numel(w2_scale_perm, w2_weight_scale[i].numel())
+                gemm2_scales_mxfp4_shuffled.append(w2_scale_perm)
                 # w2 bias shuffling
                 permute_indices = get_w2_permute_indices_with_cache(
                     self._cache_permute_indices,
@@ -645,6 +678,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.mxfp4_backend == Mxfp4Backend.SM100_FI_MXFP4_MXFP8_CUTLASS
             or self.mxfp4_backend == Mxfp4Backend.SM90_FI_MXFP4_BF16
         ):
+            packed_meta = getattr(layer, "packed_weights_meta", None)
+            prepacked = bool(
+                isinstance(packed_meta, dict)
+                and packed_meta.get("backend_prepack")
+                == "flashinfer-cutlass-mxfp4"
+            )
             layer.gemm1_alpha = Parameter(
                 torch.tensor([1.702] * self.num_experts, dtype=torch.float32).cuda(),
                 requires_grad=False,
@@ -696,6 +735,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 and layer.w2_bias.shape[1] == self.hidden_size
             )
 
+            if prepacked:
+                return
+
             # De-interleave and swap for w13 weight, bias, and scales
             w13_w = layer.w13_weight.data
             gate_w, up_w = w13_w[:, ::2, :], w13_w[:, 1::2, :]
@@ -721,13 +763,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 orig_shape = w13_scale_swapped.shape
                 w13_scale_interleaved = block_scale_interleave(
                     w13_scale_swapped.view(torch.uint8)
-                ).reshape(orig_shape)
+                )
+                if w13_scale_interleaved.numel() != w13_scale_swapped.numel():
+                    w13_scale_interleaved = (
+                        w13_scale_interleaved.reshape(-1)[: w13_scale_swapped.numel()]
+                    )
+                w13_scale_interleaved = w13_scale_interleaved.reshape(orig_shape)
 
                 w2_s = layer.w2_weight_scale.data
                 orig_shape = w2_s.shape
-                w2_scale_interleaved = block_scale_interleave(
-                    w2_s.view(torch.uint8)
-                ).reshape(orig_shape)
+                w2_scale_interleaved = block_scale_interleave(w2_s.view(torch.uint8))
+                if w2_scale_interleaved.numel() != w2_s.numel():
+                    w2_scale_interleaved = (
+                        w2_scale_interleaved.reshape(-1)[: w2_s.numel()]
+                    )
+                w2_scale_interleaved = w2_scale_interleaved.reshape(orig_shape)
 
                 layer.w13_weight = Parameter(w13_weight_swapped, requires_grad=False)
                 layer.w13_weight_scale = Parameter(

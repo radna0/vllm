@@ -14,13 +14,13 @@ if not current_platform.has_device_capability(100):
 
 
 def _dequantize_nvfp4_kv_cache(
-    packed: torch.Tensor, scales: torch.Tensor, head_size: int
+    packed: torch.Tensor, scales: torch.Tensor, head_size: int, global_scale: float
 ) -> torch.Tensor:
     packed_head_size = head_size // 8
     scale_elems = head_size // 16
     packed_bytes = packed.view(torch.uint8).reshape(-1, packed_head_size * 4)
     values = break_fp4_bytes(packed_bytes, dtype=torch.float32)
-    scales_f32 = scales.view(torch.float8_e4m3fn).to(torch.float32)
+    scales_f32 = scales.view(torch.float8_e4m3fn).to(torch.float32) / global_scale
     scales_f32 = scales_f32.reshape(-1, scale_elems)
     values = values.reshape(-1, scale_elems, 16) * scales_f32[:, :, None]
     return values.reshape(-1, head_size)
@@ -55,6 +55,7 @@ def test_nvfp4_kv_cache_pack_unpack_order(dtype: torch.dtype) -> None:
     block_size = 4
     num_tokens = 4
     num_heads = 1
+    global_scale = 2.0
 
     base_vals = kE2M1ToFloat.to(device=device)
     values = torch.cat((base_vals, -base_vals)).to(dtype=dtype)
@@ -89,9 +90,11 @@ def test_nvfp4_kv_cache_pack_unpack_order(dtype: torch.dtype) -> None:
         "nvfp4",
         k_scale,
         v_scale,
+        global_scale,
+        global_scale,
     )
 
-    dequant = _dequantize_nvfp4_kv_cache(key_cache, k_scale, head_size)
+    dequant = _dequantize_nvfp4_kv_cache(key_cache, k_scale, head_size, global_scale)
     torch.testing.assert_close(
         dequant.view_as(key),
         key,
@@ -99,7 +102,9 @@ def test_nvfp4_kv_cache_pack_unpack_order(dtype: torch.dtype) -> None:
         atol=1e-2,
     )
     v_scale_linear = _deinterleave_v_scales(v_scale, head_size)
-    dequant_v = _dequantize_nvfp4_kv_cache(value_cache, v_scale_linear, head_size)
+    dequant_v = _dequantize_nvfp4_kv_cache(
+        value_cache, v_scale_linear, head_size, global_scale
+    )
     torch.testing.assert_close(
         dequant_v.view_as(value),
         value,

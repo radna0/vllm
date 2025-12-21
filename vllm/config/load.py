@@ -49,6 +49,7 @@ class LoadConfig:
     https://github.com/ggml-org/ggml/blob/master/docs/gguf.md).\n
     - "mistral" will load weights from consolidated safetensors files used by
     Mistral models.
+    - "drift" will load vLLM-native packed safetensors (non-HF naming).\n
     - Other custom values can be supported via plugins."""
     download_dir: str | None = None
     """Directory to download and load the weights, default to the default

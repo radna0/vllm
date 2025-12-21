@@ -5,6 +5,7 @@
 import torch
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -26,6 +27,8 @@ from vllm.utils.flashinfer import (
     has_flashinfer_cutlass_fused_moe,
 )
 
+logger = init_logger(__name__)
+
 __all__ = [
     "is_flashinfer_fp4_cutlass_moe_available",
     "is_flashinfer_fp4_cutedsl_moe_available",
@@ -34,10 +37,22 @@ __all__ = [
 ]
 
 
+def _flashinfer_fp4_enabled() -> bool:
+    if envs.is_set("VLLM_USE_FLASHINFER_MOE_FP4"):
+        return envs.VLLM_USE_FLASHINFER_MOE_FP4
+    if current_platform.is_device_capability_family(120):
+        logger.info_once(
+            "Defaulting to FlashInfer FP4 MoE kernels on SM120. "
+            "Set VLLM_USE_FLASHINFER_MOE_FP4=0 to disable."
+        )
+        return True
+    return False
+
+
 def is_flashinfer_fp4_cutlass_moe_available() -> bool:
     """Return `True` when FlashInfer CUTLASS NV-FP4 kernels can be used."""
     return (
-        envs.VLLM_USE_FLASHINFER_MOE_FP4
+        _flashinfer_fp4_enabled()
         and has_flashinfer_cutlass_fused_moe()
         and current_platform.is_cuda()
         and current_platform.has_device_capability(100)
@@ -47,7 +62,7 @@ def is_flashinfer_fp4_cutlass_moe_available() -> bool:
 def is_flashinfer_fp4_cutedsl_moe_available() -> bool:
     """Return ``True`` when FlashInfer CUTEDSL NV-FP4 kernels can be used."""
     return (
-        envs.VLLM_USE_FLASHINFER_MOE_FP4
+        _flashinfer_fp4_enabled()
         and has_flashinfer_cutedsl_grouped_gemm_nt_masked()
         and current_platform.is_cuda()
         and (

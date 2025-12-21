@@ -285,11 +285,25 @@ def get_flashinfer_moe_backend() -> FlashinferMoeBackend:
     if flashinfer_moe_backend in backend_map:
         if (
             flashinfer_moe_backend == "latency"
-            and not current_platform.is_device_capability_family(100)
+            and not (
+                current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)
+            )
         ):
             logger.info_once(
                 "Flashinfer TRTLLM MOE backend is only supported on "
                 "SM100 and later, using CUTLASS backend instead",
+                scope="local",
+            )
+            return FlashinferMoeBackend.CUTLASS
+        if (
+            flashinfer_moe_backend == "latency"
+            and current_platform.is_device_capability_family(120)
+            and not envs.is_set("VLLM_FLASHINFER_MOE_BACKEND")
+        ):
+            logger.info_once(
+                "Defaulting FlashInfer MoE backend to CUTLASS on SM120. "
+                "Set VLLM_FLASHINFER_MOE_BACKEND=latency to enable TRTLLM.",
                 scope="local",
             )
             return FlashinferMoeBackend.CUTLASS

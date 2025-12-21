@@ -260,6 +260,7 @@ class TritonAttentionBackend(AttentionBackend):
     ]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
+        "bfloat16",
         "fp8",
         "fp8_e4m3",
         "fp8_e5m2",
@@ -445,6 +446,14 @@ class TritonAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(1)
+        k_scale = layer._k_scale
+        v_scale = layer._v_scale
+        if k_scale.device != query.device:
+            k_scale = k_scale.to(query.device)
+            layer._k_scale = k_scale
+        if v_scale.device != query.device:
+            v_scale = v_scale.to(query.device)
+            layer._v_scale = v_scale
 
         if (
             self.kv_sharing_target_layer_name is None
@@ -453,44 +462,65 @@ class TritonAttentionImpl(AttentionImpl):
         ):
             # Reshape the input keys and values and store them in the cache.
             # Skip this if sharing KV cache with an earlier attention layer.
-            if self.kv_cache_dtype == "nvfp4":
-                torch.ops._C_cache_ops.reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer.kv_cache_k_scale,
-                    layer.kv_cache_v_scale,
-                )
-            elif self.kv_cache_dtype.startswith("fp8"):
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
-                # triton kernel does not support uint8 kv_cache
-                #  (because some explicit casts (e.g. float8_e4m3fnuz)
-                #   are not supported)
-                triton_reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
-            else:
-                triton_reshape_and_cache_flash(
-                    key,
-                    value,
-                    key_cache,
-                    value_cache,
-                    attn_metadata.slot_mapping,
-                    self.kv_cache_dtype,
-                    layer._k_scale,
-                    layer._v_scale,
-                )
+            slot_mapping = attn_metadata.slot_mapping
+            cache_key = key
+            cache_value = value
+            num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+            num_tokens = min(
+                cache_key.shape[0],
+                cache_value.shape[0],
+                slot_mapping.numel(),
+            )
+            if isinstance(num_actual_tokens, int) and 0 < num_actual_tokens < num_tokens:
+                num_tokens = num_actual_tokens
+            if num_tokens > 0:
+                if cache_key.shape[0] != num_tokens:
+                    cache_key = cache_key[:num_tokens]
+                    cache_value = cache_value[:num_tokens]
+                if slot_mapping.numel() != num_tokens:
+                    slot_mapping = slot_mapping[:num_tokens]
+                if not slot_mapping.is_contiguous():
+                    slot_mapping = slot_mapping.contiguous()
+                if self.kv_cache_dtype == "nvfp4":
+                    torch.ops._C_cache_ops.reshape_and_cache_flash(
+                        cache_key,
+                        cache_value,
+                        key_cache,
+                        value_cache,
+                        slot_mapping,
+                        self.kv_cache_dtype,
+                        layer.kv_cache_k_scale,
+                        layer.kv_cache_v_scale,
+                        layer._k_global_scale_float,
+                        layer._v_global_scale_float,
+                    )
+                elif self.kv_cache_dtype.startswith("fp8"):
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                    # triton kernel does not support uint8 kv_cache
+                    #  (because some explicit casts (e.g. float8_e4m3fnuz)
+                    #   are not supported)
+                    triton_reshape_and_cache_flash(
+                        cache_key,
+                        cache_value,
+                        key_cache,
+                        value_cache,
+                        slot_mapping,
+                        self.kv_cache_dtype,
+                        k_scale,
+                        v_scale,
+                    )
+                else:
+                    triton_reshape_and_cache_flash(
+                        cache_key,
+                        cache_value,
+                        key_cache,
+                        value_cache,
+                        slot_mapping,
+                        self.kv_cache_dtype,
+                        k_scale,
+                        v_scale,
+                    )
 
         if self.kv_cache_dtype.startswith("fp8"):
             if key_cache.dtype != self.fp8_dtype:
@@ -512,7 +542,6 @@ class TritonAttentionImpl(AttentionImpl):
         softmax_segm_max = attn_metadata.softmax_segm_max
         softmax_segm_expsum = attn_metadata.softmax_segm_expsum
 
-        descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         use_nvfp4 = self.kv_cache_dtype == "nvfp4"
         k_scale_cache = getattr(layer, "kv_cache_k_scale", None)
         v_scale_cache = getattr(layer, "kv_cache_v_scale", None)
@@ -520,8 +549,45 @@ class TritonAttentionImpl(AttentionImpl):
             assert k_scale_cache is not None and v_scale_cache is not None, (
                 "NVFP4 KV cache requires k/v scale tensors."
             )
+            if key_cache.dtype != torch.int32 or value_cache.dtype != torch.int32:
+                raise ValueError(
+                    "NVFP4 KV cache must use int32 storage for TRITON attention."
+                )
+            if (
+                k_scale_cache.device != query.device
+                or v_scale_cache.device != query.device
+            ):
+                raise ValueError(
+                    "NVFP4 KV cache scales must be on the same device as the query."
+                )
+            if (
+                k_scale_cache.dtype != torch.float8_e4m3fn
+                or v_scale_cache.dtype != torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    "NVFP4 KV cache scales must use float8_e4m3fn dtype."
+                )
+            if k_scale_cache.stride() != v_scale_cache.stride():
+                raise ValueError(
+                    "NVFP4 KV cache requires shared scale storage for K/V."
+                )
+            if k_scale_cache.stride(-1) != 1:
+                raise ValueError(
+                    "NVFP4 KV cache scales must be contiguous in the last dimension."
+                )
+            k_global_scale = layer._k_global_scale_float
+            v_global_scale = layer._v_global_scale_float
+            k_global_scale_inv = 0.0 if k_global_scale == 0.0 else 1.0 / k_global_scale
+            v_global_scale_inv = 0.0 if v_global_scale == 0.0 else 1.0 / v_global_scale
+            k_descale = k_scale
+            v_descale = v_scale
+        else:
+            descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
+            k_global_scale_inv = 1.0
+            v_global_scale_inv = 1.0
+            k_descale = k_scale.expand(descale_shape)
+            v_descale = v_scale.expand(descale_shape)
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
-
         unified_attention(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -538,8 +604,8 @@ class TritonAttentionImpl(AttentionImpl):
             block_table=block_table,
             softcap=self.logits_soft_cap,
             q_descale=None,  # Not supported
-            k_descale=layer._k_scale.expand(descale_shape),
-            v_descale=layer._v_scale.expand(descale_shape),
+            k_descale=k_descale,
+            v_descale=v_descale,
             seq_threshold_3D=seq_threshold_3D,
             num_par_softmax_segments=num_par_softmax_segments,
             softmax_segm_output=softmax_segm_output,
@@ -551,6 +617,8 @@ class TritonAttentionImpl(AttentionImpl):
             use_nvfp4=use_nvfp4,
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
+            k_global_scale_inv=k_global_scale_inv,
+            v_global_scale_inv=v_global_scale_inv,
         )
 
         return output

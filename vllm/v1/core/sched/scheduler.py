@@ -42,7 +42,7 @@ from vllm.v1.core.sched.output import (
 from vllm.v1.core.sched.request_queue import SchedulingPolicy, create_request_queue
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -217,12 +217,84 @@ class Scheduler(SchedulerInterface):
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
         )
+        self._init_kv_cache_byte_metrics()
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
         self.perf_metrics: ModelMetrics | None = None
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
+
+    def _init_kv_cache_byte_metrics(self) -> None:
+        self._kv_cache_bytes_per_block = 0
+        self._kv_cache_data_bytes_per_block = 0
+        self._kv_cache_scale_bytes_per_block = 0
+        self._kv_cache_bytes_total = 0
+        self._kv_cache_data_bytes_total = 0
+        self._kv_cache_scale_bytes_total = 0
+
+        num_blocks = self.kv_cache_config.num_blocks
+        if num_blocks <= 0 or not self.kv_cache_config.kv_cache_tensors:
+            return
+
+        layer_specs: dict[str, Any] = {}
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                layer_specs.update(spec.kv_cache_specs)
+            else:
+                for layer_name in group.layer_names:
+                    layer_specs[layer_name] = spec
+
+        for tensor in self.kv_cache_config.kv_cache_tensors:
+            if not tensor.shared_by:
+                continue
+            layer_name = tensor.shared_by[0]
+            spec = layer_specs.get(layer_name)
+            if spec is None:
+                continue
+            data_bytes, scale_bytes = spec.page_size_bytes_breakdown()
+            expected_per_block = tensor.size // num_blocks
+            if data_bytes + scale_bytes != expected_per_block:
+                total_bytes = data_bytes + scale_bytes
+                if total_bytes > 0 and expected_per_block > 0:
+                    scale_ratio = scale_bytes / total_bytes
+                    scale_bytes = int(round(expected_per_block * scale_ratio))
+                    data_bytes = expected_per_block - scale_bytes
+                else:
+                    data_bytes = expected_per_block
+                    scale_bytes = 0
+                logger.debug(
+                    "Adjusted KV cache byte breakdown for %s: expected %d, "
+                    "got %d.",
+                    layer_name,
+                    expected_per_block,
+                    data_bytes + scale_bytes,
+                )
+            self._kv_cache_data_bytes_per_block += data_bytes
+            self._kv_cache_scale_bytes_per_block += scale_bytes
+
+        self._kv_cache_bytes_per_block = (
+            self._kv_cache_data_bytes_per_block
+            + self._kv_cache_scale_bytes_per_block
+        )
+        self._kv_cache_data_bytes_total = (
+            self._kv_cache_data_bytes_per_block * num_blocks
+        )
+        self._kv_cache_scale_bytes_total = (
+            self._kv_cache_scale_bytes_per_block * num_blocks
+        )
+        self._kv_cache_bytes_total = (
+            self._kv_cache_data_bytes_total + self._kv_cache_scale_bytes_total
+        )
+
+    def _get_used_kv_cache_blocks(self) -> int:
+        num_blocks = self.kv_cache_config.num_blocks
+        if num_blocks <= 1:
+            return 0
+        num_free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        used_blocks = (num_blocks - 1) - num_free_blocks
+        return max(0, used_blocks)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1510,10 +1582,18 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        kv_cache_bytes_used = (
+            self._get_used_kv_cache_blocks() * self._kv_cache_bytes_per_block
+        )
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting),
             kv_cache_usage=self.kv_cache_manager.usage,
+            kv_cache_bytes_total=self._kv_cache_bytes_total,
+            kv_cache_bytes_used=kv_cache_bytes_used,
+            kv_cache_bytes_data=self._kv_cache_data_bytes_total,
+            kv_cache_bytes_scale=self._kv_cache_scale_bytes_total,
+            kv_cache_dtype=self.cache_config.cache_dtype,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

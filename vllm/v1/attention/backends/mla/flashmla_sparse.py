@@ -105,7 +105,7 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [9, 10]
+        return capability.major in [9, 10, 12]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -420,7 +420,8 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         max_num_sm_parts = int(
             max((sm_count // 2) / h_k // (cdiv(h_q // h_k, 2 * 64) * s_q), 1)
         )
-        if current_platform.is_device_capability_family(100):
+        if (current_platform.is_device_capability_family(100)
+                or current_platform.is_device_capability_family(120)):
             max_num_sm_parts *= 2
         self.tile_scheduler_metadata_buffer = torch.empty(
             # TileSchedulerMetaDataSize = 8
@@ -719,7 +720,9 @@ class FlashMLASparseImpl(MLACommonBaseImpl[FlashMLASparseMetadata]):
         self.softmax_scale = scale
         assert indexer is not None
         self.topk_indices_buffer = indexer.topk_indices_buffer
-        self.padding = 128 if current_platform.is_device_capability_family(100) else 64
+        cap = current_platform.get_device_capability()
+        cap_major = cap[0] if cap is not None else 0
+        self.padding = 128 if cap_major >= 10 else 64
 
         if kv_cache_dtype == "fp8_ds_mla":
             # Reserve workspace during initialization

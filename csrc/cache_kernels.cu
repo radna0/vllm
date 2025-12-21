@@ -373,6 +373,7 @@ __global__ void reshape_and_cache_flash_nvfp4_kernel(
     uint8_t* __restrict__ k_scale_cache,  // [num_blocks, block_size, num_heads,
                                           // head_size/16]
     uint8_t* __restrict__ v_scale_cache,  // same as above
+    float k_global_scale, float v_global_scale,
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int64_t block_stride, const int64_t page_stride,
     const int64_t head_stride, const int64_t key_stride,
@@ -435,10 +436,10 @@ __global__ void reshape_and_cache_flash_nvfp4_kernel(
                   head_idx * scale_head_stride + interleaved_scale;
   }
 
-  uint32_t k_packed =
-      vllm::cvt_warp_fp16_to_fp4<cuda_type>(key_vec, 1.0f, k_scale_ptr);
-  uint32_t v_packed =
-      vllm::cvt_warp_fp16_to_fp4<cuda_type>(value_vec, 1.0f, v_scale_ptr);
+  uint32_t k_packed = vllm::cvt_warp_fp16_to_fp4<cuda_type>(
+      key_vec, k_global_scale, k_scale_ptr);
+  uint32_t v_packed = vllm::cvt_warp_fp16_to_fp4<cuda_type>(
+      value_vec, v_global_scale, v_scale_ptr);
 
   if (in_bounds) {
     key_dst[col_idx] = k_packed;
@@ -511,6 +512,7 @@ __global__ void rope_and_cache_flash_nvfp4_kernel(
     uint8_t* __restrict__ k_scale_cache,    // [num_blocks, block_size, num_kv_heads,
                                             // head_size/16]
     uint8_t* __restrict__ v_scale_cache,    // same as above
+    float k_global_scale, float v_global_scale,
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
     const int64_t* __restrict__ positions,     // [num_tokens]
     const scalar_t* __restrict__ cos_sin_cache,  // [max_pos, rot_dim]
@@ -625,10 +627,10 @@ __global__ void rope_and_cache_flash_nvfp4_kernel(
     }
   }
 
-  uint32_t k_packed =
-      vllm::cvt_warp_fp16_to_fp4<cuda_type>(key_vec, 1.0f, k_scale_ptr);
-  uint32_t v_packed =
-      vllm::cvt_warp_fp16_to_fp4<cuda_type>(value_vec, 1.0f, v_scale_ptr);
+  uint32_t k_packed = vllm::cvt_warp_fp16_to_fp4<cuda_type>(
+      key_vec, k_global_scale, k_scale_ptr);
+  uint32_t v_packed = vllm::cvt_warp_fp16_to_fp4<cuda_type>(
+      value_vec, v_global_scale, v_scale_ptr);
 
   if (do_cache && in_bounds) {
     key_dst[col_idx] = k_packed;
@@ -991,7 +993,7 @@ void reshape_and_cache_flash(
         value_cache,  // [num_blocks, block_size, num_heads, head_size]
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
-    torch::Tensor& v_scale) {
+    torch::Tensor& v_scale, double k_global_scale, double v_global_scale) {
   // NOTE(woosuk): In vLLM V1, key.size(0) can be different from
   // slot_mapping.size(0) because of padding for CUDA graphs.
   // In vLLM V0, key.size(0) is always equal to slot_mapping.size(0) because
@@ -1059,6 +1061,8 @@ void reshape_and_cache_flash(
                                            k_scale.data_ptr()),
                                        reinterpret_cast<uint8_t*>(
                                            v_scale.data_ptr()),
+                                       static_cast<float>(k_global_scale),
+                                       static_cast<float>(v_global_scale),
                                        slot_mapping.data_ptr<int64_t>(),
                                        block_stride, page_stride, head_stride,
                                        key_stride, value_stride,
@@ -1089,7 +1093,8 @@ void fused_rope_and_cache_flash_nvfp4(
     torch::Tensor& slot_mapping,  // [num_tokens] or [num_actual_tokens]
     torch::Tensor& positions,     // [num_tokens]
     torch::Tensor& cos_sin_cache,  // [max_pos, rot_dim]
-    bool is_neox, torch::Tensor& k_scale, torch::Tensor& v_scale) {
+    bool is_neox, torch::Tensor& k_scale, torch::Tensor& v_scale,
+    double k_global_scale, double v_global_scale) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
     (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
   TORCH_CHECK(query.is_cuda() && key.is_cuda() && value.is_cuda(),
@@ -1204,6 +1209,8 @@ void fused_rope_and_cache_flash_nvfp4(
                                            k_scale.data_ptr()),
                                        reinterpret_cast<uint8_t*>(
                                            v_scale.data_ptr()),
+                                       static_cast<float>(k_global_scale),
+                                       static_cast<float>(v_global_scale),
                                        slot_mapping.data_ptr<int64_t>(),
                                        positions.data_ptr<int64_t>(),
                                        reinterpret_cast<const scalar_t*>(
@@ -1232,6 +1239,8 @@ void fused_rope_and_cache_flash_nvfp4(
                                            k_scale.data_ptr()),
                                        reinterpret_cast<uint8_t*>(
                                            v_scale.data_ptr()),
+                                       static_cast<float>(k_global_scale),
+                                       static_cast<float>(v_global_scale),
                                        slot_mapping.data_ptr<int64_t>(),
                                        positions.data_ptr<int64_t>(),
                                        reinterpret_cast<const scalar_t*>(

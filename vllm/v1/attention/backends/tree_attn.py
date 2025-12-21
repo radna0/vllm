@@ -24,6 +24,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.spec_decode.spec_tree_manager import SpecTreeManager
 
 logger = init_logger(__name__)
 
@@ -68,6 +69,10 @@ class TreeAttentionBackend(AttentionBackend):
     def use_cascade_attention(*args, **kwargs) -> bool:
         return False
 
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return True
+
 
 @dataclass
 class TreeAttentionMetadata:
@@ -85,6 +90,8 @@ class TreeAttentionMetadata:
     num_decodes: int = 0
 
     tree_attn_bias: torch.Tensor | None = None
+    spec_dec_packed_mask: torch.Tensor | None = None
+    spec_dec_position_offsets: torch.Tensor | None = None
 
     # Cached Prefill/decode metadata.
     _cached_prefill_metadata: Optional["TreeAttentionMetadata"] = None
@@ -112,6 +119,8 @@ class TreeAttentionMetadata:
             seq_lens=kv_seqlens,
             block_table=self.block_table[self.num_decodes :],
             slot_mapping=self.slot_mapping[self.num_decode_tokens :],
+            spec_dec_packed_mask=self.spec_dec_packed_mask,
+            spec_dec_position_offsets=self.spec_dec_position_offsets,
         )
         return self._cached_prefill_metadata
 
@@ -138,6 +147,8 @@ class TreeAttentionMetadata:
             block_table=self.block_table[: self.num_decodes],
             slot_mapping=self.slot_mapping[: self.num_decode_tokens],
             tree_attn_bias=self.tree_attn_bias,
+            spec_dec_packed_mask=self.spec_dec_packed_mask,
+            spec_dec_position_offsets=self.spec_dec_position_offsets,
         )
         return self._cached_decode_metadata
 
@@ -159,14 +170,21 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         tree_choices: list[tuple[int, ...]] = (
             ast.literal_eval(spec_token_tree) if spec_token_tree is not None else [(0,)]
         )
-        # Construct the tree attention bias.
-        depth_counts = _get_depth_counts(tree_choices)
-        self.tree_attn_bias = _prepare_tree_attn_bias(
-            tree_choices,
-            depth_counts,
-            dtype=torch.float32,
+        spec_tree_manager = SpecTreeManager(
+            tree_choices=tree_choices,
+            max_batch_size=vllm_config.scheduler_config.max_num_seqs,
             device=device,
         )
+        mask = spec_tree_manager.spec_dec_mask_matrix
+        tree_attn_bias = torch.full(
+            mask.shape, -torch.inf, device=device, dtype=torch.float32
+        )
+        tree_attn_bias.masked_fill_(mask.bool(), 0.0)
+        self.tree_attn_bias = tree_attn_bias
+        self.spec_dec_packed_mask = spec_tree_manager.spec_dec_packed_mask
+        self.spec_dec_position_offsets = spec_tree_manager.spec_dec_position_offsets
+        self._draft_packed_masks = spec_tree_manager.draft_packed_masks
+        self._draft_position_offsets = spec_tree_manager.draft_position_offsets
 
         self.reorder_batch_threshold = self.tree_attn_bias.shape[0]
 
@@ -204,6 +222,8 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             block_table=block_table,
             slot_mapping=slot_mapping,
             tree_attn_bias=self.tree_attn_bias,
+            spec_dec_packed_mask=self.spec_dec_packed_mask,
+            spec_dec_position_offsets=self.spec_dec_position_offsets,
         )
 
     def build_for_drafting(
@@ -217,14 +237,21 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         if draft_index == 0:
             # Use prefill for drafting at the root level.
             self.tree_attn_bias = torch.empty(0)
+            draft_packed_mask = None
+            draft_position_offsets = None
         else:
             # Slice the tree attention bias for drafting. Exclude
             # the root level.
             start, end = 1, 1 + common_attn_metadata.max_query_len
             self.tree_attn_bias = self.tree_attn_bias[start:end, start:end].contiguous()
+            idx = draft_index - 1
+            draft_packed_mask = self._draft_packed_masks[idx]
+            draft_position_offsets = self._draft_position_offsets[idx]
 
         # Build attention bias.
         attn_metadata = self.build(0, common_attn_metadata, fast_build=True)
+        attn_metadata.spec_dec_packed_mask = draft_packed_mask
+        attn_metadata.spec_dec_position_offsets = draft_position_offsets
 
         # Reset the tree attention bias to the original value.
         self.tree_attn_bias = orig_tree_attn_bias
@@ -296,6 +323,7 @@ class TreeAttentionImpl(AttentionImpl):
         logits_soft_cap: float | None = None,
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
+        sinks: torch.Tensor | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -322,6 +350,13 @@ class TreeAttentionImpl(AttentionImpl):
                 "encoder/decoder cross-attention "
                 "are not implemented for "
                 "TreeAttentionImpl."
+            )
+        self.sinks = sinks
+        if sinks is not None:
+            assert sinks.shape[0] == num_heads, (
+                "Sinks must have the same number of heads as the number of "
+                f"heads in the layer. Sinks shape: {sinks.shape}, "
+                f"num_heads: {num_heads}."
             )
 
     def forward(
@@ -402,6 +437,7 @@ class TreeAttentionImpl(AttentionImpl):
                 q_descale=None,  # Not supported
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
+                sinks=self.sinks,
             )
 
         if decode_meta := attn_metadata.decode_metadata:
@@ -424,5 +460,6 @@ class TreeAttentionImpl(AttentionImpl):
                 q_descale=None,  # Not supported
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
+                sinks=self.sinks,
             )
         return output

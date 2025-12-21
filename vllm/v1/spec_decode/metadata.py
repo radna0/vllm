@@ -22,6 +22,14 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # Optional spec-decoding tensors for attention backends (GPU tensors).
+    spec_decoding_generation_lengths: torch.Tensor | None = None
+    spec_decoding_position_offsets: torch.Tensor | None = None
+    spec_decoding_packed_mask: torch.Tensor | None = None
+    spec_decoding_bl_tree_mask_offset: torch.Tensor | None = None
+    spec_decoding_bl_tree_mask: torch.Tensor | None = None
+    spec_bl_tree_first_sparse_mask_offset_kv: torch.Tensor | None = None
+    is_spec_dec_tree: bool = False
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

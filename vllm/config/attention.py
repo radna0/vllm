@@ -21,8 +21,12 @@ class AttentionConfig:
     backend: AttentionBackendEnum | None = None
     """Attention backend to use. If None, will be selected automatically."""
 
-    flash_attn_version: Literal[2, 3] | None = None
-    """Force vllm to use a specific flash-attention version (2 or 3).
+    nvfp4_backend: AttentionBackendEnum | None = None
+    """Attention backend to use when kv_cache_dtype is nvfp4. If None, falls
+    back to the global backend selection."""
+
+    flash_attn_version: Literal[2, 3, 4] | None = None
+    """Force vllm to use a specific flash-attention version (2, 3, or 4).
     Only valid when using the flash-attention backend."""
 
     use_prefill_decode_attention: bool = False
@@ -66,6 +70,14 @@ class AttentionConfig:
     @classmethod
     def validate_backend_before(cls, value: Any) -> Any:
         """Enable parsing of the `backend` enum type from string."""
+        if isinstance(value, str):
+            return AttentionBackendEnum[value.upper()]
+        return value
+
+    @field_validator("nvfp4_backend", mode="before")
+    @classmethod
+    def validate_nvfp4_backend_before(cls, value: Any) -> Any:
+        """Enable parsing of the `nvfp4_backend` enum type from string."""
         if isinstance(value, str):
             return AttentionBackendEnum[value.upper()]
         return value

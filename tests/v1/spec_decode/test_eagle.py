@@ -27,7 +27,13 @@ from vllm.config import (
 from vllm.config.load import LoadConfig
 from vllm.model_executor.models.llama import LlamaForCausalLM
 from vllm.platforms import current_platform
-from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.sample.logits_processor.state import LogitsProcessors
+from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.eagle import (
+    PADDING_SLOT_ID,
+    EagleProposer,
+    compute_probs_and_sample_next_token,
+)
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
@@ -306,6 +312,7 @@ def test_prepare_inputs_padded():
 
     proposer = _create_proposer("eagle", num_speculative_tokens)
 
+    original_slot_mapping = common_attn_metadata.slot_mapping.clone()
     output_metadata, token_indices_to_sample = proposer.prepare_inputs_padded(
         common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
     )
@@ -313,6 +320,37 @@ def test_prepare_inputs_padded():
     assert output_metadata.max_query_len == 3
     assert torch.equal(output_metadata.query_start_loc, expected_query_start_loc)
     assert torch.equal(token_indices_to_sample, expected_token_indices_to_sample)
+    pad_indices = torch.tensor([2, 7, 8], dtype=torch.int64, device=device)
+    updated_slot_mapping = common_attn_metadata.slot_mapping
+    assert torch.all(updated_slot_mapping[pad_indices] == PADDING_SLOT_ID)
+    mask = torch.ones_like(updated_slot_mapping, dtype=torch.bool)
+    mask[pad_indices] = False
+    assert torch.equal(updated_slot_mapping[mask], original_slot_mapping[mask])
+
+
+def test_compute_probs_top_k():
+    device = torch.device(current_platform.device_type)
+    logits = torch.tensor([[1.0, 2.0, 0.0]], device=device)
+    sampling_metadata = SamplingMetadata(
+        temperature=torch.tensor([1.0], device=device),
+        all_greedy=False,
+        all_random=True,
+        top_p=None,
+        top_k=torch.tensor([1], dtype=torch.int32, device=device),
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(1, device=device),
+        presence_penalties=torch.zeros(1, device=device),
+        repetition_penalties=torch.ones(1, device=device),
+        output_token_ids=[],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors(),
+    )
+    token_ids, _ = compute_probs_and_sample_next_token(logits, sampling_metadata)
+    assert token_ids.item() == 1
 
 
 @pytest.mark.parametrize("method", ["eagle", "eagle3"])
@@ -662,19 +700,40 @@ def test_propose_tree(spec_token_tree):
     model_mock.side_effect = forward_returns
 
     # Mock the compute_logits calls.
-    cu_num_drafts_tensor = torch.tensor(
-        [0] + proposer.cu_drafts_per_level, dtype=torch.int32, device=device
-    )
+    tree_manager = proposer.tree_manager
+    num_drafts_per_level = proposer.num_drafts_per_level
+    level_offsets = [0]
+    for count in num_drafts_per_level[:-1]:
+        level_offsets.append(level_offsets[-1] + count)
+
     logits_returns = []
-    for level, num_children in enumerate(proposer.child_drafts_per_level):
-        token_ids = base_token_ids + cu_num_drafts_tensor[level]
-        level_num_drafts = cu_num_drafts_tensor[level + 1] - cu_num_drafts_tensor[level]
-        level_logits = []
-        for i in range(level_num_drafts // num_children):
-            level_logits.append(
-                create_deterministic_logits(token_ids + i * num_children, num_children)
-            )
-        logits_returns.append(torch.stack(level_logits, dim=1))
+    # Root logits (children of root).
+    root_logits = torch.full((batch_size, vocab_size), -100.0, device=device)
+    for b in range(batch_size):
+        for idx in range(num_drafts_per_level[0]):
+            token_id = int(base_token_ids[b].item()) + level_offsets[0] + idx
+            root_logits[b, token_id] = 100.0 - idx
+    logits_returns.append(root_logits)
+
+    for level in range(tree_manager.tree_depth - 1):
+        level_num_drafts = num_drafts_per_level[level]
+        child_counts = tree_manager.children_per_parent_per_level[level + 1].tolist()
+        max_topk = tree_manager.max_topk_per_level[level + 1]
+        level_logits = torch.full(
+            (batch_size, level_num_drafts, vocab_size), -100.0, device=device
+        )
+        child_cursor = 0
+        for parent_idx, child_count in enumerate(child_counts):
+            for child_pos in range(child_count):
+                token_offset = level_offsets[level + 1] + child_cursor + child_pos
+                for b in range(batch_size):
+                    token_id = int(base_token_ids[b].item()) + token_offset
+                    level_logits[b, parent_idx, token_id] = 100.0 - child_pos
+            child_cursor += child_count
+            if child_count < max_topk:
+                # Leave remaining top-k slots at low logits for determinism.
+                pass
+        logits_returns.append(level_logits.view(batch_size * level_num_drafts, -1))
     model_mock.compute_logits.side_effect = logits_returns
 
     # Assign the mock to the proposer

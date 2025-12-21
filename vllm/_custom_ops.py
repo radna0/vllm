@@ -2302,6 +2302,8 @@ def reshape_and_cache_flash(
     kv_cache_dtype: str,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    k_global_scale: float = 1.0,
+    v_global_scale: float = 1.0,
 ) -> None:
     torch.ops._C_cache_ops.reshape_and_cache_flash(
         key,
@@ -2312,6 +2314,8 @@ def reshape_and_cache_flash(
         kv_cache_dtype,
         k_scale,
         v_scale,
+        k_global_scale,
+        v_global_scale,
     )
 
 
@@ -2327,6 +2331,8 @@ def fused_rope_and_cache_flash_nvfp4(
     is_neox: bool,
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
+    k_global_scale: float = 1.0,
+    v_global_scale: float = 1.0,
 ) -> None:
     torch.ops._C_cache_ops.fused_rope_and_cache_flash_nvfp4(
         query,
@@ -2340,6 +2346,8 @@ def fused_rope_and_cache_flash_nvfp4(
         is_neox,
         k_scale,
         v_scale,
+        k_global_scale,
+        v_global_scale,
     )
 
 

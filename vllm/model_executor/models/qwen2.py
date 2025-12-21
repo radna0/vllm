@@ -53,6 +53,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.rope_utils import (
+    try_fused_rope_and_cache_nvfp4,
+)
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -222,8 +225,20 @@ class Qwen2Attention(nn.Module):
             q = q.view(total_tokens, self.q_size)
             k = k.view(total_tokens, self.kv_size)
 
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+        if not use_fused_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, None, None) if use_fused_rope else self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 

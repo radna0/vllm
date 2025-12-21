@@ -58,6 +58,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.rope_utils import try_fused_rope_and_cache_nvfp4
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -307,8 +308,23 @@ class Qwen3MoeAttention(nn.Module):
         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+        if not use_fused_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        if use_fused_rope:
+            attn_output = self.attn(q, None, None)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 

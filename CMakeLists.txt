@@ -301,6 +301,7 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
+  "csrc/spec_decode_kernels.cu"
   "csrc/torch_bindings.cpp")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -656,6 +657,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
       "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
       "csrc/quantization/fp4/nvfp4_experts_quant.cu"
+      "csrc/quantization/fp4/nvfp4_unpack.cu"
       "csrc/quantization/fp4/nvfp4_scaled_mm_sm120_kernels.cu"
       "csrc/quantization/fp4/nvfp4_blockwise_moe_kernel.cu")
     set_gencode_flags_for_srcs(
@@ -682,6 +684,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       "csrc/quantization/fp4/nvfp4_quant_kernels.cu"
       "csrc/quantization/fp4/activation_nvfp4_quant_fusion_kernels.cu"
       "csrc/quantization/fp4/nvfp4_experts_quant.cu"
+      "csrc/quantization/fp4/nvfp4_unpack.cu"
       "csrc/quantization/fp4/nvfp4_scaled_mm_kernels.cu"
       "csrc/quantization/fp4/nvfp4_blockwise_moe_kernel.cu")
     set_gencode_flags_for_srcs(
@@ -934,6 +937,12 @@ define_extension_target(
   USE_SABI 3
   WITH_SOABI)
 
+# Py_LIMITED_API=3 omits Py_buffer for Python >=3.11; undefine to keep pybind11
+# headers compatible with CUDA/C++ builds in local dev builds.
+target_compile_options(_C PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API>
+  $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
+
 # If CUTLASS is compiled on NVCC >= 12.5, it by default uses
 # cudaGetDriverEntryPointByVersion as a wrapper to avoid directly calling the
 # driver API. This causes problems when linking with earlier versions of CUDA.
@@ -1095,6 +1104,11 @@ define_extension_target(
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
   USE_SABI 3
   WITH_SOABI)
+
+# Match _C: avoid Py_LIMITED_API=3 causing missing Py_buffer on Python >=3.11.
+target_compile_options(_moe_C PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-UPy_LIMITED_API>
+  $<$<COMPILE_LANGUAGE:CXX>:-UPy_LIMITED_API>)
 
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #

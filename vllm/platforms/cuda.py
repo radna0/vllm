@@ -20,6 +20,7 @@ from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.logger import init_logger
 from vllm.utils.import_utils import import_pynvml
 from vllm.utils.torch_utils import cuda_device_count_stateless
+from vllm.utils.trtllm import trtllm_attention_supports_nvfp4
 
 from .interface import DeviceCapability, Platform, PlatformEnum
 
@@ -70,6 +71,7 @@ def _get_backend_priorities(
     else:
         if device_capability.major in (10, 12):
             return [
+                AttentionBackendEnum.TRTLLM_ATTN,
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.TRITON_ATTN,
@@ -162,7 +164,7 @@ class CudaPlatformBase(Platform):
         if cache_config and cache_config.block_size is None:
             cache_config.block_size = 16
         if cache_config and cache_config.cache_dtype == "nvfp4":
-            if not cls.is_device_capability_ge(DeviceCapability(10, 0)):
+            if not cls.has_device_capability((10, 0)):
                 raise ValueError(
                     "NVFP4 KV cache requires a Blackwell-class GPU "
                     "(compute capability >= 10.0)."
@@ -172,10 +174,170 @@ class CudaPlatformBase(Platform):
                 raise ValueError(
                     "NVFP4 KV cache requires CUDA >= 12.8."
                 )
-            if envs.VLLM_KV_CACHE_LAYOUT not in (None, "NHD"):
+            if cache_config.block_size is not None and cache_config.block_size % 4 != 0:
                 raise ValueError(
-                    "NVFP4 KV cache currently requires VLLM_KV_CACHE_LAYOUT=NHD."
+                    "NVFP4 KV cache requires block_size to be a multiple of 4."
                 )
+            if (
+                model_config is not None
+                and model_config.attention_chunk_size is not None
+                and cache_config.block_size is not None
+                and model_config.attention_chunk_size % cache_config.block_size != 0
+            ):
+                raise ValueError(
+                    "NVFP4 KV cache requires attention_chunk_size to be divisible "
+                    "by block_size."
+                )
+            if envs.VLLM_KV_CACHE_LAYOUT not in (None, "NHD"):
+                allow_trtllm_layout = (
+                    vllm_config.attention_config.backend
+                    == AttentionBackendEnum.TRTLLM_ATTN
+                    or vllm_config.attention_config.nvfp4_backend
+                    == AttentionBackendEnum.TRTLLM_ATTN
+                )
+                if not allow_trtllm_layout:
+                    raise ValueError(
+                        "NVFP4 KV cache currently requires "
+                        "VLLM_KV_CACHE_LAYOUT=NHD (unless using TRTLLM attention)."
+                    )
+            if (
+                model_config is not None
+                and getattr(model_config.hf_config, "model_type", None) == "gpt_oss"
+            ):
+                device_capability = cls.get_device_capability()
+                if device_capability is not None:
+                    try:
+                        head_size = model_config.get_head_size()
+                    except Exception:
+                        head_size = getattr(model_config.hf_config, "head_dim", None)
+                    if head_size is not None:
+                        def _backend_valid(backend):
+                            try:
+                                backend_class = backend.get_class()
+                            except ImportError:
+                                return False
+                            invalid_reasons = backend_class.validate_configuration(
+                                head_size=head_size,
+                                dtype=model_config.dtype,
+                                kv_cache_dtype="nvfp4",
+                                block_size=cache_config.block_size,
+                                use_mla=False,
+                                has_sink=True,
+                                use_sparse=False,
+                                use_mm_prefix=model_config.is_mm_prefix_lm,
+                                device_capability=device_capability,
+                                attn_type="decoder",
+                            )
+                            return not invalid_reasons
+
+                        num_q_per_kv = None
+                        try:
+                            num_q_heads = model_config.get_num_attention_heads(
+                                parallel_config
+                            )
+                            num_kv_heads = model_config.get_num_kv_heads(
+                                parallel_config
+                            )
+                            if num_kv_heads:
+                                num_q_per_kv = num_q_heads // num_kv_heads
+                        except Exception:
+                            num_q_per_kv = None
+                        trtllm_decode_backend = envs.VLLM_TRTLLM_DECODE_BACKEND
+                        explicit_nvfp4_backend = (
+                            vllm_config.attention_config.nvfp4_backend
+                        )
+                        trtllm_gen_supported = (
+                            device_capability.major == 10
+                            and num_q_per_kv is not None
+                            and num_q_per_kv <= 16
+                        )
+                        trtllm_valid = _backend_valid(AttentionBackendEnum.TRTLLM_ATTN)
+                        if trtllm_valid:
+                            if trtllm_decode_backend not in (
+                                "auto",
+                                "trtllm-gen",
+                            ):
+                                if explicit_nvfp4_backend is None:
+                                    logger.warning_once(
+                                        "GPT-OSS NVFP4 requires TRTLLM-GEN decode kernels; "
+                                        "VLLM_TRTLLM_DECODE_BACKEND=%s forces a non-GEN path. "
+                                        "Falling back to TRITON.",
+                                        trtllm_decode_backend,
+                                    )
+                                trtllm_valid = False
+                            elif not trtllm_gen_supported:
+                                if explicit_nvfp4_backend is None:
+                                    logger.info_once(
+                                        "TRTLLM-GEN decode kernels are not supported for "
+                                        "GPT-OSS NVFP4 on this configuration (requires "
+                                        "SM100 and num_q_heads/num_kv_heads <= 16). "
+                                        "Falling back to TRITON."
+                                    )
+                                trtllm_valid = False
+                        if trtllm_valid:
+                            sliding_window = getattr(
+                                model_config.hf_config, "sliding_window", None
+                            )
+                            uses_sliding_or_chunked = bool(
+                                sliding_window
+                            ) or bool(model_config.attention_chunk_size)
+                            # TRTLLM attention mask enum: 1=causal, 2=sliding_or_chunked_causal.
+                            mask_type = 2 if uses_sliding_or_chunked else 1
+                            if num_q_heads is not None and num_kv_heads is not None:
+                                support = trtllm_attention_supports_nvfp4(
+                                    num_heads=num_q_heads,
+                                    num_kv_heads=num_kv_heads,
+                                    head_size=head_size,
+                                    tokens_per_block=cache_config.block_size,
+                                    mask_type=mask_type,
+                                )
+                                if support is not True:
+                                    if explicit_nvfp4_backend is None:
+                                        logger.info_once(
+                                            "TRTLLM NVFP4 attention kernels are not "
+                                            "available (or could not be verified) "
+                                            "for this configuration; falling back "
+                                            "to TRITON."
+                                        )
+                                    trtllm_valid = False
+                        triton_valid = _backend_valid(AttentionBackendEnum.TRITON_ATTN)
+                        if trtllm_valid:
+                            if (
+                                vllm_config.attention_config.nvfp4_backend
+                                not in (None, AttentionBackendEnum.TRTLLM_ATTN)
+                            ):
+                                raise ValueError(
+                                    "GPT-OSS NVFP4 requires TRTLLM attention when "
+                                    "available; refusing to override explicit "
+                                    f"{vllm_config.attention_config.nvfp4_backend.name}."
+                                )
+                            vllm_config.attention_config.nvfp4_backend = (
+                                AttentionBackendEnum.TRTLLM_ATTN
+                            )
+                            logger.info_once(
+                                "Using TRTLLM backend for GPT-OSS NVFP4 attention."
+                            )
+                        elif triton_valid:
+                            if (
+                                vllm_config.attention_config.nvfp4_backend
+                                not in (None, AttentionBackendEnum.TRITON_ATTN)
+                            ):
+                                raise ValueError(
+                                    "GPT-OSS NVFP4 requires TRTLLM or TRITON "
+                                    "attention backend; got "
+                                    f"{vllm_config.attention_config.nvfp4_backend.name}."
+                                )
+                            vllm_config.attention_config.nvfp4_backend = (
+                                AttentionBackendEnum.TRITON_ATTN
+                            )
+                            logger.info_once(
+                                "Using TRITON backend for GPT-OSS NVFP4 attention."
+                            )
+                        else:
+                            raise ValueError(
+                                "GPT-OSS NVFP4 requires TRTLLM or TRITON attention "
+                                "backend; no compatible backend is available."
+                            )
 
         # TODO(lucas): handle this more gracefully
         # Note: model_config may be None during testing
@@ -188,7 +350,18 @@ class CudaPlatformBase(Platform):
             and model_config.use_mla
             and cache_config.block_size is not None
         ):
-            use_sparse = hasattr(vllm_config.model_config.hf_config, "index_topk")
+            fallback_dense_sm120 = (
+                envs.VLLM_MLA_SM120_DENSE_FALLBACK
+                and cls.is_device_capability(120)
+            )
+            if fallback_dense_sm120:
+                logger.warning_once(
+                    "VLLM_MLA_SM120_DENSE_FALLBACK=1 on SM120: forcing dense MLA "
+                    "fallback (disabling sparse MLA/DSA kernels)."
+                )
+            use_sparse = hasattr(
+                vllm_config.model_config.hf_config, "index_topk"
+            ) and not envs.VLLM_DISABLE_MLA_SPARSE and not fallback_dense_sm120
             # If `--attention-config.backend` is not set and we are using MLA,
             # then we default to FlashMLA backend for non-blackwell GPUs,
             # else we default to CutlassMLA. For each case, we force the
@@ -199,7 +372,11 @@ class CudaPlatformBase(Platform):
 
             if vllm_config.attention_config.backend is None:
                 # Default case
-                if cls.is_device_capability_family(100) and not use_sparse:
+                if fallback_dense_sm120:
+                    vllm_config.attention_config.backend = (
+                        AttentionBackendEnum.TRITON_MLA
+                    )
+                elif cls.is_device_capability_family(100) and not use_sparse:
                     # Blackwell => Force CutlassMLA (unless sparse, i.e. DSv3.2).
                     use_cutlass_mla = True
                     # Set the backend in AttentionConfig so it's used during
@@ -300,6 +477,15 @@ class CudaPlatformBase(Platform):
                 invalid_reasons[backend] = invalid_reasons_i
             else:
                 valid_backends_priorities.append((backend, priority))
+
+        if AttentionBackendEnum.TRTLLM_ATTN in invalid_reasons:
+            reasons = ", ".join(invalid_reasons[AttentionBackendEnum.TRTLLM_ATTN])
+            if attn_selector_config.has_sink:
+                logger.warning_once(
+                    "TRTLLM attention unavailable with sinks: %s", reasons
+                )
+            else:
+                logger.info_once("TRTLLM attention unavailable: %s", reasons)
 
         return valid_backends_priorities, invalid_reasons
 

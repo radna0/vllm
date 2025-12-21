@@ -32,6 +32,7 @@ import torch
 from torch import nn
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+from vllm import envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.attention.backends.abstract import AttentionBackend
 from vllm.attention.layer import Attention
@@ -100,6 +101,26 @@ elif current_platform.is_xpu():
     from vllm._ipex_ops import ipex_ops as ops
 
 logger = init_logger(__name__)
+
+
+def _is_v32_enabled(config) -> bool:
+    if not hasattr(config, "index_topk"):
+        return False
+    if envs.VLLM_MLA_SM120_DENSE_FALLBACK:
+        device_capability = current_platform.get_device_capability()
+        if device_capability is not None and device_capability.major == 12:
+            logger.warning_once(
+                "VLLM_MLA_SM120_DENSE_FALLBACK=1 on SM120: disabling "
+                "DeepSeek-V3.2 sparse MLA/DSA indexer for dense fallback."
+            )
+            return False
+    if envs.VLLM_DISABLE_MLA_SPARSE:
+        logger.warning_once(
+            "VLLM_DISABLE_MLA_SPARSE=1: disabling DeepSeek-V3.2 sparse MLA/DSA "
+            "indexer for this run."
+        )
+        return False
+    return True
 
 
 class DeepseekAttention(nn.Module):
@@ -878,6 +899,11 @@ class Indexer(nn.Module):
         )
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
+        if q_pe.dim() == 4:
+            # Flatten batch dimension for sparse indexer expectations.
+            q_pe = q_pe.reshape(-1, q_pe.size(-2), q_pe.size(-1))
+        if k_pe.dim() == 4:
+            k_pe = k_pe.reshape(-1, k_pe.size(-2), k_pe.size(-1))
         # `rotary_emb` is shape-preserving; `q_pe` is already
         # [num_tokens, n_head, rope_dim].
         q = torch.cat([q_pe, q_nope], dim=-1)
@@ -1036,7 +1062,7 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = _is_v32_enabled(config)
 
         if self.is_v32:
             self.indexer_rope_emb = get_rope(
@@ -1250,7 +1276,7 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        self.is_v32 = _is_v32_enabled(config)
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1680,6 +1706,13 @@ class DeepseekV2ForCausalLM(
                             continue
 
                         if is_pp_missing_parameter(name, self):
+                            continue
+
+                        if (
+                            (envs.VLLM_DISABLE_MLA_SPARSE
+                             or envs.VLLM_MLA_SM120_DENSE_FALLBACK)
+                            and ".self_attn.indexer." in name
+                        ):
                             continue
 
                         param = params_dict[name]

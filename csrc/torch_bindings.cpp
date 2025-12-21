@@ -6,6 +6,9 @@
 #include <torch/library.h>
 #include <torch/version.h>
 
+// Ensure we bind to vllm:: symbols from CUDA TU (spec_decode_kernels, etc.).
+using namespace vllm;
+
 // Note on op signatures:
 // The X_meta signatures are for the meta functions corresponding to op X.
 // They must be kept in sync with the signature for X. Generally, only
@@ -33,6 +36,271 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
+
+  ops.def(
+      "pack_accepted_tokens(Tensor output_token_ids, Tensor offsets, Tensor "
+      "counts, int total_tokens) -> Tensor");
+  ops.impl("pack_accepted_tokens", torch::kCUDA, &pack_accepted_tokens);
+
+  ops.def(
+      "build_spec_decode_indices(Tensor num_draft_tokens, "
+      "Tensor cu_num_scheduled_tokens, Tensor! cu_num_draft_tokens, "
+      "Tensor! cu_num_sampled_tokens, Tensor! logits_indices, "
+      "Tensor! target_logits_indices, Tensor! bonus_logits_indices) -> ()");
+  ops.impl("build_spec_decode_indices", torch::kCUDA,
+           &build_spec_decode_indices);
+
+  ops.def(
+      "eagle_rewind_slot_mapping(Tensor cu_num_draft_tokens, "
+      "Tensor valid_sampled_tokens_count, Tensor query_start_loc, "
+      "Tensor! slot_mapping, int pad_id) -> ()");
+  ops.impl("eagle_rewind_slot_mapping", torch::kCUDA,
+           &eagle_rewind_slot_mapping);
+
+  ops.def(
+      "eagle_compute_slot_mapping(Tensor positions, Tensor block_table, "
+      "int block_table_stride, int block_size, int max_model_len, "
+      "Tensor! slot_mapping, int pad_id) -> ()");
+  ops.impl("eagle_compute_slot_mapping", torch::kCUDA,
+           &eagle_compute_slot_mapping);
+
+  ops.def(
+      "eagle_update_draft_state(Tensor draft_tokens, Tensor output_hidden_states, "
+      "int output_hidden_states_stride, Tensor! input_ids, Tensor positions, "
+      "int positions_stride0, Tensor! input_hidden_states, "
+      "int input_hidden_states_stride, Tensor! seq_lens, Tensor! slot_mapping, "
+      "Tensor block_table, int block_table_stride, int hidden_size, "
+      "int block_size, int max_model_len, int pad_id, bool use_mrope) -> ()");
+  ops.impl("eagle_update_draft_state", torch::kCUDA,
+           &eagle_update_draft_state);
+
+  ops.def("eagle_sample_argmax(Tensor logits) -> Tensor");
+  ops.impl("eagle_sample_argmax", torch::kCUDA, &eagle_sample_argmax);
+
+  ops.def(
+      "eagle_sample_topk_topp_gumbel(Tensor logits, Tensor? top_k, Tensor? top_p, "
+      "Tensor? temperature, float sampling_eps) -> Tensor");
+  ops.impl("eagle_sample_topk_topp_gumbel", torch::kCUDA,
+           &eagle_sample_topk_topp_gumbel);
+
+  ops.def(
+      "eagle_expand_draft_tokens(Tensor draft_token_ids, "
+      "Tensor cu_num_draft_tokens, int max_draft_len, int pad_id) -> Tensor");
+  ops.impl("eagle_expand_draft_tokens", torch::kCUDA,
+           &eagle_expand_draft_tokens);
+
+  ops.def(
+      "eagle_update_draft_state_and_tokens(Tensor draft_tokens, "
+      "Tensor output_hidden_states, int output_hidden_states_stride, "
+      "Tensor! input_ids, Tensor positions, int positions_stride0, "
+      "Tensor! input_hidden_states, int input_hidden_states_stride, "
+      "Tensor! seq_lens, Tensor! slot_mapping, Tensor block_table, "
+      "int block_table_stride, Tensor! output_draft_tokens, "
+      "int output_draft_stride, int step, int hidden_size, int block_size, "
+      "int max_model_len, int pad_id, bool use_mrope) -> ()");
+  ops.impl("eagle_update_draft_state_and_tokens", torch::kCUDA,
+           &eagle_update_draft_state_and_tokens);
+
+  ops.def(
+      "eagle_tree_copy_level(Tensor draft_token_ids, Tensor draft_positions, "
+      "Tensor draft_hidden_states, Tensor! tree_input_ids, "
+      "Tensor! tree_positions, Tensor! tree_hidden_states, int level_offset, "
+      "int hidden_size) -> ()");
+  ops.impl("eagle_tree_copy_level", torch::kCUDA, &eagle_tree_copy_level);
+
+  ops.def(
+      "eagle_tree_select_next_tokens(Tensor topk_ids, Tensor parent_indices, "
+      "Tensor child_indices, Tensor! output_tokens) -> ()");
+  ops.impl("eagle_tree_select_next_tokens", torch::kCUDA,
+           &eagle_tree_select_next_tokens);
+
+  ops.def(
+      "eagle_tree_gather_hidden_states(Tensor hidden_states, "
+      "Tensor parent_indices, Tensor! output_hidden_states) -> ()");
+  ops.impl("eagle_tree_gather_hidden_states", torch::kCUDA,
+           &eagle_tree_gather_hidden_states);
+
+  ops.def(
+      "eagle_assemble_target_logits_offsets(Tensor! logits_ptrs, "
+      "Tensor! decoding_tokens, Tensor logits, Tensor draft_decoding_tokens, "
+      "int max_decoding_tokens) -> ()");
+  ops.impl("eagle_assemble_target_logits_offsets", torch::kCUDA,
+           &eagle_assemble_target_logits_offsets);
+
+  ops.def(
+      "eagle_assemble_draft_logits_offsets(Tensor! logits_ptrs, Tensor logits, "
+      "Tensor! output_ids_ptrs, Tensor! output_ids, Tensor! skip_decode, "
+      "Tensor num_valid_logits, int num_input_logits, "
+      "int max_decoding_draft_tokens) -> ()");
+  ops.impl("eagle_assemble_draft_logits_offsets", torch::kCUDA,
+           &eagle_assemble_draft_logits_offsets);
+
+  ops.def(
+      "eagle_copy_output_tokens_ids(Tensor tmp_output_ids_ptrs, Tensor top_ks, "
+      "Tensor top_k_offsets, Tensor input_draft_ids, Tensor input_draft_lens, "
+      "Tensor num_valid_logits, Tensor! output_draft_ids, "
+      "Tensor! output_draft_lens, int layer_id, Tensor input_paths, "
+      "Tensor! output_paths, int max_path_len) -> ()");
+  ops.impl("eagle_copy_output_tokens_ids", torch::kCUDA,
+           &eagle_copy_output_tokens_ids);
+
+  ops.def(
+      "eagle_extract_real_draft_tokens(int cur_draft_idx, int max_draft_len, "
+      "int max_total_draft_tokens, int max_top_k, "
+      "int num_tokens_expand_this_layer, Tensor tokens_gather_idx, "
+      "Tensor top_k_list, Tensor draft_tokens_indices_cumsum, "
+      "Tensor new_draft_tokens, Tensor! draft_tokens_buffer) -> ()");
+  ops.impl("eagle_extract_real_draft_tokens", torch::kCUDA,
+           &eagle_extract_real_draft_tokens);
+
+  ops.def(
+      "eagle_prepare_ctx_eagle_inputs(Tensor! eagle_seq_lens, "
+      "Tensor! eagle_ctx_lens, Tensor! output_ids, Tensor! position_ids, "
+      "Tensor! hidden_states_indices, Tensor! last_token_indices, "
+      "Tensor! num_last_token_indices, "
+      "Tensor! hidden_size_batch_level_starts, Tensor input_ids, "
+      "Tensor chunked_context_next_tokens, Tensor base_seq_lens, "
+      "Tensor base_ctx_lens, Tensor accepted_tokens, Tensor accepted_lens, "
+      "Tensor prev_draft_lens, Tensor prev_paths, Tensor best_path_ids, "
+      "int max_path_len, int max_decoding_tokens, "
+      "int max_non_leaves_per_layer) -> ()");
+  ops.impl("eagle_prepare_ctx_eagle_inputs", torch::kCUDA,
+           &eagle_prepare_ctx_eagle_inputs);
+
+  ops.def(
+      "eagle_prepare_gen_eagle_inputs(Tensor! next_sequence_lengths, "
+      "Tensor! next_context_lengths, Tensor! output_ids, Tensor! position_ids, "
+      "Tensor! spec_decoding_gen_lengths, "
+      "Tensor! spec_decoding_position_offsets, "
+      "Tensor! spec_decoding_packed_masks, Tensor! hidden_states_indices, "
+      "Tensor! last_token_indices, Tensor! num_last_token_indices, "
+      "Tensor! output_hidden_size_batch_starts_per_level, "
+      "Tensor! is_leaf_mask, Tensor! selected_draft_indices, "
+      "Tensor! selected_draft_pos_offsets, Tensor! num_selected_draft_indices, "
+      "Tensor! selected_masks, Tensor! cum_sum_generation_lengths, "
+      "Tensor! max_generation_length, Tensor! non_leaves_in_level_offsets, "
+      "Tensor! parent_non_leaf_in_level_offset, Tensor next_draft_ids, "
+      "Tensor eagle_net0_sequence_lengths, Tensor prev_context_lengths, "
+      "Tensor input_hidden_size_batch_starts_per_level, Tensor next_paths, "
+      "int level_idx, int max_path_len, int max_decoding_tokens, "
+      "int max_non_leaves_per_layer) -> ()");
+  ops.impl("eagle_prepare_gen_eagle_inputs", torch::kCUDA,
+           &eagle_prepare_gen_eagle_inputs);
+
+  ops.def(
+      "eagle_update_scores(Tensor cur_log_probs, Tensor prev_layer_scores, "
+      "int dynamic_tree_max_topk) -> ()");
+  ops.impl("eagle_update_scores", torch::kCUDA, &eagle_update_scores);
+
+  ops.def(
+      "eagle_update_path(int layer_idx, int dynamic_tree_max_topk, "
+      "Tensor prev_paths, Tensor second_topk_output_ids, "
+      "Tensor! new_paths, Tensor! next_expand_indices) -> ()");
+  ops.impl("eagle_update_path", torch::kCUDA, &eagle_update_path);
+
+  ops.def(
+      "eagle_update_draft_tokens_and_scores(int layer_idx, "
+      "int dynamic_tree_max_topk, Tensor cur_draft_ids, "
+      "Tensor input_draft_ids, Tensor input_draft_lens, "
+      "Tensor! output_draft_ids, Tensor! output_draft_lens, "
+      "Tensor cur_layer_scores, Tensor! output_current_scores) -> ()");
+  ops.impl("eagle_update_draft_tokens_and_scores", torch::kCUDA,
+           &eagle_update_draft_tokens_and_scores);
+
+  ops.def(
+      "eagle_set_topks_from_dynamic_tree(int layer_idx, Tensor! top_ks, "
+      "Tensor! top_k_offsets, int dynamic_tree_max_topk, "
+      "Tensor num_valid_logits) -> ()");
+  ops.impl("eagle_set_topks_from_dynamic_tree", torch::kCUDA,
+           &eagle_set_topks_from_dynamic_tree);
+
+  ops.def(
+      "eagle_assemble_second_topk_inputs(Tensor first_topk_logprobs, "
+      "Tensor! second_topk_input_ptrs, Tensor! second_topk_output_ids, "
+      "Tensor! second_topk_output_ptrs, int dynamic_tree_max_topk) -> ()");
+  ops.impl("eagle_assemble_second_topk_inputs", torch::kCUDA,
+           &eagle_assemble_second_topk_inputs);
+
+  ops.def(
+      "eagle_extract_scores_and_real_draft_tokens(Tensor second_topk_input_ptrs, "
+      "Tensor second_topk_output_ptrs, Tensor first_topk_output_ids, "
+      "Tensor! second_topk_output_logprobs, int dynamic_tree_max_topk) -> ()");
+  ops.impl("eagle_extract_scores_and_real_draft_tokens", torch::kCUDA,
+           &eagle_extract_scores_and_real_draft_tokens);
+
+  ops.def(
+      "eagle_assemble_third_topk_inputs(Tensor all_layers_scores, "
+      "Tensor! third_topk_input_ptrs, Tensor! third_topk_output_ids, "
+      "Tensor! third_topk_output_ptrs, Tensor! third_topks, "
+      "int num_eagle_layers, int max_nodes_on_final_tree) -> ()");
+  ops.impl("eagle_assemble_third_topk_inputs", torch::kCUDA,
+           &eagle_assemble_third_topk_inputs);
+
+  ops.def(
+      "eagle_reconstruct_final_path(Tensor third_topk_output_ptrs, "
+      "Tensor all_layers_predecessor, Tensor! output_paths, "
+      "int dynamic_tree_max_topk, int max_decoding_draft_tokens, "
+      "int max_decoding_tokens, int max_path_len, int num_eagle_layers, "
+      "int max_nodes_on_final_tree) -> ()");
+  ops.impl("eagle_reconstruct_final_path", torch::kCUDA,
+           &eagle_reconstruct_final_path);
+
+  ops.def(
+      "eagle_kv_cache_rewind(Tensor kv_cache, Tensor cu_num_draft_tokens, "
+      "Tensor valid_sampled_tokens_count, Tensor query_start_loc, "
+      "Tensor slot_mapping, int block_size, int pad_id) -> ()");
+  ops.impl("eagle_kv_cache_rewind", torch::kCUDA,
+           &eagle_kv_cache_rewind);
+
+  ops.def(
+      "eagle_compact_slot_mapping(Tensor cu_num_draft_tokens, "
+      "Tensor query_start_loc, Tensor accepted_offsets, Tensor packed_indices, "
+      "Tensor! slot_mapping, int pad_id) -> ()");
+  ops.impl("eagle_compact_slot_mapping", torch::kCUDA,
+           &eagle_compact_slot_mapping);
+
+  ops.def(
+      "eagle_build_tree_accepted_indices(Tensor draft_token_ids, "
+      "Tensor sampled_token_ids, Tensor valid_sampled_tokens_count, "
+      "Tensor level_offsets, Tensor level_sizes, Tensor children_offsets, "
+      "Tensor children_offsets_start, Tensor! output_indices, "
+      "Tensor! output_counts) -> ()");
+  ops.impl("eagle_build_tree_accepted_indices", torch::kCUDA,
+           &eagle_build_tree_accepted_indices);
+
+  ops.def(
+      "eagle_kv_cache_compact(Tensor kv_cache, Tensor cu_num_draft_tokens, "
+      "Tensor query_start_loc, Tensor slot_mapping, Tensor accepted_offsets, "
+      "Tensor packed_indices, int block_size, int pad_id) -> ()");
+  ops.impl("eagle_kv_cache_compact", torch::kCUDA,
+           &eagle_kv_cache_compact);
+
+  ops.def(
+      "eagle_kv_cache_compact_packed(Tensor kv_cache, "
+      "Tensor cu_num_draft_tokens, Tensor query_start_loc, "
+      "Tensor slot_mapping, Tensor accepted_offsets, Tensor packed_indices, "
+      "int block_size, int pad_id) -> ()");
+  ops.impl("eagle_kv_cache_compact_packed", torch::kCUDA,
+           &eagle_kv_cache_compact_packed);
+
+  ops.def(
+      "eagle_topk_small(Tensor scores, int top_k) -> (Tensor, Tensor)");
+  ops.impl("eagle_topk_small", torch::kCUDA, &eagle_topk_small);
+
+  ops.def(
+      "eagle_build_packed_tree_mask(Tensor paths, int tree_len, "
+      "bool exclude_root) -> Tensor");
+  ops.impl("eagle_build_packed_tree_mask", torch::kCUDA,
+           &eagle_build_packed_tree_mask);
+
+  ops.def(
+      "eagle_topk_logits(Tensor logits, int top_k) -> (Tensor, Tensor)");
+  ops.impl("eagle_topk_logits", torch::kCUDA, &eagle_topk_logits);
+
+  ops.def(
+      "eagle_topk_logits_custom(Tensor logits, int top_k) -> (Tensor, Tensor)");
+  ops.impl("eagle_topk_logits_custom", torch::kCUDA,
+           &eagle_topk_logits_custom);
 
   // Attention ops
   // Compute the attention between an input query and the cached
@@ -114,6 +382,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "silu_and_mul_nvfp4_quant(Tensor! result, Tensor! result_block_scale, "
       "Tensor input, Tensor input_global_scale) -> ()");
   ops.impl("silu_and_mul_nvfp4_quant", torch::kCUDA, &silu_and_mul_nvfp4_quant);
+
+  ops.def("nvfp4_unpack_fp4x2(Tensor! out, Tensor packed) -> ()");
+  ops.impl("nvfp4_unpack_fp4x2", torch::kCUDA, &nvfp4_unpack_fp4x2);
 #endif
 
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
@@ -711,7 +982,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                        Tensor! value_cache,"
       "                        Tensor slot_mapping,"
       "                        str kv_cache_dtype,"
-      "                        Tensor k_scale, Tensor v_scale) -> ()");
+      "                        Tensor k_scale, Tensor v_scale,"
+      "                        float k_global_scale=1.0,"
+      "                        float v_global_scale=1.0) -> ()");
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
@@ -721,7 +994,9 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                                Tensor! value_cache,"
       "                                Tensor slot_mapping, Tensor positions,"
       "                                Tensor cos_sin_cache, bool is_neox,"
-      "                                Tensor k_scale, Tensor v_scale) -> ()");
+      "                                Tensor k_scale, Tensor v_scale,"
+      "                                float k_global_scale=1.0,"
+      "                                float v_global_scale=1.0) -> ()");
   cache_ops.impl("fused_rope_and_cache_flash_nvfp4", torch::kCUDA,
                  &fused_rope_and_cache_flash_nvfp4);
 

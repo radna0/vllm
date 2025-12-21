@@ -104,6 +104,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    PAD_SLOT_ID,
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
@@ -140,12 +141,11 @@ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.rejection_sampler import RejectionSampler
+from vllm.v1.sample.rejection_sampler import RejectionSampler, pack_output_token_ids
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -474,15 +474,17 @@ class GPUModelRunner(
         self.encoder_cache: dict[str, torch.Tensor] = {}
 
         self.use_aux_hidden_state_outputs = False
+        self._aux_hidden_states_buffer: torch.Tensor | None = None
+        self._aux_hidden_states_dim: int | None = None
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer | SuffixDecodingProposer | EagleProposer | MedusaProposer
-            )
+            self.drafter: Any
             if self.speculative_config.method == "ngram":
+                from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
                 self.drafter = NgramProposer(self.vllm_config)
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
@@ -656,6 +658,30 @@ class GPUModelRunner(
             )
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+        self._spec_decode_metadata_cache: SpecDecodeMetadata | None = None
+        self._spec_decode_cu_num_draft_tokens: torch.Tensor | None = None
+        self._spec_decode_cu_num_sampled_tokens: torch.Tensor | None = None
+        self._spec_decode_logits_indices: torch.Tensor | None = None
+        self._spec_decode_target_logits_indices: torch.Tensor | None = None
+        self._spec_decode_bonus_logits_indices: torch.Tensor | None = None
+        if self.num_spec_tokens:
+            self._spec_decode_cu_num_draft_tokens = torch.empty(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._spec_decode_cu_num_sampled_tokens = torch.empty(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            self._spec_decode_logits_indices = torch.empty(
+                self.max_num_tokens + self.max_num_reqs,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._spec_decode_target_logits_indices = torch.empty(
+                self.max_num_tokens, dtype=torch.int32, device=self.device
+            )
+            self._spec_decode_bonus_logits_indices = torch.empty(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
 
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
@@ -691,9 +717,13 @@ class GPUModelRunner(
         # with dedicated stream for overlapping and event for coordination.
         self.valid_sampled_token_count_event: torch.Event | None = None
         self.valid_sampled_token_count_copy_stream: torch.cuda.Stream | None = None
+        self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.use_async_scheduling and self.num_spec_tokens:
             self.valid_sampled_token_count_event = torch.Event()
             self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
+            self.valid_sampled_token_count_gpu = torch.empty(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
         self.valid_sampled_token_count_cpu = torch.empty(
             self.max_num_reqs,
             dtype=torch.int64,
@@ -767,6 +797,40 @@ class GPUModelRunner(
             if self.uses_xdrope_dim > 0:
                 return self.xdrope_positions.gpu[:, num_tokens]
             return self.positions.gpu[num_tokens]
+
+    def _pack_aux_hidden_states(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        num_tokens: int | None = None,
+        token_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if token_indices is not None:
+            num_tokens = int(token_indices.shape[0])
+        assert num_tokens is not None
+        total_dim = sum(h.shape[-1] for h in aux_hidden_states)
+        if (
+            self._aux_hidden_states_buffer is None
+            or self._aux_hidden_states_dim != total_dim
+        ):
+            self._aux_hidden_states_dim = total_dim
+            self._aux_hidden_states_buffer = torch.empty(
+                (self.max_num_tokens, total_dim),
+                dtype=aux_hidden_states[0].dtype,
+                device=self.device,
+            )
+        out = self._aux_hidden_states_buffer[:num_tokens, :total_dim]
+        offset = 0
+        if token_indices is None:
+            for h in aux_hidden_states:
+                width = h.shape[-1]
+                out[:, offset : offset + width].copy_(h[:num_tokens])
+                offset += width
+        else:
+            for h in aux_hidden_states:
+                width = h.shape[-1]
+                out[:, offset : offset + width].copy_(h[token_indices])
+                offset += width
+        return out
 
     def _make_buffer(
         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
@@ -958,9 +1022,35 @@ class GPUModelRunner(
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
 
-        # Wait until valid_sampled_tokens_count is copied to cpu,
-        # then use it to update actual num_computed_tokens of each request.
+        # Wait until valid_sampled_tokens_count is ready, then use it to update
+        # actual num_computed_tokens of each request (async scheduling path).
         valid_sampled_token_count = self._get_valid_sampled_token_count()
+        valid_counts_by_req: dict[int, int] = {}
+        if valid_sampled_token_count is not None and req_data.req_ids:
+            assert self.input_batch.prev_req_id_to_index is not None
+            prev_indices: list[int] = []
+            prev_positions: list[int] = []
+            for i, req_id in enumerate(req_data.req_ids):
+                req_state = self.requests[req_id]
+                if not req_state.prev_num_draft_len:
+                    continue
+                prev_req_index = self.input_batch.prev_req_id_to_index.get(req_id)
+                if prev_req_index is None:
+                    continue
+                prev_indices.append(prev_req_index)
+                prev_positions.append(i)
+            if prev_indices:
+                prev_indices_tensor = torch.tensor(
+                    prev_indices, device=self.device, dtype=torch.int64
+                )
+                counts = (
+                    valid_sampled_token_count.index_select(0, prev_indices_tensor)
+                    .cpu()
+                    .numpy()
+                )
+                valid_counts_by_req = {
+                    pos: int(counts[idx]) for idx, pos in enumerate(prev_positions)
+                }
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -987,9 +1077,7 @@ class GPUModelRunner(
                 if req_index is None:
                     req_state.prev_num_draft_len = 0
                 else:
-                    assert self.input_batch.prev_req_id_to_index is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                    num_accepted = valid_sampled_token_count[prev_req_index] - 1
+                    num_accepted = valid_counts_by_req.get(i, 1) - 1
                     num_rejected = req_state.prev_num_draft_len - num_accepted
                     num_computed_tokens -= num_rejected
                     req_state.output_token_ids.extend([-1] * num_accepted)
@@ -1624,6 +1712,7 @@ class GPUModelRunner(
         for_cudagraph_capture: bool = False,
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
+        spec_decode_metadata: SpecDecodeMetadata | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -1700,6 +1789,27 @@ class GPUModelRunner(
             slot_mapping=slot_mapping_gid_0,
             causal=True,
         )
+
+        if use_spec_decode and spec_decode_metadata is not None:
+            cm_base.spec_decoding_generation_lengths = (
+                spec_decode_metadata.spec_decoding_generation_lengths
+            )
+            cm_base.spec_decoding_position_offsets = (
+                spec_decode_metadata.spec_decoding_position_offsets
+            )
+            cm_base.spec_decoding_packed_mask = (
+                spec_decode_metadata.spec_decoding_packed_mask
+            )
+            cm_base.spec_decoding_bl_tree_mask_offset = (
+                spec_decode_metadata.spec_decoding_bl_tree_mask_offset
+            )
+            cm_base.spec_decoding_bl_tree_mask = (
+                spec_decode_metadata.spec_decoding_bl_tree_mask
+            )
+            cm_base.spec_bl_tree_first_sparse_mask_offset_kv = (
+                spec_decode_metadata.spec_bl_tree_first_sparse_mask_offset_kv
+            )
+            cm_base.spec_decoding_is_tree = spec_decode_metadata.is_spec_dec_tree
 
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
@@ -2091,6 +2201,71 @@ class GPUModelRunner(
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
+        if envs.VLLM_EAGLE_CUDA_INDICES and hasattr(
+            torch.ops.vllm, "build_spec_decode_indices"
+        ):
+            num_reqs = num_draft_tokens.shape[0]
+            total_draft_tokens = int(num_draft_tokens.sum())
+            total_sampled_tokens = total_draft_tokens + num_reqs
+
+            num_draft_tokens_gpu = torch.from_numpy(num_draft_tokens).to(
+                self.device, dtype=torch.int32, non_blocking=True
+            )
+            cu_num_scheduled_tokens_gpu = torch.from_numpy(
+                cu_num_scheduled_tokens
+            ).to(self.device, dtype=torch.int32, non_blocking=True)
+
+            cu_num_draft_tokens = self._spec_decode_cu_num_draft_tokens[:num_reqs]
+            cu_num_sampled_tokens = self._spec_decode_cu_num_sampled_tokens[:num_reqs]
+            logits_indices = self._spec_decode_logits_indices[:total_sampled_tokens]
+            target_logits_indices = self._spec_decode_target_logits_indices[
+                :total_draft_tokens
+            ]
+            bonus_logits_indices = self._spec_decode_bonus_logits_indices[:num_reqs]
+
+            torch.ops.vllm.build_spec_decode_indices(
+                num_draft_tokens_gpu,
+                cu_num_scheduled_tokens_gpu,
+                cu_num_draft_tokens,
+                cu_num_sampled_tokens,
+                logits_indices,
+                target_logits_indices,
+                bonus_logits_indices,
+            )
+
+            draft_token_ids = self.input_ids.gpu[logits_indices]
+            if total_draft_tokens > 0:
+                draft_token_ids = draft_token_ids[target_logits_indices + 1]
+            else:
+                draft_token_ids = torch.empty(
+                    (0,), dtype=torch.int32, device=self.device
+                )
+
+            num_draft_tokens_list = num_draft_tokens.tolist()
+            if self._spec_decode_metadata_cache is None:
+                self._spec_decode_metadata_cache = SpecDecodeMetadata(
+                    draft_token_ids=draft_token_ids,
+                    num_draft_tokens=num_draft_tokens_list,
+                    cu_num_draft_tokens=cu_num_draft_tokens,
+                    cu_num_sampled_tokens=cu_num_sampled_tokens,
+                    target_logits_indices=target_logits_indices,
+                    bonus_logits_indices=bonus_logits_indices,
+                    logits_indices=logits_indices,
+                )
+            else:
+                metadata = self._spec_decode_metadata_cache
+                metadata.draft_token_ids = draft_token_ids
+                metadata.num_draft_tokens = num_draft_tokens_list
+                metadata.cu_num_draft_tokens = cu_num_draft_tokens
+                metadata.cu_num_sampled_tokens = cu_num_sampled_tokens
+                metadata.target_logits_indices = target_logits_indices
+                metadata.bonus_logits_indices = bonus_logits_indices
+                metadata.logits_indices = logits_indices
+                metadata.max_spec_len = max(num_draft_tokens_list, default=0)
+
+            self._maybe_attach_dynamic_tree_metadata(self._spec_decode_metadata_cache)
+            return self._spec_decode_metadata_cache
+
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -2133,21 +2308,45 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
+        num_reqs = num_draft_tokens.shape[0]
+        num_tokens = target_logits_indices.shape[0]
+        num_logits = logits_indices.shape[0]
+
+        def _copy_or_alloc(
+            src: np.ndarray,
+            dst: torch.Tensor | None,
+            length: int,
+        ) -> torch.Tensor:
+            if dst is None:
+                return torch.from_numpy(src).to(self.device, non_blocking=True)
+            view = dst[:length]
+            view.copy_(torch.from_numpy(src), non_blocking=True)
+            return view
+
+        cu_num_draft_tokens = _copy_or_alloc(
+            cu_num_draft_tokens,
+            self._spec_decode_cu_num_draft_tokens,
+            num_reqs,
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
+        cu_num_sampled_tokens = _copy_or_alloc(
+            cu_num_sampled_tokens,
+            self._spec_decode_cu_num_sampled_tokens,
+            num_reqs,
         )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
+        logits_indices = _copy_or_alloc(
+            logits_indices,
+            self._spec_decode_logits_indices,
+            num_logits,
         )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
+        target_logits_indices = _copy_or_alloc(
+            target_logits_indices,
+            self._spec_decode_target_logits_indices,
+            num_tokens,
         )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
+        bonus_logits_indices = _copy_or_alloc(
+            bonus_logits_indices,
+            self._spec_decode_bonus_logits_indices,
+            num_reqs,
         )
 
         # Compute the draft token ids.
@@ -2155,15 +2354,52 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        return SpecDecodeMetadata(
-            draft_token_ids=draft_token_ids,
-            num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+        num_draft_tokens_list = num_draft_tokens.tolist()
+        if self._spec_decode_metadata_cache is None:
+            self._spec_decode_metadata_cache = SpecDecodeMetadata(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=num_draft_tokens_list,
+                cu_num_draft_tokens=cu_num_draft_tokens,
+                cu_num_sampled_tokens=cu_num_sampled_tokens,
+                target_logits_indices=target_logits_indices,
+                bonus_logits_indices=bonus_logits_indices,
+                logits_indices=logits_indices,
+            )
+        else:
+            metadata = self._spec_decode_metadata_cache
+            metadata.draft_token_ids = draft_token_ids
+            metadata.num_draft_tokens = num_draft_tokens_list
+            metadata.cu_num_draft_tokens = cu_num_draft_tokens
+            metadata.cu_num_sampled_tokens = cu_num_sampled_tokens
+            metadata.target_logits_indices = target_logits_indices
+            metadata.bonus_logits_indices = bonus_logits_indices
+            metadata.logits_indices = logits_indices
+            metadata.max_spec_len = max(num_draft_tokens_list, default=0)
+
+        self._maybe_attach_dynamic_tree_metadata(self._spec_decode_metadata_cache)
+        return self._spec_decode_metadata_cache
+
+    def _maybe_attach_dynamic_tree_metadata(
+        self, metadata: SpecDecodeMetadata | None
+    ) -> None:
+        if metadata is None:
+            return
+        if not isinstance(self.drafter, EagleProposer):
+            return
+        spec_len = metadata.max_spec_len + 1
+        if spec_len <= 1:
+            return
+        dyn_meta = self.drafter.get_dynamic_tree_metadata(
+            self.input_batch.req_ids, spec_len
         )
+        if dyn_meta is None:
+            return
+        (
+            metadata.spec_decoding_position_offsets,
+            metadata.spec_decoding_packed_mask,
+            metadata.spec_decoding_generation_lengths,
+        ) = dyn_meta
+        metadata.is_spec_dec_tree = True
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -2747,12 +2983,21 @@ class GPUModelRunner(
                     valid_sampled_token_ids[int(i)].clear()
             else:
                 # Includes spec decode tokens.
-                valid_sampled_token_ids, cu_num_tokens = RejectionSampler.parse_output(
+                packed_token_ids, cu_num_tokens_tensor = pack_output_token_ids(
                     sampled_token_ids,
                     self.input_batch.vocab_size,
                     discard_sampled_tokens_req_indices,
-                    return_cu_num_tokens=logprobs_tensors is not None,
                 )
+                cu_num_tokens_list = cu_num_tokens_tensor.cpu().tolist()
+                packed_cpu = packed_token_ids.cpu().tolist()
+                valid_sampled_token_ids = [
+                    packed_cpu[cu_num_tokens_list[i] : cu_num_tokens_list[i + 1]]
+                    for i in range(num_sampled_tokens)
+                ]
+                if logprobs_tensors is not None:
+                    cu_num_tokens = cu_num_tokens_list
+                else:
+                    cu_num_tokens = None
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -2799,6 +3044,19 @@ class GPUModelRunner(
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.is_token_ids[req_idx, start_idx:end_idx] = True
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
+            if (
+                not self.use_async_scheduling
+                and self.input_batch.prompt_token_ids_gpu is not None
+            ):
+                self.input_batch.prompt_token_ids_gpu[
+                    req_idx, start_idx:end_idx
+                ].copy_(
+                    torch.as_tensor(
+                        sampled_ids,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                )
 
             req_id = req_ids[req_idx]
             req_state = self.requests[req_id]
@@ -3203,6 +3461,7 @@ class GPUModelRunner(
                         use_spec_decode=use_spec_decode,
                         num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                         cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        spec_decode_metadata=spec_decode_metadata,
                     )
                 )
 
@@ -3400,6 +3659,7 @@ class GPUModelRunner(
                     aux_hidden_states,
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
+                    use_padded_batch_for_eagle,
                 )
             if trace_active and draft_start is not None:
                 draft_sync_s += spec_trace.sync()
@@ -3411,6 +3671,17 @@ class GPUModelRunner(
             spec_config is not None
             and spec_config.use_eagle()
             and not spec_config.disable_padded_drafter_batch
+        )
+        if use_padded_batch_for_eagle and envs.VLLM_EAGLE_AUTO_PADDED:
+            use_padded_batch_for_eagle = self._should_use_padded_batch_for_eagle(
+                spec_decode_common_attn_metadata,
+                self.input_batch.sampling_metadata,
+            )
+        use_gpu_verify_unpadded = (
+            spec_config is not None
+            and spec_config.use_eagle()
+            and not use_padded_batch_for_eagle
+            and envs.VLLM_EAGLE_GPU_VERIFY
         )
         effective_drafter_max_model_len = self.max_model_len
         if effective_drafter_max_model_len is None:
@@ -3449,6 +3720,11 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
+        elif use_gpu_verify_unpadded and input_fits_in_drafter:
+            assert self.speculative_config is not None
+            assert isinstance(self.drafter, EagleProposer)
+            sampled_token_ids = sampler_output.sampled_token_ids
+            propose_draft_token_ids(sampled_token_ids)
 
         bookkeep_start = None
         bookkeep_sync_s = 0.0
@@ -3480,6 +3756,7 @@ class GPUModelRunner(
         if (
             self.speculative_config
             and not use_padded_batch_for_eagle
+            and not use_gpu_verify_unpadded
             and input_fits_in_drafter
         ):
             # ngram and other speculative decoding methods use the sampled
@@ -3563,6 +3840,32 @@ class GPUModelRunner(
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def _should_use_padded_batch_for_eagle(
+        self,
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None,
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        if spec_decode_common_attn_metadata is None or not self.use_cuda_graph:
+            return False
+        if (
+            not sampling_metadata.all_greedy
+            and not envs.VLLM_EAGLE_CUDAGRAPH_ALLOW_RANDOM
+        ):
+            return False
+        query_start_loc_cpu = spec_decode_common_attn_metadata.query_start_loc_cpu
+        query_lens = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        if query_lens.numel() == 0:
+            return False
+        min_len = int(query_lens.min().item())
+        max_len = int(query_lens.max().item())
+        if min_len != max_len:
+            return False
+        if self.uniform_decode_query_len is not None and (
+            max_len != self.uniform_decode_query_len
+        ):
+            return False
+        return True
+
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
     ) -> None:
@@ -3575,24 +3878,132 @@ class GPUModelRunner(
         with torch.cuda.stream(self.valid_sampled_token_count_copy_stream):
             self.valid_sampled_token_count_copy_stream.wait_stream(default_stream)  # type: ignore
             counts = valid_sampled_tokens_count
-            counts_cpu = self.valid_sampled_token_count_cpu
-            counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
+            if self.valid_sampled_token_count_gpu is not None:
+                self.valid_sampled_token_count_gpu[: counts.shape[0]].copy_(counts)
+            else:
+                counts_cpu = self.valid_sampled_token_count_cpu
+                counts_cpu[: counts.shape[0]].copy_(counts, non_blocking=True)
             self.valid_sampled_token_count_event.record()
 
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
-    def _get_valid_sampled_token_count(self) -> list[int]:
-        # Wait until valid_sampled_tokens_count is copied to cpu,
+    def _get_valid_sampled_token_count(self) -> torch.Tensor | None:
+        # Wait until valid_sampled_tokens_count is ready.
         prev_sampled_token_ids = self.input_batch.prev_sampled_token_ids
         if (
             self.valid_sampled_token_count_event is None
             or prev_sampled_token_ids is None
         ):
-            return []
+            return None
 
-        counts_cpu = self.valid_sampled_token_count_cpu
         self.valid_sampled_token_count_event.synchronize()
-        return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
+        if self.valid_sampled_token_count_gpu is not None:
+            return self.valid_sampled_token_count_gpu[: prev_sampled_token_ids.shape[0]]
+        return self.valid_sampled_token_count_cpu[: prev_sampled_token_ids.shape[0]].to(
+            self.device, non_blocking=True
+        )
+
+    def _maybe_eagle_kv_cache_rewind(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        valid_sampled_tokens_count: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> None:
+        if (
+            not envs.VLLM_EAGLE_CUDA_KV_REWIND
+            or spec_decode_metadata is None
+            or valid_sampled_tokens_count is None
+            or not hasattr(torch.ops.vllm, "eagle_kv_cache_rewind")
+            or not self.kv_caches
+        ):
+            return
+        slot_mapping = common_attn_metadata.slot_mapping
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+        query_start_loc = common_attn_metadata.query_start_loc
+        for kv_cache in self.kv_caches:
+            if not isinstance(kv_cache, torch.Tensor):
+                continue
+            if kv_cache.dim() != 5:
+                continue
+            if kv_cache.size(0) != 2 and kv_cache.size(1) != 2:
+                continue
+            torch.ops.vllm.eagle_kv_cache_rewind(
+                kv_cache,
+                cu_num_draft_tokens,
+                valid_sampled_tokens_count,
+                query_start_loc,
+                slot_mapping,
+                self.cache_config.block_size,
+                PAD_SLOT_ID,
+            )
+
+    def _maybe_eagle_kv_cache_compact(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        sampled_token_ids: torch.Tensor | None,
+        valid_sampled_tokens_count: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> bool:
+        if (
+            not envs.VLLM_EAGLE_CUDA_KV_COMPACT
+            or spec_decode_metadata is None
+            or sampled_token_ids is None
+            or valid_sampled_tokens_count is None
+            or not hasattr(torch.ops.vllm, "eagle_kv_cache_compact")
+            or not hasattr(torch.ops.vllm, "eagle_compact_slot_mapping")
+            or not isinstance(self.drafter, EagleProposer)
+            or not self.kv_caches
+        ):
+            return False
+
+        packed_indices, accepted_offsets = (
+            self.drafter.build_tree_accepted_indices(
+                spec_decode_metadata,
+                sampled_token_ids,
+                valid_sampled_tokens_count,
+            )
+        )
+        if packed_indices is None or accepted_offsets is None:
+            return False
+
+        slot_mapping = common_attn_metadata.slot_mapping
+        cu_num_draft_tokens = spec_decode_metadata.cu_num_draft_tokens
+        query_start_loc = common_attn_metadata.query_start_loc
+        kv_compact_op = torch.ops.vllm.eagle_kv_cache_compact
+        if (
+            isinstance(self.drafter, EagleProposer)
+            and getattr(self.drafter, "_use_packed_kv_compact", False)
+            and hasattr(torch.ops.vllm, "eagle_kv_cache_compact_packed")
+        ):
+            kv_compact_op = torch.ops.vllm.eagle_kv_cache_compact_packed
+
+        for kv_cache in self.kv_caches:
+            if not isinstance(kv_cache, torch.Tensor):
+                continue
+            if kv_cache.dim() != 5:
+                continue
+            if kv_cache.size(0) != 2 and kv_cache.size(1) != 2:
+                continue
+            kv_compact_op(
+                kv_cache,
+                cu_num_draft_tokens,
+                query_start_loc,
+                slot_mapping,
+                accepted_offsets,
+                packed_indices,
+                self.cache_config.block_size,
+                PAD_SLOT_ID,
+            )
+
+        torch.ops.vllm.eagle_compact_slot_mapping(
+            cu_num_draft_tokens,
+            query_start_loc,
+            accepted_offsets,
+            packed_indices,
+            slot_mapping,
+            PAD_SLOT_ID,
+        )
+        return True
 
     def propose_draft_token_ids(
         self,
@@ -3604,11 +4015,14 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
+        use_padded_batch_for_eagle: bool,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
         if spec_config.method == "ngram":
+            from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.drafter.propose(
@@ -3649,21 +4063,36 @@ class GPUModelRunner(
             )
         elif spec_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
+            valid_sampled_tokens_count: torch.Tensor | None = None
 
-            if spec_config.disable_padded_drafter_batch:
-                # When padded-batch is disabled, the sampled_token_ids should be
-                # the cpu-side list[list[int]] of valid sampled tokens for each
-                # request, with invalid requests having empty lists.
-                assert isinstance(sampled_token_ids, list), (
-                    "sampled_token_ids should be a python list when"
-                    "padded-batch is disabled."
-                )
-                next_token_ids = self.drafter.prepare_next_token_ids_cpu(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    scheduler_output.num_scheduled_tokens,
-                )
+            if not use_padded_batch_for_eagle:
+                if isinstance(sampled_token_ids, torch.Tensor) and envs.VLLM_EAGLE_GPU_VERIFY:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            common_attn_metadata,
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+                else:
+                    # When padded-batch is disabled, the sampled_token_ids should be
+                    # the cpu-side list[list[int]] of valid sampled tokens for each
+                    # request, with invalid requests having empty lists.
+                    assert isinstance(sampled_token_ids, list), (
+                        "sampled_token_ids should be a python list when"
+                        "padded-batch is disabled."
+                    )
+                    next_token_ids = self.drafter.prepare_next_token_ids_cpu(
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        scheduler_output.num_scheduled_tokens,
+                    )
             else:
                 # When using padded-batch, the sampled_token_ids should be
                 # the gpu tensor of sampled tokens for each request, of shape
@@ -3686,6 +4115,24 @@ class GPUModelRunner(
                     next_token_ids, valid_sampled_tokens_count
                 )
 
+            use_tree_compaction = False
+            if use_padded_batch_for_eagle and isinstance(
+                sampled_token_ids, torch.Tensor
+            ):
+                use_tree_compaction = self._maybe_eagle_kv_cache_compact(
+                    spec_decode_metadata,
+                    sampled_token_ids,
+                    valid_sampled_tokens_count,
+                    common_attn_metadata,
+                )
+
+            if not use_tree_compaction:
+                self._maybe_eagle_kv_cache_rewind(
+                    spec_decode_metadata,
+                    valid_sampled_tokens_count,
+                    common_attn_metadata,
+                )
+
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
                 # input_ids can be None for multimodal models.
@@ -3693,34 +4140,56 @@ class GPUModelRunner(
                 target_positions = self._get_positions(num_scheduled_tokens)
                 if self.use_aux_hidden_state_outputs:
                     assert aux_hidden_states is not None
-                    target_hidden_states = torch.cat(
-                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                    target_hidden_states = self._pack_aux_hidden_states(
+                        aux_hidden_states, num_tokens=num_scheduled_tokens
                     )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
                 if spec_config.disable_padded_drafter_batch:
                     token_indices_to_sample = None
-                    common_attn_metadata, token_indices = self.drafter.prepare_inputs(
-                        common_attn_metadata,
-                        sampled_token_ids,
-                        spec_decode_metadata.num_draft_tokens,
-                    )
-                    target_token_ids = self.input_ids.gpu[token_indices]
-                    target_positions = self._get_positions(token_indices)
-                    if self.use_aux_hidden_state_outputs:
-                        assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h[token_indices] for h in aux_hidden_states], dim=-1
+                    if (
+                        isinstance(sampled_token_ids, torch.Tensor)
+                        and envs.VLLM_EAGLE_GPU_VERIFY
+                    ):
+                        common_attn_metadata, token_indices = (
+                            self.drafter.prepare_inputs_unpadded_gpu(
+                                common_attn_metadata,
+                                valid_sampled_tokens_count,
+                                spec_decode_metadata.cu_num_draft_tokens,
+                            )
                         )
+                        target_token_ids = self.input_ids.gpu[token_indices]
+                        target_positions = self._get_positions(token_indices)
+                        if self.use_aux_hidden_state_outputs:
+                            assert aux_hidden_states is not None
+                            target_hidden_states = self._pack_aux_hidden_states(
+                                aux_hidden_states, token_indices=token_indices
+                            )
+                        else:
+                            target_hidden_states = hidden_states[token_indices]
                     else:
-                        target_hidden_states = hidden_states[token_indices]
+                        common_attn_metadata, token_indices = self.drafter.prepare_inputs(
+                            common_attn_metadata,
+                            sampled_token_ids,
+                            spec_decode_metadata.num_draft_tokens,
+                        )
+                        target_token_ids = self.input_ids.gpu[token_indices]
+                        target_positions = self._get_positions(token_indices)
+                        if self.use_aux_hidden_state_outputs:
+                            assert aux_hidden_states is not None
+                            target_hidden_states = self._pack_aux_hidden_states(
+                                aux_hidden_states, token_indices=token_indices
+                            )
+                        else:
+                            target_hidden_states = hidden_states[token_indices]
                 else:
                     common_attn_metadata, token_indices_to_sample = (
                         self.drafter.prepare_inputs_padded(
                             common_attn_metadata,
                             spec_decode_metadata,
                             valid_sampled_tokens_count,
+                            skip_rewind=use_tree_compaction,
                         )
                     )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
@@ -3729,8 +4198,8 @@ class GPUModelRunner(
                     target_positions = self._get_positions(total_num_tokens)
                     if self.use_aux_hidden_state_outputs:
                         assert aux_hidden_states is not None
-                        target_hidden_states = torch.cat(
-                            [h[:total_num_tokens] for h in aux_hidden_states], dim=-1
+                        target_hidden_states = self._pack_aux_hidden_states(
+                            aux_hidden_states, num_tokens=total_num_tokens
                         )
                     else:
                         target_hidden_states = hidden_states[:total_num_tokens]
@@ -3752,6 +4221,7 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
+                req_ids=self.input_batch.req_ids,
             )
 
         return draft_token_ids
@@ -4350,6 +4820,7 @@ class GPUModelRunner(
                 max_query_len=max_query_len,
                 ubatch_slices=ubatch_slices_padded if pad_attn else ubatch_slices,
                 for_cudagraph_capture=is_graph_capturing,
+                spec_decode_metadata=None,
             )
 
         with self.maybe_dummy_run_with_lora(

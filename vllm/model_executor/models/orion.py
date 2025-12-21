@@ -32,6 +32,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.rope_utils import try_fused_rope_and_cache_nvfp4
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 
@@ -155,8 +156,23 @@ class OrionAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v)
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+        )
+        if not use_fused_rope:
+            q, k = self.rotary_emb(positions, q, k)
+        if use_fused_rope:
+            attn_output = self.attn(q, None, None)
+        else:
+            attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
 

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import glob
+import json
 import os
 import time
 from collections.abc import Generator, Iterable
@@ -77,6 +78,46 @@ class DefaultModelLoader(BaseModelLoader):
                 f"{load_config.load_format}: "
                 f"{unexpected_keys}"
             )
+        self._drift_meta: dict | None = None
+        self._drift_meta_path: str | None = None
+
+    def _maybe_load_drift_meta(self, hf_folder: str) -> dict | None:
+        if self._drift_meta is not None:
+            return self._drift_meta
+        meta_path = os.path.join(hf_folder, "drift_meta.json")
+        if not os.path.isfile(meta_path):
+            return None
+        try:
+            with open(meta_path, "r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except Exception as exc:
+            logger.warning_once(
+                "Failed to load drift_meta.json from %s (%s).", meta_path, exc
+            )
+            return None
+        if not isinstance(meta, dict):
+            logger.warning_once(
+                "drift_meta.json at %s is not a JSON object. Ignoring.", meta_path
+            )
+            return None
+        self._drift_meta = meta
+        self._drift_meta_path = meta_path
+        logger.info_once(
+            "Using packed weights metadata from %s.", meta_path, scope="local"
+        )
+        return self._drift_meta
+
+    def _attach_drift_meta(self, model: nn.Module, model_config: ModelConfig) -> None:
+        if self._drift_meta is None:
+            model_path = model_config.model
+            if isinstance(model_path, str) and os.path.isdir(model_path):
+                self._maybe_load_drift_meta(model_path)
+        if self._drift_meta is None:
+            return
+        if hasattr(model, "set_packed_weights_meta"):
+            model.set_packed_weights_meta(self._drift_meta)
+        else:
+            setattr(model, "packed_weights_meta", self._drift_meta)
 
     def _prepare_weights(
         self,
@@ -117,9 +158,17 @@ class DefaultModelLoader(BaseModelLoader):
         # Some quantized models use .pt files for storing the weights.
         if load_format == "hf":
             allow_patterns = ["*.safetensors", "*.bin"]
-        elif load_format == "safetensors" or load_format == "fastsafetensors":
+        elif (
+            load_format == "safetensors"
+            or load_format == "fastsafetensors"
+            or load_format == "drift"
+        ):
             use_safetensors = True
-            allow_patterns = ["*.safetensors"]
+            if load_format == "drift":
+                allow_patterns = ["drift-*.safetensors"]
+                index_file = "drift.safetensors.index.json"
+            else:
+                allow_patterns = ["*.safetensors"]
         elif load_format == "mistral":
             use_safetensors = True
             allow_patterns = ["consolidated*.safetensors"]
@@ -147,6 +196,7 @@ class DefaultModelLoader(BaseModelLoader):
             )
         else:
             hf_folder = model_name_or_path
+        self._maybe_load_drift_meta(hf_folder)
 
         hf_weights_files: list[str] = []
         for pattern in allow_patterns:
@@ -300,6 +350,8 @@ class DefaultModelLoader(BaseModelLoader):
                 and torchao_version_at_least("0.15.0")
             ):
                 self.load_config.safetensors_load_strategy = "torchao"
+
+        self._attach_drift_meta(model, model_config)
 
         weights_to_load = {name for name, _ in model.named_parameters()}
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))

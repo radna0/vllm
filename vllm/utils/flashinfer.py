@@ -12,6 +12,7 @@ import importlib.util
 import os
 import shutil
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, NoReturn
 
 import requests
@@ -33,6 +34,30 @@ FLASHINFER_CUBINS_REPOSITORY = os.environ.get(
     "FLASHINFER_CUBINS_REPOSITORY",
     "https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local/",  # noqa: E501
 )
+
+
+def _get_flashinfer_cubin_dir() -> Path:
+    env_dir = os.getenv("FLASHINFER_CUBIN_DIR")
+    if env_dir:
+        return Path(env_dir)
+    base = os.getenv("FLASHINFER_WORKSPACE_BASE", Path.home().as_posix())
+    return Path(base) / ".cache" / "flashinfer" / "cubins"
+
+
+@functools.cache
+def _flashinfer_trtllm_gen_meta_has_sm(sm: int) -> bool:
+    cubin_dir = _get_flashinfer_cubin_dir()
+    if not cubin_dir.exists():
+        return False
+    for header_name in ("flashInferMetaInfo.h", "flashinferMetaInfo.h"):
+        for header in cubin_dir.rglob(header_name):
+            try:
+                contents = header.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if f"kSM_{sm}" in contents or f"SM_{sm}" in contents:
+                return True
+    return False
 
 
 @functools.cache
@@ -189,8 +214,11 @@ def has_flashinfer_trtllm_fused_moe() -> bool:
     """Return `True` if FlashInfer TRTLLM fused MoE is available."""
     if not has_flashinfer_moe():
         return False
-    if not current_platform.is_device_capability_family(100):
-        # FlashInfer TRTLLM fused MoE is currently built for SM100 only.
+    if not (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
+    ):
+        # FlashInfer TRTLLM fused MoE is currently built for SM100/SM120 only.
         return False
     required_functions = [
         ("flashinfer.fused_moe", "trtllm_fp8_block_scale_moe"),
@@ -276,21 +304,27 @@ def has_nvidia_artifactory() -> bool:
 @functools.cache
 def supports_trtllm_attention() -> bool:
     """
-    TRTLLM attention is supported if the platform is SM100/SM120,
-    NVIDIA artifactory is accessible, and batch-invariant mode is not enabled.
+    TRTLLM attention (flashinfer trtllm-gen) is supported if the platform is
+    compatible, cubins are available locally or via artifactory, and
+    batch-invariant mode is not enabled.
     """
     # Batch-invariant mode disables TRTLLM attention
     if vllm_is_batch_invariant():
         return False
 
-    # Requires SM100/SM120 and NVIDIA artifactory to be accessible to download cubins
-    return (
-        (
-            current_platform.is_device_capability_family(100)
-            or current_platform.is_device_capability_family(120)
-        )
-        and has_nvidia_artifactory()
-    )
+    if current_platform.is_device_capability_family(120):
+        if envs.VLLM_FLASHINFER_TRTLLM_SM120_ALLOW:
+            return True
+        return _flashinfer_trtllm_gen_meta_has_sm(120)
+
+    if not current_platform.is_device_capability_family(100):
+        return False
+
+    if _flashinfer_trtllm_gen_meta_has_sm(100) or _flashinfer_trtllm_gen_meta_has_sm(103):
+        return True
+
+    # Requires NVIDIA artifactory to be accessible to download cubins
+    return has_nvidia_artifactory()
 
 
 def force_use_trtllm_attention() -> bool | None:
@@ -363,14 +397,17 @@ def use_trtllm_attention(
             )
         return False
 
-    # TRTLLM prefill currently relies on trtllm-gen FMHA kernels (SM100-only).
+    # TRTLLM prefill currently relies on trtllm-gen FMHA kernels (SM100/103-only).
     if is_prefill and current_platform.is_device_capability_family(120):
-        if force_use_trtllm:
-            logger.warning_once(
-                "TRTLLM prefill attention is not supported on SM120 yet; "
-                "falling back to FlashInfer prefill."
-            )
-        return False
+        if not supports_trtllm_attention():
+            if force_use_trtllm or has_sinks:
+                logger.warning_once(
+                    "TRTLLM prefill attention on SM120 requires TRTLLM-GEN "
+                    "cubins. Set VLLM_FLASHINFER_TRTLLM_SM120_ALLOW=1 after "
+                    "installing SM120 TRTLLM-GEN cubins, or fall back to "
+                    "FlashInfer prefill."
+                )
+            return False
 
     # The platform is not supported
     if not supports_trtllm_attention():
@@ -401,9 +438,13 @@ def use_trtllm_attention(
         return False
 
     if has_spec and not is_prefill:
-        # Speculative decoding requires TRTLLM attention for decodes
-        logger.info_once("Using TRTLLM attention (enabled for speculative decoding).")
-        return True
+        # Speculative decoding can run on either backend; only force TRTLLM
+        # when explicitly requested.
+        if force_use_trtllm:
+            logger.info_once(
+                "Using TRTLLM attention (forced for speculative decoding)."
+            )
+            return True
 
     # Must use TRTLLM attention if query is FP8 quantized
     if q_dtype == current_platform.fp8_dtype():

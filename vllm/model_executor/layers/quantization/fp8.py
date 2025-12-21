@@ -56,6 +56,12 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     select_cutlass_fp8_gemm_impl,
     swap_w13_to_w31,
 )
+from vllm.model_executor.layers.quantization.utils.trtllm_moe import (
+    can_use_trtllm_fp8_moe,
+    trtllm_fp8_block_scale_moe,
+    trtllm_moe_enabled,
+    warn_trtllm_moe_unavailable,
+)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     W8A8BlockFp8LinearOp,
     create_fp8_input_scale,
@@ -155,7 +161,9 @@ def get_fp8_moe_backend(
     ):
         backend = get_flashinfer_moe_backend()
         if backend == FlashinferMoeBackend.TENSORRT_LLM:
-            logger.info_once("Using FlashInfer FP8 MoE TRTLLM backend for SM100")
+            logger.info_once(
+                "Using FlashInfer FP8 MoE TRTLLM backend for SM100/SM120"
+            )
             return Fp8MoeBackend.FLASHINFER_TRTLLM
         else:
             if block_quant and (
@@ -1245,43 +1253,83 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         x: torch.Tensor,
         router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        topk_weights = None
+        topk_ids = None
+        zero_expert_result = None
         if self.flashinfer_moe_backend == FlashinferMoeBackend.TENSORRT_LLM:
             # TODO(rob): convert this to MK.
-            if layer.enable_eplb:
-                raise NotImplementedError("EPLB not supported for `Fp8MoEMethod` yet.")
             assert layer.activation == "silu", (
                 f"Expected 'silu' activation but got {layer.activation}"
             )
+            if layer.enable_eplb and layer.moe_parallel_config.use_all2all_kernels:
+                logger.warning_once(
+                    "TRTLLM FP8 MoE custom ops do not support all2all; "
+                    "falling back to non-TRTLLM kernels."
+                )
+            elif layer.enable_eplb:
+                topk_weights, topk_ids, zero_expert_result = layer.select_experts(
+                    hidden_states=x,
+                    router_logits=router_logits,
+                )
 
             if self.block_quant:
-                import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
+                if trtllm_moe_enabled():
+                    if (
+                        can_use_trtllm_fp8_moe()
+                        and not layer.moe_parallel_config.use_all2all_kernels
+                    ):
+                        return trtllm_fp8_block_scale_moe(
+                            layer=layer,
+                            x=x,
+                            router_logits=router_logits,
+                            top_k=layer.top_k,
+                            global_num_experts=layer.global_num_experts,
+                            num_expert_group=layer.num_expert_group,
+                            topk_group=layer.topk_group,
+                            topk_weights=topk_weights,
+                            topk_ids=topk_ids,
+                        )
+                    if layer.moe_parallel_config.use_all2all_kernels:
+                        logger.warning_once(
+                            "TRTLLM FP8 MoE custom ops do not support all2all; "
+                            "falling back to FlashInfer kernels."
+                        )
+                    warn_trtllm_moe_unavailable("fp8-block-scale")
 
-                e_score_correction_bias = (
-                    layer.e_score_correction_bias.to(x.dtype)
-                    if layer.e_score_correction_bias is not None
-                    else None
-                )
-                routing_method_type = layer.routing_method_type
-                return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
-                    routing_logits=router_logits.to(torch.float32)
-                    if routing_method_type == RoutingMethodType.DeepSeekV3
-                    else router_logits,
-                    routing_bias=e_score_correction_bias,
-                    x=x,
-                    w13_weight=layer.w13_weight,
-                    w13_weight_scale_inv=layer.w13_weight_scale_inv,
-                    w2_weight=layer.w2_weight,
-                    w2_weight_scale_inv=layer.w2_weight_scale_inv,
-                    global_num_experts=layer.global_num_experts,
-                    top_k=layer.top_k,
-                    num_expert_group=layer.num_expert_group,
-                    topk_group=layer.topk_group,
-                    intermediate_size=layer.intermediate_size_per_partition,
-                    expert_offset=layer.ep_rank * layer.local_num_experts,
-                    local_num_experts=layer.local_num_experts,
-                    block_shape=self.weight_block_size,
-                    routing_method_type=routing_method_type,
-                    routed_scaling=layer.routed_scaling_factor,
+                if not layer.enable_eplb:
+                    import vllm.model_executor.layers.fused_moe.flashinfer_trtllm_moe  # noqa: E501, F401
+
+                    e_score_correction_bias = (
+                        layer.e_score_correction_bias.to(x.dtype)
+                        if layer.e_score_correction_bias is not None
+                        else None
+                    )
+                    routing_method_type = layer.routing_method_type
+                    return torch.ops.vllm.flashinfer_fused_moe_blockscale_fp8(
+                        routing_logits=router_logits.to(torch.float32)
+                        if routing_method_type == RoutingMethodType.DeepSeekV3
+                        else router_logits,
+                        routing_bias=e_score_correction_bias,
+                        x=x,
+                        w13_weight=layer.w13_weight,
+                        w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                        w2_weight=layer.w2_weight,
+                        w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                        global_num_experts=layer.global_num_experts,
+                        top_k=layer.top_k,
+                        num_expert_group=layer.num_expert_group,
+                        topk_group=layer.topk_group,
+                        intermediate_size=layer.intermediate_size_per_partition,
+                        expert_offset=layer.ep_rank * layer.local_num_experts,
+                        local_num_experts=layer.local_num_experts,
+                        block_shape=self.weight_block_size,
+                        routing_method_type=routing_method_type,
+                        routed_scaling=layer.routed_scaling_factor,
+                    )
+                logger.warning_once(
+                    "EPLB requested for FP8 MoE, but FlashInfer TRTLLM "
+                    "backend does not accept precomputed routing; "
+                    "falling back to non-TRTLLM kernels."
                 )
             else:
                 assert (
@@ -1299,12 +1347,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 )
 
-        select_result = layer.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
-
-        topk_weights, topk_ids, zero_expert_result = select_result
+        if topk_weights is None:
+            select_result = layer.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+            )
+            topk_weights, topk_ids, zero_expert_result = select_result
 
         if self.rocm_aiter_moe_enabled:
             from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (  # noqa: E501

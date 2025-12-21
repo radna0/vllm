@@ -173,6 +173,11 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    kv_cache_bytes_total: int = 0
+    kv_cache_bytes_used: int = 0
+    kv_cache_bytes_data: int = 0
+    kv_cache_bytes_scale: int = 0
+    kv_cache_dtype: str | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
     connector_prefix_cache_stats: PrefixCacheStats | None = None

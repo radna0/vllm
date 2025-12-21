@@ -46,6 +46,65 @@ from vllm.v1.kv_cache_interface import (
 logger = init_logger(__name__)
 
 
+_NVFP4_GLOBAL_SCALE_MAX = float(torch.finfo(torch.float8_e4m3fn).max) * 6.0
+
+
+def _calc_nvfp4_global_scale(tensor: torch.Tensor) -> float:
+    if tensor.numel() == 0:
+        return 1.0
+    max_abs = torch.max(torch.abs(tensor)).float().item()
+    if max_abs <= 0.0:
+        return 1.0
+    return _NVFP4_GLOBAL_SCALE_MAX / max_abs
+
+
+def _process_nvfp4_kv_scales(layer: nn.Module) -> None:
+    if getattr(layer, "kv_cache_dtype", None) != "nvfp4":
+        return
+    if not hasattr(layer, "k_cache_scaling_factor"):
+        return
+
+    def _extract_scale(value: torch.Tensor) -> float | None:
+        if value.numel() == 0:
+            return None
+        scale_val = float(value.to("cpu").item())
+        return scale_val if scale_val > 0.0 else None
+
+    k_scale = _extract_scale(layer.k_cache_scaling_factor)
+    v_scale = _extract_scale(layer.v_cache_scaling_factor)
+    kv_scale = _extract_scale(layer.kv_cache_scaling_factor)
+    scales_found = any(scale is not None for scale in (k_scale, v_scale, kv_scale))
+
+    if k_scale is None and v_scale is None and kv_scale is not None:
+        k_scale = kv_scale
+        v_scale = kv_scale
+    elif k_scale is None and v_scale is not None:
+        k_scale = v_scale
+    elif v_scale is None and k_scale is not None:
+        v_scale = k_scale
+    elif k_scale is None and v_scale is None:
+        k_scale = 1.0
+        v_scale = 1.0
+        if not getattr(layer, "calculate_kv_scales", False):
+            logger.warning_once(
+                "NVFP4 kv_cache_scaling_factor not found; using 1.0."
+            )
+
+    layer._k_global_scale_float = k_scale
+    layer._v_global_scale_float = v_scale
+    if scales_found:
+        if getattr(layer, "calculate_kv_scales", False):
+            logger.info_once(
+                "NVFP4 KV cache scales loaded from checkpoint; "
+                "disabling runtime calibration."
+            )
+        layer.calculate_kv_scales = False
+
+    del layer.k_cache_scaling_factor
+    del layer.v_cache_scaling_factor
+    del layer.kv_cache_scaling_factor
+
+
 def _init_kv_cache_quant(
     layer: nn.Module,
     quant_config: QuantizationConfig | None,
@@ -85,6 +144,8 @@ def _init_kv_cache_quant(
     layer._q_scale_float = 1.0
     layer._k_scale_float = 1.0
     layer._v_scale_float = 1.0
+    layer._k_global_scale_float = 1.0
+    layer._v_global_scale_float = 1.0
 
     # The output scale on host memory. This should be the input scale of
     # the quant op after this attention layer.
@@ -107,6 +168,17 @@ def _init_kv_cache_quant(
         # values after weight loading.
         layer.quant_method = quant_method
         layer.quant_method.create_weights(layer)
+
+    if kv_cache_dtype == "nvfp4" and not hasattr(layer, "k_cache_scaling_factor"):
+        layer.k_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
+        layer.v_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
+        layer.kv_cache_scaling_factor = torch.nn.Parameter(
+            torch.tensor(-1.0), requires_grad=False
+        )
 
 
 class Attention(nn.Module, AttentionLayerBase):
@@ -243,6 +315,9 @@ class Attention(nn.Module, AttentionLayerBase):
         # opaque custom op. For other platforms, we directly call them
         # and let torch.compile handle them.
         self.use_direct_call = not current_platform.opaque_attention_op()
+        if kv_cache_dtype == "nvfp4":
+            # NVFP4 fused RoPE+cache path needs direct access to the impl.
+            self.use_direct_call = True
 
         self.use_output = self.attn_backend.accept_output_buffer
         compilation_config = vllm_config.compilation_config
@@ -362,6 +437,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
 
     def calc_kv_scales(self, query, key, value):
+        if self.kv_cache_dtype == "nvfp4":
+            self._k_global_scale_float = _calc_nvfp4_global_scale(key)
+            self._v_global_scale_float = _calc_nvfp4_global_scale(value)
+            self.calculate_kv_scales = False
+            return
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         self._k_scale.copy_(torch.abs(key).max() / self.k_range)
         self._v_scale.copy_(torch.abs(value).max() / self.v_range)
@@ -380,6 +460,7 @@ class Attention(nn.Module, AttentionLayerBase):
         return s
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
+        _process_nvfp4_kv_scales(self)
         self.impl.process_weights_after_loading(act_dtype)
 
     def get_attn_backend(self) -> type[AttentionBackend]:
@@ -643,6 +724,26 @@ def maybe_calc_kv_scales(
     # This flag gets set to False after the first forward pass
     if not self.calculate_kv_scales:
         return
+
+    if self.kv_cache_dtype == "nvfp4":
+        attn_metadata = forward_context.attn_metadata
+        if isinstance(attn_metadata, dict):
+            attn_metadata = attn_metadata.get(layer_name)
+        num_actual_tokens = getattr(attn_metadata, "num_actual_tokens", None)
+        if isinstance(num_actual_tokens, int) and num_actual_tokens > 0:
+            query = query[:num_actual_tokens]
+            key = key[:num_actual_tokens]
+            value = value[:num_actual_tokens]
+        slot_mapping = getattr(attn_metadata, "slot_mapping", None)
+        if slot_mapping is not None and slot_mapping.device == query.device:
+            slot_mapping = slot_mapping[: query.shape[0]]
+            valid_mask = slot_mapping >= 0
+            if not bool(valid_mask.any().item()):
+                return
+            if not bool(valid_mask.all().item()):
+                query = query[valid_mask]
+                key = key[valid_mask]
+                value = value[valid_mask]
 
     self.calc_kv_scales(query, key, value)
 

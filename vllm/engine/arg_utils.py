@@ -373,6 +373,7 @@ class EngineArgs:
     config_format: str = ModelConfig.config_format
     dtype: ModelDType = ModelConfig.dtype
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
+    enable_nvfp4_kv_cache: bool = CacheConfig.enable_nvfp4_kv_cache
     seed: int = ModelConfig.seed
     max_model_len: int | None = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -548,6 +549,9 @@ class EngineArgs:
     model_impl: str = ModelConfig.model_impl
     override_attention_dtype: str = ModelConfig.override_attention_dtype
     attention_backend: AttentionBackendEnum | None = AttentionConfig.backend
+    nvfp4_attention_backend: AttentionBackendEnum | None = (
+        AttentionConfig.nvfp4_backend
+    )
 
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
@@ -730,6 +734,9 @@ class EngineArgs:
         attention_group.add_argument(
             "--attention-backend", **attention_kwargs["backend"]
         )
+        attention_group.add_argument(
+            "--nvfp4-attention-backend", **attention_kwargs["nvfp4_backend"]
+        )
 
         # Structured outputs arguments
         structured_outputs_kwargs = get_kwargs(StructuredOutputsConfig)
@@ -899,6 +906,9 @@ class EngineArgs:
         )
         cache_group.add_argument("--swap-space", **cache_kwargs["swap_space"])
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
+        cache_group.add_argument(
+            "--enable-nvfp4-kv-cache", **cache_kwargs["enable_nvfp4_kv_cache"]
+        )
         cache_group.add_argument(
             "--num-gpu-blocks-override", **cache_kwargs["num_gpu_blocks_override"]
         )
@@ -1372,6 +1382,17 @@ class EngineArgs:
         resolved_cache_dtype = resolve_kv_cache_dtype_string(
             self.kv_cache_dtype, model_config
         )
+        if not self.enable_nvfp4_kv_cache and resolved_cache_dtype == "nvfp4":
+            if self.kv_cache_dtype != "auto":
+                raise ValueError(
+                    "NVFP4 KV cache is disabled but kv_cache_dtype is set to "
+                    f"{self.kv_cache_dtype}. Enable NVFP4 or choose a "
+                    "different kv_cache_dtype."
+                )
+            logger.info(
+                "NVFP4 KV cache is disabled; falling back to auto cache dtype."
+            )
+            resolved_cache_dtype = "auto"
 
         cache_config = CacheConfig(
             block_size=self.block_size,
@@ -1387,6 +1408,7 @@ class EngineArgs:
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
+            enable_nvfp4_kv_cache=self.enable_nvfp4_kv_cache,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
@@ -1674,6 +1696,19 @@ class EngineArgs:
                 ]
             else:
                 attention_config.backend = self.attention_backend
+        if self.nvfp4_attention_backend is not None:
+            if attention_config.nvfp4_backend is not None:
+                raise ValueError(
+                    "nvfp4_attention_backend and attention_config.nvfp4_backend "
+                    "are mutually exclusive"
+                )
+            # Convert string to enum if needed (CLI parsing returns a string)
+            if isinstance(self.nvfp4_attention_backend, str):
+                attention_config.nvfp4_backend = AttentionBackendEnum[
+                    self.nvfp4_attention_backend.upper()
+                ]
+            else:
+                attention_config.nvfp4_backend = self.nvfp4_attention_backend
 
         load_config = self.create_load_config()
 

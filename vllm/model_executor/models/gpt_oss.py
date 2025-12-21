@@ -32,8 +32,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from vllm.model_executor.models.utils import sequence_parallel_chunk
+from vllm.model_executor.models.rope_utils import try_fused_rope_and_cache_nvfp4
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -126,15 +130,88 @@ class OAIAttention(nn.Module):
             prefix=f"{prefix}.attn",
             sinks=self.sinks,
         )
+        self._nvfp4_backend_name = None
+        self._nvfp4_trtllm_checked = False
+        self._nvfp4_block_size = (
+            cache_config.block_size if cache_config is not None else None
+        )
+        if cache_config is not None and cache_config.cache_dtype == "nvfp4":
+            try:
+                self._nvfp4_backend_name = self.attn.get_attn_backend().get_name()
+            except Exception:
+                self._nvfp4_backend_name = None
+
+    def _ensure_trtllm_nvfp4_support(self) -> None:
+        if self._nvfp4_trtllm_checked:
+            return
+        from vllm.utils.trtllm import trtllm_attention_supports_nvfp4
+
+        impl = getattr(self.attn, "impl", None)
+        window_left = getattr(impl, "window_left", -1)
+        attention_chunk_size = getattr(impl, "attention_chunk_size", None)
+        uses_sliding_or_chunked = (
+            window_left >= 0
+            or (attention_chunk_size is not None and attention_chunk_size > 0)
+        )
+        mask_type = 2 if uses_sliding_or_chunked else 1
+        support = trtllm_attention_supports_nvfp4(
+            num_heads=self.num_local_attention_heads,
+            num_kv_heads=self.num_local_key_value_heads,
+            head_size=self.head_dim,
+            tokens_per_block=self._nvfp4_block_size,
+            mask_type=mask_type,
+        )
+        if support is not True:
+            raise NotImplementedError(
+                "GPT-OSS NVFP4 requires TRTLLM NVFP4 attention kernels; "
+                "attention_supports_nvfp4_output returned "
+                f"{support} (mask_type={mask_type}, "
+                f"tokens_per_block={self._nvfp4_block_size})."
+            )
+        self._nvfp4_trtllm_checked = True
 
     def forward(
         self, hidden_states: torch.Tensor, positions: torch.Tensor
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
-        v = v.contiguous()
-        attn_output = self.attn(q, k, v)
+        if self.attn.kv_cache_dtype == "nvfp4":
+            if self._nvfp4_backend_name is None:
+                try:
+                    self._nvfp4_backend_name = (
+                        self.attn.get_attn_backend().get_name()
+                    )
+                except Exception:
+                    self._nvfp4_backend_name = None
+            if self._nvfp4_backend_name not in ("TRITON_ATTN", "TRTLLM_ATTN"):
+                raise NotImplementedError(
+                    "GPT-OSS NVFP4 requires TRITON or TRTLLM attention backends."
+                )
+            if self._nvfp4_backend_name == "TRTLLM_ATTN":
+                self._ensure_trtllm_nvfp4_support()
+            if not q.is_contiguous():
+                q = q.contiguous()
+            if not k.is_contiguous():
+                k = k.contiguous()
+            if not v.is_contiguous():
+                v = v.contiguous()
+        use_fused_rope = try_fused_rope_and_cache_nvfp4(
+            attn=self.attn,
+            rotary_emb=self.rotary_emb,
+            positions=positions,
+            query=q,
+            key=k,
+            value=v,
+            num_heads=self.num_local_attention_heads,
+            num_kv_heads=self.num_local_key_value_heads,
+            head_dim=self.head_dim,
+        )
+        if not use_fused_rope:
+            q, k = self.rotary_emb(positions, q, k)
+            v = v.contiguous()
+            attn_output = self.attn(q, k, v)
+        else:
+            attn_output = self.attn(q, None, None)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -269,6 +346,24 @@ class GptOssModel(nn.Module):
             ["hidden_states", "residual"], self.config.hidden_size
         )
         self.aux_hidden_state_layers = tuple[int, ...]()
+        self._packed_weights_meta: dict | None = None
+        self._use_packed_weights = False
+
+    def set_packed_weights_meta(self, meta: dict | None) -> None:
+        self._packed_weights_meta = meta
+        self._use_packed_weights = bool(
+            meta and meta.get("format") == "gpt-oss-packed"
+        )
+        if meta is None:
+            return
+        for module in self.modules():
+            setattr(module, "packed_weights_meta", meta)
+
+    def _packed_qkv_fused(self) -> bool:
+        if not self._packed_weights_meta:
+            return False
+        attn_meta = self._packed_weights_meta.get("attention", {})
+        return bool(attn_meta.get("qkv_fused", False))
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embedding(input_ids)
@@ -321,6 +416,11 @@ class GptOssModel(nn.Module):
         mxfp4_block = 32
         use_ep = self.parallel_config.enable_expert_parallel
         num_experts = self.config.num_local_experts
+        hidden_size = self.config.hidden_size
+        prepack_backend = None
+        if self._packed_weights_meta:
+            prepack_backend = self._packed_weights_meta.get("backend_prepack")
+        trtllm_prepacked = prepack_backend == "flashinfer-trtllm-mxfp4"
 
         # In MoE, we need to flatten the tensor parallel size across the data
         # parallel size when EP is disabled.
@@ -333,6 +433,18 @@ class GptOssModel(nn.Module):
         )
 
         intermediate_size = self.config.intermediate_size
+        if hidden_size % 2 != 0 or intermediate_size % 2 != 0:
+            raise ValueError(
+                "MXFP4 packed weights require hidden_size and intermediate_size "
+                f"to be even, got hidden_size={hidden_size}, "
+                f"intermediate_size={intermediate_size}."
+            )
+        if hidden_size % mxfp4_block != 0 or intermediate_size % mxfp4_block != 0:
+            raise ValueError(
+                "MXFP4 block weights require hidden_size and intermediate_size "
+                f"to be divisible by {mxfp4_block}, got hidden_size={hidden_size}, "
+                f"intermediate_size={intermediate_size}."
+            )
         intermediate_size_block = intermediate_size // mxfp4_block
         per_rank_intermediate_size_block = cdiv(intermediate_size_block, tp_size)
         per_rank_intermediate_size = per_rank_intermediate_size_block * mxfp4_block
@@ -341,31 +453,147 @@ class GptOssModel(nn.Module):
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
+        layout_checked = {
+            "w13_weight": False,
+            "w2_weight": False,
+            "w13_weight_scale": False,
+            "w2_weight_scale": False,
+            "w13_bias": False,
+            "w2_bias": False,
+        }
+
+        def _check_mxfp4_weight_layout(
+            weight: torch.Tensor,
+            name: str,
+            expected_rows: int,
+            expected_cols: int,
+            expected_packed: int,
+        ) -> None:
+            if weight.dtype != torch.uint8:
+                raise ValueError(
+                    f"Expected MXFP4 weights in uint8 for {name}, "
+                    f"got dtype={weight.dtype}."
+                )
+            if weight.ndim == 3:
+                expected_shape = (expected_rows, expected_cols, expected_packed)
+                if weight.shape != expected_shape:
+                    raise ValueError(
+                        f"Unexpected MXFP4 layout for {name}: got shape "
+                        f"{tuple(weight.shape)}, expected {expected_shape}."
+                    )
+            elif weight.ndim == 4:
+                if weight.shape[0] != expected_rows or weight.shape[1] != expected_cols:
+                    raise ValueError(
+                        f"Unexpected MXFP4 block layout for {name}: got shape "
+                        f"{tuple(weight.shape)}, expected (E={expected_rows}, "
+                        f"N={expected_cols}, *, *)."
+                    )
+                packed_dim = weight.shape[2]
+                packed_stride = weight.shape[3]
+                stride_expected = mxfp4_block // 2
+                valid_stride_layout = (
+                    packed_stride == stride_expected
+                    and packed_dim * packed_stride == expected_packed
+                )
+                valid_block_layout = (
+                    packed_dim == mxfp4_block
+                    and packed_stride * packed_dim == expected_packed
+                )
+                if not (valid_stride_layout or valid_block_layout):
+                    raise ValueError(
+                        f"Unexpected MXFP4 packed size for {name}: got last dim "
+                        f"{tuple(weight.shape[2:])}, expected product {expected_packed} "
+                        f"with block={mxfp4_block}."
+                    )
+            else:
+                raise ValueError(
+                    f"Unexpected MXFP4 layout rank for {name}: got ndim={weight.ndim}, "
+                    "expected 3D or 4D tensor."
+                )
+
+        def _check_mxfp4_scale_layout(
+            weight: torch.Tensor,
+            name: str,
+            expected_rows: int,
+            expected_cols: int,
+            expected_blocks: int,
+        ) -> None:
+            if weight.dtype != torch.uint8 and not (
+                trtllm_prepacked and weight.dtype == torch.float8_e4m3fn
+            ):
+                raise ValueError(
+                    f"Expected MXFP4 scales in uint8 for {name}, got dtype={weight.dtype}."
+                )
+            expected_shape = (expected_rows, expected_cols, expected_blocks)
+            if weight.ndim != 3 or weight.shape != expected_shape:
+                raise ValueError(
+                    f"Unexpected MXFP4 scale layout for {name}: got shape "
+                    f"{tuple(weight.shape)}, expected {expected_shape}."
+                )
+
+        def _check_bias_layout(
+            weight: torch.Tensor,
+            name: str,
+            expected_rows: int,
+            expected_cols: int,
+        ) -> None:
+            expected_shape = (expected_rows, expected_cols)
+            if weight.ndim != 2 or weight.shape != expected_shape:
+                raise ValueError(
+                    f"Unexpected bias layout for {name}: got shape "
+                    f"{tuple(weight.shape)}, expected {expected_shape}."
+                )
+
         for name, weight in weights:
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
+            if "scale" in name or "scaling_factor" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if ".w13_weight_scale" in name:
                 # Handle MLP gate and up projection weights scale
+                if not layout_checked["w13_weight_scale"]:
+                    _check_mxfp4_scale_layout(
+                        weight,
+                        name,
+                        num_experts,
+                        2 * intermediate_size,
+                        hidden_size // mxfp4_block,
+                    )
+                    layout_checked["w13_weight_scale"] = True
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end, ...]
 
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if trtllm_prepacked and narrow_weight.dtype == torch.float8_e4m3fn:
+                    param.data = narrow_weight
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w2_weight_scale" in name:
                 # Handle MLP down projection weights
+                if not layout_checked["w2_weight_scale"]:
+                    _check_mxfp4_scale_layout(
+                        weight,
+                        name,
+                        num_experts,
+                        hidden_size,
+                        intermediate_size // mxfp4_block,
+                    )
+                    layout_checked["w2_weight_scale"] = True
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
@@ -374,23 +602,36 @@ class GptOssModel(nn.Module):
                     ]
 
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if trtllm_prepacked and narrow_weight.dtype == torch.float8_e4m3fn:
+                    param.data = narrow_weight
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
-                # flat weight from (E, 2 * N, block_size, entry_per_block)
-                # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
-                weight = weight.view(
-                    num_experts, 2 * intermediate_size, -1
-                ).contiguous()
+                if not layout_checked["w13_weight"]:
+                    _check_mxfp4_weight_layout(
+                        weight,
+                        name,
+                        num_experts,
+                        2 * intermediate_size,
+                        hidden_size // 2,
+                    )
+                    layout_checked["w13_weight"] = True
+                if weight.ndim == 4:
+                    # flat weight from (E, 2 * N, block_size, entry_per_block)
+                    # to (E, 2 * N, -1), shouldn't trigger copy for contiguous
+                    weight = weight.view(
+                        num_experts, 2 * intermediate_size, -1
+                    ).contiguous()
 
                 # Extract gate and up projection parts
                 # since the weight is shuffled, we can slice directly
@@ -412,11 +653,21 @@ class GptOssModel(nn.Module):
                 continue
             elif ".w2_weight" in name:
                 # Handle MLP down projection weights
-                # same flatten here, but since 2 mx4 value are packed in 1
-                # uint8, divide by 2
-                weight = weight.view(
-                    num_experts, -1, intermediate_size // 2
-                ).contiguous()
+                if not layout_checked["w2_weight"]:
+                    _check_mxfp4_weight_layout(
+                        weight,
+                        name,
+                        num_experts,
+                        hidden_size,
+                        intermediate_size // 2,
+                    )
+                    layout_checked["w2_weight"] = True
+                if weight.ndim == 4:
+                    # same flatten here, but since 2 mx4 value are packed in 1
+                    # uint8, divide by 2
+                    weight = weight.view(
+                        num_experts, -1, intermediate_size // 2
+                    ).contiguous()
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
@@ -436,24 +687,38 @@ class GptOssModel(nn.Module):
             elif ".w13_bias" in name:
                 # Handle MLP gate and up projection biases
                 # Extract gate and up projection bias parts
+                if not layout_checked["w13_bias"]:
+                    _check_bias_layout(
+                        weight,
+                        name,
+                        num_experts,
+                        2 * intermediate_size,
+                    )
+                    layout_checked["w13_bias"] = True
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
                     narrow_weight = weight[:, 2 * tp_rank_start : 2 * tp_rank_end]
 
                 param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(
-                    param,
-                    narrow_weight,
-                    weight_name=name,
-                    shard_id=None,
-                    expert_id=None,
-                )
+                if trtllm_prepacked and narrow_weight.dtype == torch.float32:
+                    param.data = narrow_weight
+                else:
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(
+                        param,
+                        narrow_weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif ".w2_bias" in name:
                 # Handle MLP down projection bias
+                if not layout_checked["w2_bias"]:
+                    _check_bias_layout(weight, name, num_experts, hidden_size)
+                    layout_checked["w2_bias"] = True
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if use_ep:
@@ -462,16 +727,28 @@ class GptOssModel(nn.Module):
                     # (only load on rank 0 to avoid duplication)
                     if tp_rank != 0:
                         weight.zero_()
-                weight_loader(
-                    param, weight, weight_name=name, shard_id=None, expert_id=None
-                )
+                if trtllm_prepacked and weight.dtype == torch.float32:
+                    param.data = weight
+                else:
+                    weight_loader(
+                        param,
+                        weight,
+                        weight_name=name,
+                        shard_id=None,
+                        expert_id=None,
+                    )
                 loaded_params.add(name)
                 continue
             elif "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                if narrow_weight.shape != param.shape:
+                    raise ValueError(
+                        "Attention sinks shape mismatch: expected "
+                        f"{tuple(param.shape)}, got {tuple(narrow_weight.shape)}."
+                    )
+                param.data.copy_(narrow_weight.to(param.dtype))
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -529,6 +806,10 @@ class GptOssModel(nn.Module):
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
+            if "scale" in name or "scaling_factor" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             if ".w13_weight" in name:
                 # Handle MLP gate and up projection weights
@@ -538,7 +819,8 @@ class GptOssModel(nn.Module):
                 else:
                     narrow_weight = weight[:, :, 2 * tp_rank_start : 2 * tp_rank_end]
 
-                narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
+                if not self._use_packed_weights:
+                    narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
                 param.copy_(narrow_weight)
@@ -550,7 +832,8 @@ class GptOssModel(nn.Module):
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
                     narrow_weight = weight[:, tp_rank_start:tp_rank_end, :]
-                narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
+                if not self._use_packed_weights:
+                    narrow_weight = narrow_weight.permute(0, 2, 1).contiguous()
                 param = params_dict[name]
 
                 param.copy_(narrow_weight)
@@ -584,7 +867,12 @@ class GptOssModel(nn.Module):
                 # Handle attention sinks (distributed across ranks)
                 param = params_dict[name]
                 narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                if narrow_weight.shape != param.shape:
+                    raise ValueError(
+                        "Attention sinks shape mismatch: expected "
+                        f"{tuple(param.shape)}, got {tuple(narrow_weight.shape)}."
+                    )
+                param.data.copy_(narrow_weight.to(param.dtype))
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -615,6 +903,8 @@ class GptOssModel(nn.Module):
             (".qkv_proj", ".k_proj", "k"),
             (".qkv_proj", ".v_proj", "v"),
         ]
+        if self._packed_qkv_fused():
+            stacked_params_mapping = []
 
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
@@ -701,6 +991,11 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        self.packed_weights_meta: dict | None = None
+
+    def set_packed_weights_meta(self, meta: dict | None) -> None:
+        self.packed_weights_meta = meta
+        self.model.set_packed_weights_meta(meta)
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.model.aux_hidden_state_layers = layers
@@ -741,4 +1036,10 @@ class GptOssForCausalLM(nn.Module, SupportsPP, SupportsEagle3, SupportsLoRA):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        mapper = self.hf_to_vllm_mapper
+        if (
+            self.packed_weights_meta
+            and self.packed_weights_meta.get("naming") == "vllm"
+        ):
+            mapper = None
+        return loader.load_weights(weights, mapper=mapper)

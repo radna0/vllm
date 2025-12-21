@@ -23,6 +23,7 @@ from typing_extensions import deprecated, runtime_checkable
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import is_pin_memory_available as _is_pin_memory_available
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -51,6 +52,10 @@ PAD_SLOT_ID = -1
 
 def is_valid_kv_cache_layout(value: str) -> bool:
     return value in get_args(KVCacheLayoutType)
+
+
+def is_pin_memory_available() -> bool:
+    return _is_pin_memory_available()
 
 
 @dataclass
@@ -95,6 +100,18 @@ class CommonAttentionMetadata:
     dcp_local_seq_lens: torch.Tensor | None = None
     dcp_local_seq_lens_cpu: torch.Tensor | None = None
     """Sequence lengths of the local rank in decode context parallelism world"""
+
+    # Optional spec-decoding tensors for attention backends (GPU tensors).
+    spec_decoding_generation_lengths: torch.Tensor | None = None
+    spec_decoding_position_offsets: torch.Tensor | None = None
+    spec_decoding_packed_mask: torch.Tensor | None = None
+    spec_decoding_bl_tree_mask_offset: torch.Tensor | None = None
+    spec_decoding_bl_tree_mask: torch.Tensor | None = None
+    spec_bl_tree_first_sparse_mask_offset_kv: torch.Tensor | None = None
+    spec_decoding_is_tree: bool | None = None
+    # Beam search support (optional).
+    cache_indirection: torch.Tensor | None = None
+    beam_width: int = 1
 
     # WARNING: Deprecated fields. Will be removed in a future release (v0.14.0)
     _seq_lens_cpu: torch.Tensor | None = None
@@ -158,6 +175,23 @@ class CommonAttentionMetadata:
             encoder_seq_lens_cpu=maybe_slice_reqs(self.encoder_seq_lens_cpu),
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
+            spec_decoding_generation_lengths=maybe_slice_reqs(
+                self.spec_decoding_generation_lengths
+            ),
+            spec_decoding_position_offsets=maybe_slice_reqs(
+                self.spec_decoding_position_offsets
+            ),
+            spec_decoding_packed_mask=maybe_slice_reqs(self.spec_decoding_packed_mask),
+            spec_decoding_bl_tree_mask_offset=maybe_slice_reqs(
+                self.spec_decoding_bl_tree_mask_offset
+            ),
+            spec_decoding_bl_tree_mask=self.spec_decoding_bl_tree_mask,
+            spec_bl_tree_first_sparse_mask_offset_kv=maybe_slice_reqs(
+                self.spec_bl_tree_first_sparse_mask_offset_kv
+            ),
+            spec_decoding_is_tree=self.spec_decoding_is_tree,
+            cache_indirection=maybe_slice_reqs(self.cache_indirection),
+            beam_width=self.beam_width,
         )
 
 
@@ -258,6 +292,8 @@ def _make_metadata_with_slice(
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
 
+    maybe_slice_reqs = lambda x: x[request_slice] if x is not None else None
+
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
@@ -270,6 +306,25 @@ def _make_metadata_with_slice(
         slot_mapping=slot_mapping,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        spec_decoding_generation_lengths=maybe_slice_reqs(
+            attn_metadata.spec_decoding_generation_lengths
+        ),
+        spec_decoding_position_offsets=maybe_slice_reqs(
+            attn_metadata.spec_decoding_position_offsets
+        ),
+        spec_decoding_packed_mask=maybe_slice_reqs(
+            attn_metadata.spec_decoding_packed_mask
+        ),
+        spec_decoding_bl_tree_mask_offset=maybe_slice_reqs(
+            attn_metadata.spec_decoding_bl_tree_mask_offset
+        ),
+        spec_decoding_bl_tree_mask=attn_metadata.spec_decoding_bl_tree_mask,
+        spec_bl_tree_first_sparse_mask_offset_kv=maybe_slice_reqs(
+            attn_metadata.spec_bl_tree_first_sparse_mask_offset_kv
+        ),
+        spec_decoding_is_tree=attn_metadata.spec_decoding_is_tree,
+        cache_indirection=maybe_slice_reqs(attn_metadata.cache_indirection),
+        beam_width=attn_metadata.beam_width,
     )
 
 

@@ -120,6 +120,78 @@ _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _get_mn_major_tma_aligned_tensor_impl: Callable[..., Any] | None = None
 _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
+_deep_gemm_unsupported_arch = False
+
+
+def _fp8_mqa_logits_torch(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    kv, scale = kv
+    seq_len_kv = kv.shape[0]
+    k = kv.to(torch.bfloat16)
+    q = q.to(torch.bfloat16)
+
+    device = q.device
+    mask_lo = torch.arange(0, seq_len_kv, device=device)[None, :] >= cu_seqlen_ks[:, None]
+    mask_hi = torch.arange(0, seq_len_kv, device=device)[None, :] < cu_seqlen_ke[:, None]
+    mask = mask_lo & mask_hi
+
+    score = torch.einsum("mhd,nd->hmn", q, k).float() * scale
+    logits = (score.relu() * weights.unsqueeze(-1).transpose(0, 1)).sum(dim=0)
+    logits = logits.masked_fill(~mask, float("-inf"))
+    return logits
+
+
+def _fp8_paged_mqa_logits_torch(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    fp8_dtype = current_platform.fp8_dtype()
+    batch_size, next_n, _, dim = q.size()
+    kv_cache, scale = kv_cache[..., :dim], kv_cache[..., dim:]
+    scale = scale.contiguous().view(torch.float)
+    q = q.float()
+    kv_cache = kv_cache.view(fp8_dtype).float() * scale
+    num_block, block_size, _, dim = kv_cache.size()
+    logits = torch.full(
+        [batch_size * next_n, max_model_len],
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+    context_lens = context_lens.tolist()
+    for i in range(batch_size):
+        context_len = context_lens[i]
+        q_offsets = torch.arange(context_len - next_n, context_len, device=q.device)
+        weight_slice = weights[i * next_n : (i + 1) * next_n, :].contiguous()
+        for block_rk in range(cdiv(context_len, block_size)):
+            block_idx = block_tables[i][block_rk]
+            qx, kx = q[i], kv_cache[block_idx]
+            if qx.dim() == 2:
+                qx = qx.unsqueeze(1)
+            if kx.dim() == 3 and kx.size(1) == 1:
+                kx = kx.squeeze(1)
+            k_offsets = torch.arange(
+                block_rk * block_size, (block_rk + 1) * block_size, device=q.device
+            )
+            mask = (k_offsets[None, :] < context_len) & (
+                k_offsets[None, :] <= q_offsets[:, None]
+            )
+            scores = torch.einsum("mhd,nd->mhn", qx.float(), kx.float())
+            scores = torch.where(mask[:, None, :], scores, -float("inf"))
+            logits[
+                i * next_n : (i + 1) * next_n,
+                block_rk * block_size : (block_rk + 1) * block_size,
+            ] = (scores * weight_slice[:, :, None]).sum(dim=1)
+    return logits
 
 
 def _lazy_init() -> None:
@@ -261,10 +333,25 @@ def fp8_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    global _deep_gemm_unsupported_arch
     _lazy_init()
-    if _fp8_mqa_logits_impl is None:
-        return _missing()
-    return _fp8_mqa_logits_impl(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    if (
+        not envs.VLLM_USE_DEEP_GEMM
+        or _fp8_mqa_logits_impl is None
+        or _deep_gemm_unsupported_arch
+        or not is_deep_gemm_supported()
+    ):
+        return _fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    try:
+        return _fp8_mqa_logits_impl(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    except RuntimeError as exc:
+        if "Unsupported architecture" in str(exc):
+            _deep_gemm_unsupported_arch = True
+            logger.warning_once(
+                "DeepGEMM FP8 MQA logits unsupported on this GPU; falling back to torch."
+            )
+            return _fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+        raise
 
 
 def get_paged_mqa_logits_metadata(
@@ -282,10 +369,30 @@ def get_paged_mqa_logits_metadata(
         Backend-specific tensor consumed by `fp8_paged_mqa_logits` to
         schedule work across SMs.
     """
+    global _deep_gemm_unsupported_arch
     _lazy_init()
-    if _get_paged_mqa_logits_metadata_impl is None:
-        return _missing()
-    return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
+    if (
+        not envs.VLLM_USE_DEEP_GEMM
+        or _get_paged_mqa_logits_metadata_impl is None
+        or _deep_gemm_unsupported_arch
+        or not is_deep_gemm_supported()
+    ):
+        return torch.zeros(
+            (num_sms + 1, 2), device=context_lens.device, dtype=torch.int32
+        )
+    try:
+        return _get_paged_mqa_logits_metadata_impl(context_lens, block_size, num_sms)
+    except RuntimeError as exc:
+        if "Unsupported architecture" in str(exc):
+            _deep_gemm_unsupported_arch = True
+            logger.warning_once(
+                "DeepGEMM paged MQA metadata unsupported on this GPU; "
+                "falling back to a dummy schedule."
+            )
+            return torch.zeros(
+                (num_sms + 1, 2), device=context_lens.device, dtype=torch.int32
+            )
+        raise
 
 
 def fp8_paged_mqa_logits(
@@ -318,19 +425,48 @@ def fp8_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    global _deep_gemm_unsupported_arch
     _lazy_init()
-    if _fp8_paged_mqa_logits_impl is None:
-        return _missing()
-    return _fp8_paged_mqa_logits_impl(
-        q_fp8,
-        kv_cache_fp8,
-        weights,
-        context_lens,
-        block_tables,
-        schedule_metadata,
-        max_model_len,
-        clean_logits=True,
-    )
+    if (
+        not envs.VLLM_USE_DEEP_GEMM
+        or _fp8_paged_mqa_logits_impl is None
+        or _deep_gemm_unsupported_arch
+        or not is_deep_gemm_supported()
+    ):
+        return _fp8_paged_mqa_logits_torch(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+    try:
+        return _fp8_paged_mqa_logits_impl(
+            q_fp8,
+            kv_cache_fp8,
+            weights,
+            context_lens,
+            block_tables,
+            schedule_metadata,
+            max_model_len,
+            clean_logits=True,
+        )
+    except RuntimeError as exc:
+        if "Unsupported architecture" in str(exc):
+            _deep_gemm_unsupported_arch = True
+            logger.warning_once(
+                "DeepGEMM FP8 paged MQA logits unsupported on this GPU; falling back to torch."
+            )
+            return _fp8_paged_mqa_logits_torch(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                context_lens,
+                block_tables,
+                max_model_len,
+            )
+        raise
 
 
 def _ceil_to_ue8m0(x: torch.Tensor):

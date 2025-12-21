@@ -14,6 +14,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces import supports_eagle3
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -119,6 +120,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             self.do_spec_decode = False
             self.num_speculative_steps = 0
             self.speculator = None
+        self.use_aux_hidden_state_outputs = (
+            self._get_eagle3_use_aux_hidden_state_from_config()
+            if self.speculative_config is not None
+            else False
+        )
 
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
@@ -164,6 +170,16 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             if self.do_spec_decode:
                 self.speculator.load_model(self.model)
+            if self.use_aux_hidden_state_outputs:
+                if not supports_eagle3(self.model):
+                    raise RuntimeError(
+                        "Model does not support EAGLE3 interface but "
+                        "aux_hidden_state_outputs was requested"
+                    )
+                aux_layers = self._get_eagle3_aux_layers_from_config()
+                if not aux_layers:
+                    aux_layers = self.model.get_eagle3_aux_hidden_state_layers()
+                self.model.set_aux_hidden_state_layers(aux_layers)
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -283,10 +299,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_tokens_across_dp=num_tokens_across_dp,
             ),
         ):
-            hidden_states = self.model(
+            model_output = self.model(
                 input_ids=input_batch.input_ids,
                 positions=input_batch.positions,
             )
+            if isinstance(model_output, tuple):
+                hidden_states = model_output[0]
+            else:
+                hidden_states = model_output
             sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -925,7 +945,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # Run CUDA graph.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
-            hidden_states = self.cudagraph_manager.run(
+            model_output = self.cudagraph_manager.run(
                 input_batch.num_tokens_after_padding
             )
         else:
@@ -938,12 +958,45 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 cudagraph_runtime_mode=cudagraph_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
             ):
-                hidden_states = self.model(
+                model_output = self.model(
                     input_ids=input_batch.input_ids,
                     positions=input_batch.positions,
                 )
+        aux_hidden_states = None
+        if isinstance(model_output, tuple):
+            hidden_states, aux_hidden_states = model_output
+        else:
+            hidden_states = model_output
 
-        self.execute_model_state = hidden_states, input_batch, sampling_metadata
+        self.execute_model_state = (
+            hidden_states,
+            aux_hidden_states,
+            input_batch,
+            sampling_metadata,
+        )
+        return None
+
+    def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
+        if self.speculative_config is None or self.speculative_config.method != "eagle3":
+            return False
+        eagle_config = getattr(
+            self.speculative_config.draft_model_config.hf_config,
+            "eagle_config",
+            None,
+        )
+        if eagle_config is not None:
+            return eagle_config.get("use_aux_hidden_state", True)
+        return True
+
+    def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
+        if not (self.speculative_config and self.speculative_config.draft_model_config):
+            return None
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
+            return None
+        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
+        if layer_ids and isinstance(layer_ids, (list, tuple)):
+            return tuple(layer_ids)
         return None
 
     @torch.inference_mode()
@@ -952,7 +1005,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> AsyncOutput | ModelRunnerOutput:
         assert self.execute_model_state is not None
-        hidden_states, input_batch, sampling_metadata = self.execute_model_state
+        (
+            hidden_states,
+            aux_hidden_states,
+            input_batch,
+            sampling_metadata,
+        ) = self.execute_model_state
         self.execute_model_state = None  # type: ignore
         assert sampling_metadata is not None
 
@@ -995,7 +1053,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 input_batch,
                 sampling_metadata,
                 hidden_states,
-                None,  # aux_hidden_states
+                aux_hidden_states,
                 num_sampled,
                 num_rejected,
             )

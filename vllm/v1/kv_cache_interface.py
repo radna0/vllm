@@ -35,6 +35,12 @@ class KVCacheSpec:
         """
         raise NotImplementedError
 
+    def page_size_bytes_breakdown(self) -> tuple[int, int]:
+        """
+        Return (data_bytes, scale_bytes) per page.
+        """
+        return self.page_size_bytes, 0
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         """
         The maximum possible memory usage of this KV cache in bytes.
@@ -92,6 +98,18 @@ class AttentionSpec(KVCacheSpec):
             * self.head_size
             * get_dtype_size(self.dtype)
         )
+
+    def page_size_bytes_breakdown(self) -> tuple[int, int]:
+        if self.cache_dtype_str == "nvfp4":
+            packed_head_size = self.head_size // 2  # two FP4 values per byte
+            data_bytes = (
+                2 * self.block_size * self.num_kv_heads * packed_head_size
+            )
+            scale_bytes = (
+                2 * self.block_size * self.num_kv_heads * cdiv(self.head_size, 16)
+            )
+            return data_bytes, scale_bytes
+        return self.page_size_bytes, 0
 
 
 @dataclass(frozen=True)
@@ -318,6 +336,15 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+
+    def page_size_bytes_breakdown(self) -> tuple[int, int]:
+        data_bytes = 0
+        scale_bytes = 0
+        for spec in self.kv_cache_specs.values():
+            data_i, scale_i = spec.page_size_bytes_breakdown()
+            data_bytes += data_i
+            scale_bytes += scale_i
+        return data_bytes, scale_bytes
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

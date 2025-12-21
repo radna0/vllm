@@ -30,6 +30,22 @@ from vllm.v1.worker.gpu.spec_decode.eagle_cudagraph import (
 logger = init_logger(__name__)
 
 
+class _EagleSpeculatorDraftLoop(nn.Module):
+    def __init__(self, speculator: "EagleSpeculator"):
+        super().__init__()
+        self.speculator = speculator
+
+    def forward(
+        self,
+        num_reqs: int,
+        attn_metadata: dict[str, Any],
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
+        self.speculator._draft_loop_impl(
+            num_reqs, attn_metadata, num_tokens_across_dp
+        )
+
+
 class EagleSpeculator:
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -79,6 +95,16 @@ class EagleSpeculator:
             dtype=torch.int64,
             device=device,
         )
+        self._draft_top_k = torch.empty(
+            self.max_num_reqs,
+            dtype=torch.int32,
+            device=device,
+        )
+        self._draft_top_p = torch.empty(
+            self.max_num_reqs,
+            dtype=torch.float32,
+            device=device,
+        )
         self.draft_tokens = torch.zeros(
             self.max_num_reqs,
             self.num_speculative_steps,
@@ -92,6 +118,7 @@ class EagleSpeculator:
             vllm_config, device
         )
         self._decode_attn_metadata_cache: dict[int, dict[str, Any]] = {}
+        self._draft_loop = _EagleSpeculatorDraftLoop(self)
 
     def load_model(self, target_model: nn.Module) -> None:
         from vllm.compilation.backends import set_model_tag
@@ -149,14 +176,25 @@ class EagleSpeculator:
         attn_metadata: dict[str, Any],
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
+        self._draft_loop(num_reqs, attn_metadata, num_tokens_across_dp)
+
+    def _draft_loop_impl(
+        self,
+        num_reqs: int,
+        attn_metadata: dict[str, Any],
+        num_tokens_across_dp: torch.Tensor | None,
+    ) -> None:
         pos = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc.gpu[: num_reqs + 1]
+        top_k = self._draft_top_k[:num_reqs]
+        top_p = self._draft_top_p[:num_reqs]
         for step in range(1, self.num_speculative_steps):
             # Run the eagle model.
             last_hidden_states, hidden_states = self.run_model(
                 num_reqs, attn_metadata, num_tokens_across_dp
             )
             logits = self.model.compute_logits(last_hidden_states)
+            logits = apply_top_k_top_p(logits, top_k, top_p)
 
             # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
             # used for draft and target sampling.
@@ -326,20 +364,22 @@ class EagleSpeculator:
         torch.gather(sampling_metadata.temperature, 0, cu_num_logits, out=temperature)
         torch.gather(sampling_metadata.seeds, 0, cu_num_logits, out=seeds)
         torch.gather(input_batch.positions, 0, last_token_indices, out=pos)
-        top_k = None
-        top_p = None
+        top_k = self._draft_top_k[:num_reqs]
         if sampling_metadata.top_k is not None:
-            top_k = torch.empty(
-                num_reqs, dtype=torch.int32, device=logits.device
+            torch.gather(
+                sampling_metadata.top_k.to(dtype=top_k.dtype),
+                0,
+                cu_num_logits,
+                out=top_k,
             )
-            torch.gather(sampling_metadata.top_k, 0, cu_num_logits, out=top_k)
+        else:
+            top_k.fill_(self.vocab_size)
+        top_p = self._draft_top_p[:num_reqs]
         if sampling_metadata.top_p is not None:
-            top_p = torch.empty(
-                num_reqs, dtype=torch.float32, device=logits.device
-            )
             torch.gather(sampling_metadata.top_p, 0, cu_num_logits, out=top_p)
-        if top_k is not None or top_p is not None:
-            logits = apply_top_k_top_p(logits, top_k, top_p)
+        else:
+            top_p.fill_(1.0)
+        logits = apply_top_k_top_p(logits, top_k, top_p)
         # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
         # used for draft and target sampling.
         draft_tokens = gumbel_sample(

@@ -41,6 +41,12 @@ void silu_and_mul_nvfp4_quant_sm1xxa(torch::Tensor& output,
                                      torch::Tensor& input_sf);
 #endif
 
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+void nvfp4_unpack_fp4x2_sm1xxa(torch::Tensor& output,
+                               torch::Tensor const& input);
+#endif
+
 void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
                       torch::Tensor& output_sf, torch::Tensor const& input_sf) {
 #if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
@@ -73,4 +79,12 @@ void silu_and_mul_nvfp4_quant(torch::Tensor& output, torch::Tensor& output_sf,
 #endif
   TORCH_CHECK_NOT_IMPLEMENTED(
       false, "No compiled silu_and_mul nvfp4 quantization kernel");
+}
+
+void nvfp4_unpack_fp4x2(torch::Tensor& output, torch::Tensor const& input) {
+#if (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100) || \
+    (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120)
+  return nvfp4_unpack_fp4x2_sm1xxa(output, input);
+#endif
+  TORCH_CHECK_NOT_IMPLEMENTED(false, "No compiled nvfp4 unpack kernel");
 }

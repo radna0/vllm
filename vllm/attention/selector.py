@@ -67,6 +67,11 @@ def get_attn_backend(
 
     vllm_config = get_current_vllm_config()
     backend_enum = vllm_config.attention_config.backend
+    if (
+        kv_cache_dtype == "nvfp4"
+        and vllm_config.attention_config.nvfp4_backend is not None
+    ):
+        backend_enum = vllm_config.attention_config.nvfp4_backend
 
     attn_selector_config = AttentionSelectorConfig(
         head_size=head_size,

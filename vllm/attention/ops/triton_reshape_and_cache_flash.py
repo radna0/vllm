@@ -114,9 +114,9 @@ def triton_reshape_and_cache_flash(
         raise NotImplementedError(
             "NVFP4 KV cache is not supported by Triton reshape_and_cache_flash."
         )
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
-        f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
-    )
+    assert (
+        kv_cache_dtype in ("auto", "bfloat16") or kv_cache_dtype.startswith("fp8")
+    ), f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     kv_cache_torch_dtype = (
         current_platform.fp8_dtype()
         if kv_cache_dtype.startswith("fp8")

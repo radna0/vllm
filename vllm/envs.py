@@ -47,10 +47,28 @@ if TYPE_CHECKING:
     VLLM_SPEC_DECODE_TRACE: bool = False
     VLLM_SPEC_DECODE_TRACE_INTERVAL: float = 10.0
     VLLM_SPEC_DECODE_TRACE_SYNC: bool = False
+    VLLM_EAGLE_FAST_LOGITS: bool = False
+    VLLM_EAGLE_CUDAGRAPH_ALLOW_RANDOM: bool = False
+    VLLM_EAGLE_AUTO_PADDED: bool = False
+    VLLM_EAGLE_GPU_VERIFY: bool = False
+    VLLM_EAGLE_OPT_MODE: str | None = None
+    VLLM_EAGLE_DYNAMIC_TREE: bool = False
+    VLLM_EAGLE_DYNAMIC_TOPK: int = 0
+    VLLM_EAGLE_DYNAMIC_TREE_KERNELS: bool = False
+    VLLM_EAGLE_CUDA_INDICES: bool = False
+    VLLM_EAGLE_CUDA_REWIND: bool = False
+    VLLM_EAGLE_CUDA_DRAFT: bool = False
+    VLLM_EAGLE_CUDA_SAMPLE: bool = False
+    VLLM_EAGLE_CUDA_TREE_COPY: bool = False
+    VLLM_EAGLE_CUDA_TREE_DRAFT: bool = False
+    VLLM_EAGLE_CUDA_KV_REWIND: bool = False
+    VLLM_EAGLE_CUDA_KV_COMPACT: bool = False
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
+    VLLM_DISABLE_MLA_SPARSE: bool = False
+    VLLM_MLA_SM120_DENSE_FALLBACK: bool = False
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -214,9 +232,16 @@ if TYPE_CHECKING:
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
     VLLM_USE_TRTLLM_ATTENTION: str | None = None
+    VLLM_USE_TRTLLM_MOE: bool = False
     VLLM_TRTLLM_BINDINGS_PATH: str | None = None
+    VLLM_TRTLLM_PYTHON_PATH: str | None = None
     VLLM_TRTLLM_LIB_DIR: str | None = None
     VLLM_TRTLLM_DISABLE: bool = False
+    VLLM_TRTLLM_DECODE_BACKEND: Literal[
+        "auto", "xqa", "mmha", "trtllm-gen"
+    ] = "auto"
+    VLLM_TRTLLM_SINK_TOKEN_LENGTH: int = 0
+    VLLM_FLASHINFER_TRTLLM_SM120_ALLOW: bool = False
     VLLM_NVFP4_GEMM_BACKEND: str | None = None
     VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION: bool = False
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
@@ -456,6 +481,73 @@ def get_vllm_port() -> int | None:
 
 logger = logging.getLogger(__name__)
 
+
+def _eagle_opt_mode() -> str:
+    return os.getenv("VLLM_EAGLE_OPT_MODE", "").strip().lower()
+
+
+_EAGLE_OPT_OVERRIDES: dict[str, dict[str, bool]] = {
+    "baseline": {
+        "VLLM_EAGLE_FAST_LOGITS": False,
+        "VLLM_EAGLE_GPU_VERIFY": False,
+        "VLLM_EAGLE_CUDA_INDICES": False,
+        "VLLM_EAGLE_CUDA_REWIND": False,
+        "VLLM_EAGLE_CUDA_DRAFT": False,
+        "VLLM_EAGLE_CUDA_SAMPLE": False,
+        "VLLM_EAGLE_CUDA_TREE_COPY": False,
+        "VLLM_EAGLE_CUDA_TREE_DRAFT": False,
+        "VLLM_EAGLE_CUDA_KV_REWIND": False,
+        "VLLM_EAGLE_CUDA_KV_COMPACT": False,
+        "VLLM_EAGLE_DYNAMIC_TREE": False,
+        "VLLM_EAGLE_DYNAMIC_TREE_KERNELS": False,
+    },
+    "optimized": {
+        "VLLM_EAGLE_FAST_LOGITS": True,
+        "VLLM_EAGLE_GPU_VERIFY": True,
+        "VLLM_EAGLE_CUDA_INDICES": True,
+        "VLLM_EAGLE_CUDA_REWIND": True,
+        "VLLM_EAGLE_CUDA_DRAFT": True,
+        "VLLM_EAGLE_CUDA_SAMPLE": True,
+        "VLLM_EAGLE_CUDA_TREE_COPY": True,
+        "VLLM_EAGLE_CUDA_TREE_DRAFT": True,
+        "VLLM_EAGLE_CUDA_KV_REWIND": True,
+        "VLLM_EAGLE_CUDA_KV_COMPACT": True,
+        "VLLM_EAGLE_DYNAMIC_TREE": False,
+        "VLLM_EAGLE_DYNAMIC_TREE_KERNELS": True,
+    },
+    "goal": {
+        "VLLM_EAGLE_FAST_LOGITS": True,
+        "VLLM_EAGLE_GPU_VERIFY": True,
+        "VLLM_EAGLE_CUDA_INDICES": True,
+        "VLLM_EAGLE_CUDA_REWIND": True,
+        "VLLM_EAGLE_CUDA_DRAFT": True,
+        "VLLM_EAGLE_CUDA_SAMPLE": True,
+        "VLLM_EAGLE_CUDA_TREE_COPY": True,
+        "VLLM_EAGLE_CUDA_TREE_DRAFT": True,
+        "VLLM_EAGLE_CUDA_KV_REWIND": True,
+        "VLLM_EAGLE_CUDA_KV_COMPACT": True,
+        "VLLM_EAGLE_DYNAMIC_TREE": True,
+        "VLLM_EAGLE_DYNAMIC_TREE_KERNELS": True,
+    },
+}
+
+
+def _eagle_opt_override(name: str) -> bool | None:
+    mode = _eagle_opt_mode()
+    if not mode:
+        return None
+    overrides = _EAGLE_OPT_OVERRIDES.get(mode)
+    if overrides is None:
+        return None
+    return overrides.get(name)
+
+
+def _eagle_bool_env(name: str) -> bool:
+    override = _eagle_opt_override(name)
+    if override is not None:
+        return override
+    return os.getenv(name, "0") == "1"
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
@@ -674,6 +766,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SPEC_DECODE_TRACE_SYNC": lambda: os.getenv("VLLM_SPEC_DECODE_TRACE_SYNC", "0")
     == "1",
+    "VLLM_EAGLE_FAST_LOGITS": lambda: _eagle_bool_env("VLLM_EAGLE_FAST_LOGITS"),
+    "VLLM_EAGLE_CUDAGRAPH_ALLOW_RANDOM": lambda: os.getenv(
+        "VLLM_EAGLE_CUDAGRAPH_ALLOW_RANDOM", "0"
+    )
+    == "1",
+    "VLLM_EAGLE_AUTO_PADDED": lambda: os.getenv("VLLM_EAGLE_AUTO_PADDED", "0") == "1",
+    "VLLM_EAGLE_GPU_VERIFY": lambda: _eagle_bool_env("VLLM_EAGLE_GPU_VERIFY"),
+    "VLLM_EAGLE_OPT_MODE": _eagle_opt_mode,
+    "VLLM_EAGLE_DYNAMIC_TREE": lambda: _eagle_bool_env("VLLM_EAGLE_DYNAMIC_TREE"),
+    "VLLM_EAGLE_DYNAMIC_TOPK": lambda: int(
+        os.getenv("VLLM_EAGLE_DYNAMIC_TOPK", "0")
+    ),
+    "VLLM_EAGLE_DYNAMIC_TREE_KERNELS": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_DYNAMIC_TREE_KERNELS"
+    ),
+    "VLLM_EAGLE_CUDA_INDICES": lambda: _eagle_bool_env("VLLM_EAGLE_CUDA_INDICES"),
+    "VLLM_EAGLE_CUDA_REWIND": lambda: _eagle_bool_env("VLLM_EAGLE_CUDA_REWIND"),
+    "VLLM_EAGLE_CUDA_DRAFT": lambda: _eagle_bool_env("VLLM_EAGLE_CUDA_DRAFT"),
+    "VLLM_EAGLE_CUDA_SAMPLE": lambda: _eagle_bool_env("VLLM_EAGLE_CUDA_SAMPLE"),
+    "VLLM_EAGLE_CUDA_TREE_COPY": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_CUDA_TREE_COPY"
+    ),
+    "VLLM_EAGLE_CUDA_TREE_DRAFT": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_CUDA_TREE_DRAFT"
+    ),
+    "VLLM_EAGLE_CUDA_KV_REWIND": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_CUDA_KV_REWIND"
+    ),
+    "VLLM_EAGLE_CUDA_KV_COMPACT": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_CUDA_KV_COMPACT"
+    ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging
@@ -697,6 +820,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
             ).AttentionBackendEnum.__members__.keys()
         ),
     ),
+    "VLLM_DISABLE_MLA_SPARSE": lambda: os.getenv("VLLM_DISABLE_MLA_SPARSE", "0")
+    == "1",
+    "VLLM_MLA_SM120_DENSE_FALLBACK": lambda: os.getenv(
+        "VLLM_MLA_SM120_DENSE_FALLBACK", "0"
+    )
+    == "1",
     # If set, vllm will use flashinfer sampler
     "VLLM_USE_FLASHINFER_SAMPLER": lambda: bool(
         int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"])
@@ -1412,13 +1541,35 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_USE_TRTLLM_ATTENTION" not in os.environ
         else os.environ["VLLM_USE_TRTLLM_ATTENTION"].lower() in ("1", "true")
     ),
+    # If set to 1/True, prefer TRTLLM MoE custom ops when available.
+    "VLLM_USE_TRTLLM_MOE": lambda: bool(
+        int(os.getenv("VLLM_USE_TRTLLM_MOE", "0"))
+    ),
     # Optional: override TensorRT-LLM bindings path for thop attention.
     "VLLM_TRTLLM_BINDINGS_PATH": lambda: os.getenv("VLLM_TRTLLM_BINDINGS_PATH"),
+    # Optional: add TensorRT-LLM python path for custom ops.
+    "VLLM_TRTLLM_PYTHON_PATH": lambda: os.getenv("VLLM_TRTLLM_PYTHON_PATH"),
     # Optional: TRTLLM shared library directory (libtensorrt_llm.so, etc.).
     "VLLM_TRTLLM_LIB_DIR": lambda: os.getenv("VLLM_TRTLLM_LIB_DIR"),
     # Disable loading TRTLLM bindings.
     "VLLM_TRTLLM_DISABLE": lambda: bool(
         int(os.getenv("VLLM_TRTLLM_DISABLE", "0"))
+    ),
+    # Controls decode backend selection for TRTLLM attention.
+    # Supported options: "auto", "xqa", "mmha", "trtllm-gen".
+    "VLLM_TRTLLM_DECODE_BACKEND": env_with_choices(
+        "VLLM_TRTLLM_DECODE_BACKEND",
+        "auto",
+        ["auto", "xqa", "mmha", "trtllm-gen"],
+        case_sensitive=False,
+    ),
+    # Allow TRTLLM-GEN attention on SM120 when compatible cubins are available.
+    "VLLM_FLASHINFER_TRTLLM_SM120_ALLOW": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_TRTLLM_SM120_ALLOW", "0"))
+    ),
+    # Optional: set TRTLLM sink token length for streaming attention.
+    "VLLM_TRTLLM_SINK_TOKEN_LENGTH": lambda: int(
+        os.getenv("VLLM_TRTLLM_SINK_TOKEN_LENGTH", "0")
     ),
     # If set to 1, when we use fp8 kv, we do not quantize Q to fp8
     "VLLM_FLASHINFER_DISABLE_Q_QUANTIZATION": lambda: bool(
@@ -1703,6 +1854,22 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SPEC_DECODE_TRACE",
         "VLLM_SPEC_DECODE_TRACE_INTERVAL",
         "VLLM_SPEC_DECODE_TRACE_SYNC",
+        "VLLM_EAGLE_FAST_LOGITS",
+        "VLLM_EAGLE_CUDAGRAPH_ALLOW_RANDOM",
+        "VLLM_EAGLE_AUTO_PADDED",
+        "VLLM_EAGLE_GPU_VERIFY",
+        "VLLM_EAGLE_OPT_MODE",
+        "VLLM_EAGLE_DYNAMIC_TREE",
+        "VLLM_EAGLE_DYNAMIC_TOPK",
+        "VLLM_EAGLE_DYNAMIC_TREE_KERNELS",
+        "VLLM_EAGLE_CUDA_INDICES",
+        "VLLM_EAGLE_CUDA_REWIND",
+        "VLLM_EAGLE_CUDA_DRAFT",
+        "VLLM_EAGLE_CUDA_SAMPLE",
+        "VLLM_EAGLE_CUDA_TREE_COPY",
+        "VLLM_EAGLE_CUDA_TREE_DRAFT",
+        "VLLM_EAGLE_CUDA_KV_REWIND",
+        "VLLM_EAGLE_CUDA_KV_COMPACT",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

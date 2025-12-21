@@ -120,6 +120,14 @@ class InputBatch:
             pin_memory=False,
         )
         self.token_ids_cpu = self.token_ids_cpu_tensor.numpy()
+        self.prompt_token_ids_gpu: torch.Tensor | None = None
+        if is_spec_decode:
+            self.prompt_token_ids_gpu = torch.empty(
+                (max_num_reqs, max_model_len),
+                device=device,
+                dtype=torch.int32,
+            )
+            self.prompt_token_ids_gpu.fill_(self.vocab_size)
         self.is_token_ids_tensor = torch.zeros(
             (max_num_reqs, max_model_len), device="cpu", dtype=bool, pin_memory=False
         )
@@ -333,12 +341,32 @@ class InputBatch:
         if request.prompt_token_ids is not None:
             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
             self.is_token_ids[req_index, :num_prompt_tokens] = True
+            if self.prompt_token_ids_gpu is not None:
+                row = self.prompt_token_ids_gpu[req_index]
+                row.fill_(self.vocab_size)
+                row[:num_prompt_tokens].copy_(
+                    torch.as_tensor(
+                        request.prompt_token_ids,
+                        device=self.device,
+                        dtype=torch.int32,
+                    )
+                )
         else:
             self.is_token_ids[req_index, :num_prompt_tokens] = False
+            if self.prompt_token_ids_gpu is not None:
+                self.prompt_token_ids_gpu[req_index].fill_(self.vocab_size)
         if request.prompt_embeds is not None:
             self.req_prompt_embeds[req_index] = request.prompt_embeds
         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
         self.is_token_ids[req_index, start_idx:end_idx] = True
+        if self.prompt_token_ids_gpu is not None and request.output_token_ids:
+            self.prompt_token_ids_gpu[req_index, start_idx:end_idx].copy_(
+                torch.as_tensor(
+                    request.output_token_ids,
+                    device=self.device,
+                    dtype=torch.int32,
+                )
+            )
         # Number of tokens without spec decode tokens.
         self.num_tokens_no_spec[req_index] = request.num_tokens
 
@@ -539,6 +567,10 @@ class InputBatch:
         tmp = self.token_ids_cpu[i1, ...].copy()
         self.token_ids_cpu[i1, ...] = self.token_ids_cpu[i2, ...]
         self.token_ids_cpu[i2, ...] = tmp
+        if self.prompt_token_ids_gpu is not None:
+            tmp_gpu = self.prompt_token_ids_gpu[i1].clone()
+            self.prompt_token_ids_gpu[i1].copy_(self.prompt_token_ids_gpu[i2])
+            self.prompt_token_ids_gpu[i2].copy_(tmp_gpu)
 
         self.is_token_ids[[i1, i2], ...] = self.is_token_ids[[i2, i1], ...]
 
@@ -669,6 +701,10 @@ class InputBatch:
             self.is_token_ids[empty_index, :num_tokens] = self.is_token_ids[
                 last_req_index, :num_tokens
             ]
+            if self.prompt_token_ids_gpu is not None:
+                self.prompt_token_ids_gpu[empty_index].copy_(
+                    self.prompt_token_ids_gpu[last_req_index]
+                )
             if last_req_index in self.req_prompt_embeds:
                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
                     last_req_index

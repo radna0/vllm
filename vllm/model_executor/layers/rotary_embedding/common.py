@@ -132,9 +132,14 @@ class ApplyRotaryEmb(CustomOp):
 
         self.apply_rotary_emb_flash_attn = None
         if find_spec("flash_attn") is not None:
-            from flash_attn.ops.triton.rotary import apply_rotary
-
-            self.apply_rotary_emb_flash_attn = apply_rotary
+            try:
+                from flash_attn.ops.triton.rotary import apply_rotary
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.debug_once(
+                    "flash_attn rotary import failed; falling back: %s", exc
+                )
+            else:
+                self.apply_rotary_emb_flash_attn = apply_rotary
 
     @staticmethod
     def forward_static(

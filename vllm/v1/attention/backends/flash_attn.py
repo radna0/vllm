@@ -75,6 +75,8 @@ class FlashAttentionBackend(AttentionBackend):
             # suffer from the NaN propagation problem described here:
             # https://github.com/Dao-AILab/flash-attention/issues/1974
             return [16, 32, 64]
+        if get_flash_attn_version() == 4:
+            return [128]
         return [MultipleOf(16)]
 
     @staticmethod
@@ -148,7 +150,11 @@ class FlashAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
-        return head_size % 8 == 0 and head_size <= 256
+        if head_size % 8 != 0:
+            return False
+        if get_flash_attn_version() == 4:
+            return head_size in (64, 96, 128)
+        return head_size <= 256
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
@@ -569,7 +575,7 @@ class FlashAttentionImpl(AttentionImpl):
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (
-                "Sinks are only supported in FlashAttention 3"
+                "Sinks are only supported in FlashAttention 3 or 4"
             )
             assert self.sinks.shape[0] == num_heads, (
                 "Sinks must have the same number of heads as the number of "
@@ -690,6 +696,9 @@ class FlashAttentionImpl(AttentionImpl):
             descale_shape = (cu_seqlens_q.shape[0] - 1, self.num_kv_heads)
 
             if self.dcp_world_size > 1:
+                assert self.vllm_flash_attn_version != 4, (
+                    "Distributed Context Parallel doesn't support FA4 yet"
+                )
                 self._forward_with_dcp(
                     query[:num_actual_tokens],
                     key[:num_actual_tokens],
@@ -704,32 +713,61 @@ class FlashAttentionImpl(AttentionImpl):
                 )
                 return output
             else:
-                flash_attn_varlen_func(
-                    q=query[:num_actual_tokens],
-                    k=key_cache,
-                    v=value_cache,
-                    out=output[:num_actual_tokens],
-                    cu_seqlens_q=cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    seqused_k=seqused_k,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=self.scale,
-                    causal=attn_metadata.causal,
-                    alibi_slopes=self.alibi_slopes,
-                    window_size=self.sliding_window,
-                    block_table=block_table,
-                    softcap=self.logits_soft_cap,
-                    scheduler_metadata=scheduler_metadata,
-                    fa_version=self.vllm_flash_attn_version,
-                    q_descale=layer._q_scale.expand(descale_shape),
-                    k_descale=layer._k_scale.expand(descale_shape),
-                    v_descale=layer._v_scale.expand(descale_shape),
-                    num_splits=attn_metadata.max_num_splits,
-                    s_aux=self.sinks,
-                )
+                if self.vllm_flash_attn_version == 4:
+                    from flash_attn.cute.interface import _flash_attn_fwd
+
+                    window_size = (
+                        None if self.sliding_window[0] == -1 else self.sliding_window[0],
+                        None if self.sliding_window[1] == -1 else self.sliding_window[1],
+                    )
+                    _flash_attn_fwd(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        cu_seqlens_q=cu_seqlens_q,
+                        cu_seqlens_k=None,
+                        seqused_q=None,
+                        seqused_k=seqused_k,
+                        page_table=block_table,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        window_size_left=window_size[0],
+                        window_size_right=window_size[1],
+                        learnable_sink=self.sinks,
+                        softcap=self.logits_soft_cap,
+                        return_lse=False,
+                        out=output[:num_actual_tokens],
+                    )
+                else:
+                    flash_attn_varlen_func(
+                        q=query[:num_actual_tokens],
+                        k=key_cache,
+                        v=value_cache,
+                        out=output[:num_actual_tokens],
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        seqused_k=seqused_k,
+                        max_seqlen_k=max_seqlen_k,
+                        softmax_scale=self.scale,
+                        causal=attn_metadata.causal,
+                        alibi_slopes=self.alibi_slopes,
+                        window_size=self.sliding_window,
+                        block_table=block_table,
+                        softcap=self.logits_soft_cap,
+                        scheduler_metadata=scheduler_metadata,
+                        fa_version=self.vllm_flash_attn_version,
+                        q_descale=layer._q_scale.expand(descale_shape),
+                        k_descale=layer._k_scale.expand(descale_shape),
+                        v_descale=layer._v_scale.expand(descale_shape),
+                        num_splits=attn_metadata.max_num_splits,
+                        s_aux=self.sinks,
+                    )
                 return output
 
         # Cascade attention (rare case).
+        assert self.vllm_flash_attn_version != 4, (
+            "Cascade attention is not supported in FlashAttention 4 yet."
+        )
         cascade_attention(
             output[:num_actual_tokens],
             query[:num_actual_tokens],
@@ -857,6 +895,10 @@ class FlashAttentionImpl(AttentionImpl):
             attn_metadata: Encoder attention metadata
             layer: The attention layer
         """
+        if self.vllm_flash_attn_version == 4:
+            raise NotImplementedError(
+                "FlashAttention 4 encoder attention is not wired yet."
+            )
         # For encoder attention, process FP8 quantization if needed
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError(
@@ -916,6 +958,8 @@ def use_cascade_attention(
     given configuration, and 2) heuristically decides whether using cascade
     attention can improve performance.
     """
+    if get_flash_attn_version() == 4:
+        return False
     # Too short common prefix. Probably not worth using cascade attention.
     # We use an arbitrary threshold of 256 tokens. TODO: Tune this threshold.
     # NOTE(woosuk): This is the common case. We should return False as soon as

@@ -136,19 +136,37 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
-        # Compute probability distribution from target logits.
-        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
-
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_probs,
-            bonus_token_ids,
-            sampling_metadata,
-        )
+        if sampling_metadata.all_greedy:
+            # Fast path: no need to materialize probs for greedy sampling.
+            target_argmax = target_logits.argmax(dim=-1).to(torch.int32)
+            output_token_ids = torch.full(
+                (metadata.cu_num_draft_tokens.shape[0], metadata.max_spec_len + 1),
+                PLACEHOLDER_TOKEN_ID,
+                dtype=torch.int32,
+                device=target_logits.device,
+            )
+            rejection_greedy_sample_kernel[(metadata.cu_num_draft_tokens.shape[0],)](
+                output_token_ids,
+                metadata.cu_num_draft_tokens,
+                metadata.draft_token_ids,
+                target_argmax,
+                bonus_token_ids,
+                None,
+                metadata.max_spec_len,
+            )
+        else:
+            # Compute probability distribution from target logits.
+            target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+            output_token_ids = rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_probs,
+                bonus_token_ids,
+                sampling_metadata,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -731,6 +749,82 @@ def rejection_random_sample_kernel(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,
         )
+
+
+@triton.jit
+def pack_accepted_tokens_kernel(
+    output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    output_stride,  # stride for dim 0
+    offsets_ptr,  # [batch_size]
+    counts_ptr,  # [batch_size]
+    packed_ptr,  # [total_tokens]
+    max_len,
+    BLOCK_SIZE: tl.constexpr,
+):
+    req_idx = tl.program_id(0)
+    count = tl.load(counts_ptr + req_idx)
+    if count <= 0:
+        return
+    offset = tl.load(offsets_ptr + req_idx)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < count
+    src = output_token_ids_ptr + req_idx * output_stride + offs
+    dst = packed_ptr + offset + offs
+    tl.store(dst, tl.load(src, mask=mask, other=0), mask=mask)
+
+
+def pack_output_token_ids(
+    output_token_ids: torch.Tensor,
+    vocab_size: int,
+    discard_req_indices: Sequence[int] = (),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack accepted tokens into a flat GPU buffer.
+
+    Returns:
+        packed_token_ids: [total_tokens]
+        cu_num_tokens: [batch_size + 1]
+    """
+    if output_token_ids.numel() == 0:
+        return (
+            output_token_ids.new_empty((0,)),
+            output_token_ids.new_zeros((1,), dtype=torch.int32),
+        )
+    valid_mask = (output_token_ids != PLACEHOLDER_TOKEN_ID) & (
+        output_token_ids < vocab_size
+    )
+    counts = valid_mask.sum(dim=1, dtype=torch.int32)
+    if discard_req_indices is not None and len(discard_req_indices) > 0:
+        counts[torch.tensor(discard_req_indices, device=counts.device)] = 0
+    batch_size = counts.shape[0]
+    cu_num_tokens = torch.empty(
+        batch_size + 1, dtype=torch.int32, device=counts.device
+    )
+    cu_num_tokens[0] = 0
+    cu_num_tokens[1:] = torch.cumsum(counts, dim=0)
+    total_tokens = int(cu_num_tokens[-1].item()) if batch_size else 0
+    packed = output_token_ids.new_empty((total_tokens,))
+    if total_tokens > 0:
+        offsets = cu_num_tokens[:-1]
+        use_cuda_op = (
+            hasattr(torch.ops, "vllm")
+            and hasattr(torch.ops.vllm, "pack_accepted_tokens")
+        )
+        if use_cuda_op:
+            packed = torch.ops.vllm.pack_accepted_tokens(
+                output_token_ids, offsets, counts, total_tokens
+            )
+        else:
+            block_size = triton.next_power_of_2(output_token_ids.shape[1])
+            pack_accepted_tokens_kernel[(batch_size,)](
+                output_token_ids,
+                output_token_ids.stride(0),
+                offsets,
+                counts,
+                packed,
+                output_token_ids.shape[1],
+                BLOCK_SIZE=block_size,
+            )
+    return packed, cu_num_tokens
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.
