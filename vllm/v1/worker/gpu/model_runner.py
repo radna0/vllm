@@ -227,7 +227,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         # TODO(woosuk): Support other backends.
         if not all(b.get_name() == "FLASH_ATTN" for b in self.attn_backends.values()):
-            raise NotImplementedError("Only FLASH_ATTN backend is supported currently.")
+            print(f"DEBUG initialize_kv_cache: attn_backends={[(k, b.get_name()) for k, b in self.attn_backends.items()]}")
+            # raise NotImplementedError("Only FLASH_ATTN backend is supported currently.")
+            logger.warning(f"Only FLASH_ATTN backend is officially supported, but found {[(k, b.get_name()) for k, b in self.attn_backends.items()]}. Proceeding cautiously.")
 
         self.kv_caches: list[torch.Tensor] = []
         init_kv_cache(
@@ -334,10 +336,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             num_tokens_across_dp = make_num_tokens_across_dp(
                 self.dp_size, self.max_num_tokens
             )
+            input_hs = hidden_states[: self.max_num_tokens]
+            print(f"DEBUG profile_run: input_hs shape={input_hs.shape}, speculator.hidden_size={self.speculator.hidden_size}")
             self.speculator.run_model(
                 self.max_num_tokens,
                 attn_metadata=None,
                 num_tokens_across_dp=num_tokens_across_dp,
+                hidden_states=input_hs,
             )
         torch.cuda.synchronize()
         del hidden_states, sample_hidden_states

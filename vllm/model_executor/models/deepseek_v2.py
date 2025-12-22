@@ -343,16 +343,20 @@ class DeepseekV2MoE(nn.Module):
             scoring_func=getattr(config, "scoring_func", "softmax"),
             # we do scaling outside, set factor to 1.0 to avoid double mul
             # aiter applies routed_scaling_factor internally
-            routed_scaling_factor=1.0
-            if not self.is_rocm_aiter_moe_enabled
-            else self.routed_scaling_factor,
+            routed_scaling_factor=(
+                1.0
+                if not self.is_rocm_aiter_moe_enabled
+                else self.routed_scaling_factor
+            ),
             e_score_correction_bias=self.gate.e_score_correction_bias,
             enable_eplb=self.enable_eplb,
             num_redundant_experts=self.n_redundant_experts,
             is_sequence_parallel=self.is_sequence_parallel,
-            n_shared_experts=config.n_shared_experts
-            if self.is_fusion_moe_shared_experts_enabled
-            else None,
+            n_shared_experts=(
+                config.n_shared_experts
+                if self.is_fusion_moe_shared_experts_enabled
+                else None
+            ),
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -458,10 +462,10 @@ class DeepseekV2Attention(nn.Module):
         self.num_local_heads = num_heads // tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.max_position_embeddings = max_position_embeddings
-        assert topk_indices_buffer is None, (
-            "topk_indices_buffer is not \
+        assert (
+            topk_indices_buffer is None
+        ), "topk_indices_buffer is not \
         supported for DeepseekV2Attention"
-        )
 
         if self.q_lora_rank is not None:
             self.q_a_proj = ReplicatedLinear(
@@ -1090,12 +1094,12 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             rotary_emb=self.rotary_emb,
             o_proj=self.o_proj,
-            fused_qkv_a_proj=self.fused_qkv_a_proj
-            if self.q_lora_rank is not None
-            else None,
-            kv_a_proj_with_mqa=self.kv_a_proj_with_mqa
-            if self.q_lora_rank is None
-            else None,
+            fused_qkv_a_proj=(
+                self.fused_qkv_a_proj if self.q_lora_rank is not None else None
+            ),
+            kv_a_proj_with_mqa=(
+                self.kv_a_proj_with_mqa if self.q_lora_rank is None else None
+            ),
             q_a_layernorm=self.q_a_layernorm if self.q_lora_rank is not None else None,
             q_b_proj=self.q_b_proj if self.q_lora_rank is not None else None,
             q_proj=self.q_proj if self.q_lora_rank is None else None,
@@ -1705,14 +1709,69 @@ class DeepseekV2ForCausalLM(
                         if name is None:
                             continue
 
+                        # MXFP4 Expert Mapping
+                        if "experts" in name and (
+                            name.endswith(".blocks") or name.endswith(".scales")
+                        ):
+                            # Map blocks/scales to vLLM w13/w2 names
+                            # Checkpoint:
+                            # experts.0.gate_proj.blocks / scales
+                            # experts.0.up_proj.blocks / scales
+                            # experts.0.down_proj.blocks / scales
+
+                            # Target vLLM Params:
+                            # experts.0.w13_weight / w13_weight_scale  (Fused Gate+Up)
+                            # experts.0.w2_weight / w2_weight_scale
+
+                            key_suffix = (
+                                "weight" if name.endswith(".blocks") else "weight_scale"
+                            )
+
+                            # Identify layer type
+                            if "gate_proj" in name or "up_proj" in name:
+                                target_name = (
+                                    name.replace("gate_proj", "w13")
+                                    .replace("up_proj", "w13")
+                                    .replace("blocks", "weight")
+                                    .replace("scales", "weight_scale")
+                                )
+
+                                if target_name not in params_dict:
+                                    continue
+
+                                param = params_dict[target_name]
+                                # Fused w13 expects Interleaved Gate/Up [G0, U0, G1, U1...]
+                                try:
+                                    if "gate_proj" in name:
+                                        # Gate goes to even indices [::2]
+                                        param.data[:, ::2, :].copy_(loaded_weight)
+                                    else:
+                                        # Up goes to odd indices [1::2]
+                                        param.data[:, 1::2, :].copy_(loaded_weight)
+                                except Exception as e:
+                                    # logger.warning(f"Failed to load {name} into {target_name}: {e}")
+                                    continue
+
+                                # Skip default processing
+                                continue
+
+                            elif "down_proj" in name:
+                                name = (
+                                    name.replace("down_proj", "w2")
+                                    .replace("blocks", "weight")
+                                    .replace("scales", "weight_scale")
+                                )
+
                         if is_pp_missing_parameter(name, self):
                             continue
 
                         if (
-                            (envs.VLLM_DISABLE_MLA_SPARSE
-                             or envs.VLLM_MLA_SM120_DENSE_FALLBACK)
-                            and ".self_attn.indexer." in name
-                        ):
+                            envs.VLLM_DISABLE_MLA_SPARSE
+                            or envs.VLLM_MLA_SM120_DENSE_FALLBACK
+                        ) and ".self_attn.indexer." in name:
+                            continue
+
+                        if name not in params_dict:
                             continue
 
                         param = params_dict[name]

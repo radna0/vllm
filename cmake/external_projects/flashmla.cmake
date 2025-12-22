@@ -149,6 +149,11 @@ if(FLASH_MLA_ARCHS)
             ${flashmla_SOURCE_DIR}/csrc/sm120/decode/sparse_fp8/splitkv_mla.cu
         )
     endif()
+    if(FLASH_MLA_BUILD_SM120 AND EXISTS "${flashmla_SOURCE_DIR}/csrc/sm120/mla_combine.cu")
+        list(APPEND FlashMLA_SOURCES
+            ${flashmla_SOURCE_DIR}/csrc/sm120/mla_combine.cu
+        )
+    endif()
     if(FLASH_MLA_BUILD_SM120 AND EXISTS "${flashmla_SOURCE_DIR}/csrc/sm120/decode/dense/splitkv_mla.cu")
         list(APPEND FlashMLA_SOURCES
             ${flashmla_SOURCE_DIR}/csrc/sm120/decode/dense/splitkv_mla.cu

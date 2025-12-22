@@ -252,6 +252,13 @@ class Attention(nn.Module, AttentionLayerBase):
         self.num_kv_heads = num_kv_heads
         self.sliding_window = sliding_window
         self.has_sink = extra_impl_args.get("sinks") is not None
+        if self.has_sink:
+             logger.info(f"DEBUG Attention: has_sink=True, extra_impl_args={extra_impl_args.keys()}")
+        if envs.VLLM_FORCE_DISABLE_SINKS:
+             if self.has_sink:
+                 logger.warning("Forcing has_sink=False due to VLLM_FORCE_DISABLE_SINKS")
+             self.has_sink = False
+             extra_impl_args.pop("sinks", None)
 
         # NOTE: model_config may be None during certain tests
         model_config = vllm_config.model_config

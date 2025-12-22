@@ -376,6 +376,37 @@ void eagle_prepare_gen_eagle_inputs(
     int64_t max_decoding_tokens,
     int64_t max_non_leaves_per_layer);
 
+void eagle_prepare_gen_eagle_inputs_padded(
+    torch::Tensor next_sequence_lengths,
+    torch::Tensor next_context_lengths,
+    torch::Tensor output_ids,
+    torch::Tensor position_ids,
+    torch::Tensor spec_decoding_gen_lengths,
+    torch::Tensor spec_decoding_position_offsets,
+    torch::Tensor spec_decoding_packed_masks,
+    torch::Tensor hidden_states_indices,
+    torch::Tensor last_token_indices,
+    torch::Tensor num_last_token_indices,
+    torch::Tensor output_hidden_size_batch_starts_per_level,
+    torch::Tensor is_leaf_mask,
+    torch::Tensor selected_draft_indices,
+    torch::Tensor selected_draft_pos_offsets,
+    torch::Tensor num_selected_draft_indices,
+    torch::Tensor selected_masks,
+    torch::Tensor cum_sum_generation_lengths,
+    torch::Tensor max_generation_length,
+    torch::Tensor non_leaves_in_level_offsets,
+    torch::Tensor parent_non_leaf_in_level_offset,
+    torch::Tensor next_draft_ids,
+    torch::Tensor eagle_net0_sequence_lengths,
+    torch::Tensor prev_context_lengths,
+    torch::Tensor input_hidden_size_batch_starts_per_level,
+    torch::Tensor next_paths,
+    int64_t level_idx,
+    int64_t max_path_len,
+    int64_t max_decoding_tokens,
+    int64_t max_non_leaves_per_layer);
+
 void eagle_update_scores(torch::Tensor cur_log_probs,
                          torch::Tensor prev_layer_scores,
                          int64_t dynamic_tree_max_topk);
@@ -512,6 +543,8 @@ std::vector<torch::Tensor> eagle_topk_logits(torch::Tensor logits,
 
 std::vector<torch::Tensor> eagle_topk_logits_custom(torch::Tensor logits,
                                                     int64_t top_k);
+
+
 
 #ifndef USE_ROCM
 

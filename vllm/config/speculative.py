@@ -46,6 +46,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     EagleModelTypes,
+    "specpv",
 ]
 
 
@@ -476,21 +477,14 @@ class SpeculativeConfig:
                 self.num_speculative_tokens,
             )
         # Validate values
-        if self.suffix_decoding_max_tree_depth < 1:
-            raise ValueError(
-                f"suffix_decoding_max_tree_depth="
-                f"{self.suffix_decoding_max_tree_depth} must be >= 1"
-            )
+        if self.suffix_decoding_max_tree_depth <= 0:
+            raise ValueError("suffix_decoding_max_tree_depth must be > 0")
         if self.suffix_decoding_max_cached_requests < 0:
-            raise ValueError(
-                f"suffix_decoding_max_cached_requests="
-                f"{self.suffix_decoding_max_cached_requests} must be >= 0"
-            )
-        if self.suffix_decoding_max_spec_factor < 0:
-            raise ValueError(
-                f"suffix_decoding_max_spec_factor="
-                f"{self.suffix_decoding_max_spec_factor} must be >= 0"
-            )
+            raise ValueError("suffix_decoding_max_cached_requests must be >= 0")
+        if self.suffix_decoding_max_spec_factor <= 0:
+            raise ValueError("suffix_decoding_max_spec_factor must be > 0")
+
+        # We no longer check for external arctic_inference package as it is integrated.
         if not 0 <= self.suffix_decoding_min_token_prob <= 1:
             raise ValueError(
                 f"suffix_decoding_min_token_prob="

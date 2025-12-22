@@ -1,0 +1,558 @@
+Obtaining file:///workspace/aimo/LM/vllm
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Getting requirements to build editable: started
+  Getting requirements to build editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: regex in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2025.11.3)
+Requirement already satisfied: cachetools in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (6.2.4)
+Requirement already satisfied: psutil in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (7.1.3)
+Requirement already satisfied: sentencepiece in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.2.1)
+Requirement already satisfied: numpy in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.2.6)
+Requirement already satisfied: requests>=2.26.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.32.5)
+Requirement already satisfied: tqdm in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.67.1)
+Collecting blake3 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached blake3-1.0.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.6 kB)
+Collecting py-cpuinfo (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached py_cpuinfo-9.0.0-py3-none-any.whl.metadata (794 bytes)
+Requirement already satisfied: transformers<5,>=4.56.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.57.3)
+Requirement already satisfied: tokenizers>=0.21.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.22.1)
+Requirement already satisfied: protobuf in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (6.33.2)
+Requirement already satisfied: fastapi>=0.115.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.126.0)
+Requirement already satisfied: aiohttp in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.13.2)
+Requirement already satisfied: openai>=1.99.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.14.0)
+Requirement already satisfied: pydantic>=2.12.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.12.3)
+Requirement already satisfied: prometheus_client>=0.18.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.23.1)
+Requirement already satisfied: pillow in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.0.0)
+Collecting prometheus-fastapi-instrumentator>=7.0.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached prometheus_fastapi_instrumentator-7.1.0-py3-none-any.whl.metadata (13 kB)
+Requirement already satisfied: tiktoken>=0.6.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.12.0)
+Collecting lm-format-enforcer==0.11.3 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached lm_format_enforcer-0.11.3-py3-none-any.whl.metadata (17 kB)
+Collecting llguidance<1.4.0,>=1.3.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached llguidance-1.3.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (10 kB)
+Collecting outlines_core==0.2.11 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached outlines_core-0.2.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (5.8 kB)
+Collecting diskcache==5.6.3 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached diskcache-5.6.3-py3-none-any.whl.metadata (20 kB)
+Collecting lark==1.2.2 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached lark-1.2.2-py3-none-any.whl.metadata (1.8 kB)
+Collecting xgrammar==0.1.27 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached xgrammar-0.1.27-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.8 kB)
+Requirement already satisfied: typing_extensions>=4.10 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.15.0)
+Requirement already satisfied: filelock>=3.16.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.20.0)
+Requirement already satisfied: partial-json-parser in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.2.1.1.post7)
+Requirement already satisfied: pyzmq>=25.0.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (27.1.0)
+Requirement already satisfied: msgspec in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.19.0)
+Collecting gguf>=0.17.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached gguf-0.17.1-py3-none-any.whl.metadata (4.3 kB)
+Collecting mistral_common>=1.8.5 (from mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached mistral_common-1.8.8-py3-none-any.whl.metadata (5.3 kB)
+Collecting opencv-python-headless>=4.11.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached opencv_python_headless-4.12.0.88-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (19 kB)
+Requirement already satisfied: pyyaml in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (6.0.3)
+Requirement already satisfied: six>=1.16.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.17.0)
+Requirement already satisfied: setuptools<81.0.0,>=77.0.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (80.9.0)
+Requirement already satisfied: einops in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.8.1)
+Collecting compressed-tensors==0.13.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached compressed_tensors-0.13.0-py3-none-any.whl.metadata (7.0 kB)
+Collecting depyf==0.20.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached depyf-0.20.0-py3-none-any.whl.metadata (7.3 kB)
+Requirement already satisfied: cloudpickle in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.1.2)
+Requirement already satisfied: watchfiles in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.1.1)
+Collecting python-json-logger (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached python_json_logger-4.0.0-py3-none-any.whl.metadata (4.0 kB)
+Requirement already satisfied: scipy in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.16.3)
+Requirement already satisfied: ninja in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.13.0)
+Collecting pybase64 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached pybase64-1.4.3-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl.metadata (8.7 kB)
+Collecting cbor2 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached cbor2-5.7.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (5.4 kB)
+Collecting ijson (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached ijson-3.4.0.post0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (23 kB)
+Collecting setproctitle (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached setproctitle-1.3.7-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (10 kB)
+Requirement already satisfied: openai-harmony>=0.0.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.0.8)
+Collecting anthropic==0.71.0 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached anthropic-0.71.0-py3-none-any.whl.metadata (28 kB)
+Collecting model-hosting-container-standards<1.0.0,>=0.1.10 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached model_hosting_container_standards-0.1.12-py3-none-any.whl.metadata (24 kB)
+Collecting mcp (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached mcp-1.25.0-py3-none-any.whl.metadata (89 kB)
+Collecting numba==0.61.2 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached numba-0.61.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.8 kB)
+Requirement already satisfied: ray>=2.48.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from ray[cgraph]>=2.48.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.51.0)
+Collecting torch==2.9.1 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached torch-2.9.1-cp313-cp313-manylinux_2_28_x86_64.whl.metadata (30 kB)
+Collecting torchaudio==2.9.1 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached torchaudio-2.9.1-cp313-cp313-manylinux_2_28_x86_64.whl.metadata (6.9 kB)
+Collecting torchvision==0.24.1 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached torchvision-0.24.1-cp313-cp313-manylinux_2_28_x86_64.whl.metadata (5.9 kB)
+Collecting flashinfer-python==0.5.3 (from vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached flashinfer_python-0.5.3-py3-none-any.whl.metadata (11 kB)
+Requirement already satisfied: anyio<5,>=3.5.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.12.0)
+Requirement already satisfied: distro<2,>=1.7.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.9.0)
+Collecting docstring-parser<1,>=0.15 (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached docstring_parser-0.17.0-py3-none-any.whl.metadata (3.5 kB)
+Requirement already satisfied: httpx<1,>=0.25.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.28.1)
+Requirement already satisfied: jiter<1,>=0.4.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.12.0)
+Requirement already satisfied: sniffio in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.3.1)
+Collecting loguru (from compressed-tensors==0.13.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached loguru-0.7.3-py3-none-any.whl.metadata (22 kB)
+Collecting astor (from depyf==0.20.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached astor-0.8.1-py2.py3-none-any.whl.metadata (4.2 kB)
+Requirement already satisfied: dill in /workspace/aimo/miniconda/lib/python3.13/site-packages (from depyf==0.20.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.4.0)
+Collecting apache-tvm-ffi<0.2,>=0.1 (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached apache_tvm_ffi-0.1.6-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (4.2 kB)
+Requirement already satisfied: click in /workspace/aimo/miniconda/lib/python3.13/site-packages (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (8.1.8)
+Collecting nvidia-cudnn-frontend>=1.13.0 (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached nvidia_cudnn_frontend-1.17.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (4.4 kB)
+Collecting nvidia-cutlass-dsl>=4.2.1 (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_x86_64.whl.metadata (2.6 kB)
+Collecting nvidia-ml-py (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached nvidia_ml_py-13.590.44-py3-none-any.whl.metadata (9.8 kB)
+Requirement already satisfied: packaging>=24.2 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (25.0)
+Collecting tabulate (from flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached tabulate-0.9.0-py3-none-any.whl.metadata (34 kB)
+Collecting interegular>=0.3.2 (from lm-format-enforcer==0.11.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached interegular-0.3.3-py37-none-any.whl.metadata (3.0 kB)
+Collecting llvmlite<0.45,>=0.44.0dev0 (from numba==0.61.2->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached llvmlite-0.44.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (5.0 kB)
+Requirement already satisfied: sympy>=1.13.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.6.1)
+Requirement already satisfied: jinja2 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2025.10.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.8.93 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.93)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.8.90 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.90)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.8.90 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.90)
+Requirement already satisfied: nvidia-cudnn-cu12==9.10.2.21 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (9.10.2.21)
+Requirement already satisfied: nvidia-cublas-cu12==12.8.4.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.4.1)
+Requirement already satisfied: nvidia-cufft-cu12==11.3.3.83 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (11.3.3.83)
+Requirement already satisfied: nvidia-curand-cu12==10.3.9.90 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (10.3.9.90)
+Requirement already satisfied: nvidia-cusolver-cu12==11.7.3.90 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (11.7.3.90)
+Requirement already satisfied: nvidia-cusparse-cu12==12.5.8.93 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.5.8.93)
+Requirement already satisfied: nvidia-cusparselt-cu12==0.7.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.7.1)
+Collecting nvidia-nccl-cu12==2.27.5 (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached nvidia_nccl_cu12-2.27.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.0 kB)
+Collecting nvidia-nvshmem-cu12==3.3.20 (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (2.1 kB)
+Requirement already satisfied: nvidia-nvtx-cu12==12.8.90 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.90)
+Requirement already satisfied: nvidia-nvjitlink-cu12==12.8.93 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (12.8.93)
+Requirement already satisfied: nvidia-cufile-cu12==1.13.1.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.13.1.3)
+Collecting triton==3.5.1 (from torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached triton-3.5.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (1.7 kB)
+Requirement already satisfied: idna>=2.8 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from anyio<5,>=3.5.0->anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.11)
+Requirement already satisfied: certifi in /workspace/aimo/miniconda/lib/python3.13/site-packages (from httpx<1,>=0.25.0->anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2025.11.12)
+Requirement already satisfied: httpcore==1.* in /workspace/aimo/miniconda/lib/python3.13/site-packages (from httpx<1,>=0.25.0->anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.0.9)
+Requirement already satisfied: h11>=0.16 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from httpcore==1.*->httpx<1,>=0.25.0->anthropic==0.71.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.16.0)
+Collecting jmespath (from model-hosting-container-standards<1.0.0,>=0.1.10->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached jmespath-1.0.1-py3-none-any.whl.metadata (7.6 kB)
+Requirement already satisfied: starlette>=0.49.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from model-hosting-container-standards<1.0.0,>=0.1.10->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.50.0)
+Collecting supervisor>=4.2.0 (from model-hosting-container-standards<1.0.0,>=0.1.10->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached supervisor-4.3.0-py2.py3-none-any.whl.metadata (87 kB)
+Requirement already satisfied: annotated-types>=0.6.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pydantic>=2.12.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.6.0)
+Requirement already satisfied: pydantic-core==2.41.4 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pydantic>=2.12.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.41.4)
+Requirement already satisfied: typing-inspection>=0.4.2 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pydantic>=2.12.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.4.2)
+Requirement already satisfied: huggingface-hub<1.0,>=0.34.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from transformers<5,>=4.56.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.36.0)
+Requirement already satisfied: safetensors>=0.4.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from transformers<5,>=4.56.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.7.0)
+Requirement already satisfied: hf-xet<2.0.0,>=1.1.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from huggingface-hub<1.0,>=0.34.0->transformers<5,>=4.56.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.2.0)
+Requirement already satisfied: annotated-doc>=0.0.2 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from fastapi>=0.115.0->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.0.4)
+Collecting fastapi-cli>=0.0.8 (from fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached fastapi_cli-0.0.16-py3-none-any.whl.metadata (6.4 kB)
+Collecting python-multipart>=0.0.18 (from fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached python_multipart-0.0.21-py3-none-any.whl.metadata (1.8 kB)
+Collecting email-validator>=2.0.0 (from fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached email_validator-2.3.0-py3-none-any.whl.metadata (26 kB)
+Requirement already satisfied: uvicorn>=0.12.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.40.0)
+Requirement already satisfied: pydantic-settings>=2.0.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.10.1)
+Collecting pydantic-extra-types>=2.0.0 (from fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached pydantic_extra_types-2.10.6-py3-none-any.whl.metadata (4.0 kB)
+Collecting dnspython>=2.0.0 (from email-validator>=2.0.0->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached dnspython-2.8.0-py3-none-any.whl.metadata (5.7 kB)
+Requirement already satisfied: typer>=0.15.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.17.4)
+Collecting rich-toolkit>=0.14.8 (from fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached rich_toolkit-0.17.1-py3-none-any.whl.metadata (1.0 kB)
+Collecting fastapi-cloud-cli>=0.1.1 (from fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached fastapi_cloud_cli-0.7.0-py3-none-any.whl.metadata (3.2 kB)
+Collecting rignore>=0.5.1 (from fastapi-cloud-cli>=0.1.1->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached rignore-0.7.6-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.2 kB)
+Requirement already satisfied: sentry-sdk>=2.20.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from fastapi-cloud-cli>=0.1.1->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.48.0)
+Collecting fastar>=0.8.0 (from fastapi-cloud-cli>=0.1.1->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached fastar-0.8.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.0 kB)
+Requirement already satisfied: MarkupSafe>=2.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from jinja2->torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.0.2)
+Requirement already satisfied: jsonschema>=4.21.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.25.1)
+Requirement already satisfied: attrs>=22.2.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from jsonschema>=4.21.1->mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (25.4.0)
+Requirement already satisfied: jsonschema-specifications>=2023.03.6 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from jsonschema>=4.21.1->mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2025.9.1)
+Requirement already satisfied: referencing>=0.28.4 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from jsonschema>=4.21.1->mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.37.0)
+Requirement already satisfied: rpds-py>=0.7.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from jsonschema>=4.21.1->mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.30.0)
+Collecting cuda-python>=12.8 (from nvidia-cutlass-dsl>=4.2.1->flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached cuda_python-13.1.1-py3-none-any.whl.metadata (6.2 kB)
+Collecting cuda-bindings~=13.1.1 (from cuda-python>=12.8->nvidia-cutlass-dsl>=4.2.1->flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached cuda_bindings-13.1.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (2.3 kB)
+Collecting cuda-pathfinder~=1.1 (from cuda-python>=12.8->nvidia-cutlass-dsl>=4.2.1->flashinfer-python==0.5.3->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached cuda_pathfinder-1.3.3-py3-none-any.whl.metadata (1.9 kB)
+Collecting pycountry>=23 (from pydantic-extra-types[pycountry]>=2.10.5->mistral_common>=1.8.5->mistral_common[image]>=1.8.5->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached pycountry-24.6.1-py3-none-any.whl.metadata (12 kB)
+Requirement already satisfied: python-dotenv>=0.21.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pydantic-settings>=2.0.0->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.1.0)
+Requirement already satisfied: msgpack<2.0.0,>=1.0.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from ray>=2.48.0->ray[cgraph]>=2.48.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.1.2)
+Collecting cupy-cuda12x (from ray[cgraph]>=2.48.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached cupy_cuda12x-13.6.0-cp313-cp313-manylinux2014_x86_64.whl.metadata (2.4 kB)
+Requirement already satisfied: charset_normalizer<4,>=2 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from requests>=2.26.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (3.4.4)
+Requirement already satisfied: urllib3<3,>=1.21.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from requests>=2.26.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.5.0)
+Requirement already satisfied: rich>=13.7.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from rich-toolkit>=0.14.8->fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (14.2.0)
+Requirement already satisfied: markdown-it-py>=2.2.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (4.0.0)
+Requirement already satisfied: pygments<3.0.0,>=2.13.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.19.2)
+Requirement already satisfied: mdurl~=0.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from markdown-it-py>=2.2.0->rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.1.2)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from sympy>=1.13.3->torch==2.9.1->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.3.0)
+Requirement already satisfied: shellingham>=1.3.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from typer>=0.15.1->fastapi-cli>=0.0.8->fastapi-cli[standard]>=0.0.8; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.5.4)
+Requirement already satisfied: httptools>=0.6.3 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.7.1)
+Requirement already satisfied: uvloop>=0.15.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.21.0)
+Requirement already satisfied: websockets>=10.4 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from uvicorn[standard]>=0.12.0; extra == "standard"->fastapi[standard]>=0.115.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (15.0.1)
+Requirement already satisfied: aiohappyeyeballs>=2.5.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.6.1)
+Requirement already satisfied: aiosignal>=1.4.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.4.0)
+Requirement already satisfied: frozenlist>=1.1.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.8.0)
+Requirement already satisfied: multidict<7.0,>=4.5 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (6.7.0)
+Requirement already satisfied: propcache>=0.2.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (0.4.1)
+Requirement already satisfied: yarl<2.0,>=1.17.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from aiohttp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (1.22.0)
+Collecting fastrlock>=0.5 (from cupy-cuda12x->ray[cgraph]>=2.48.0->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached fastrlock-0.8.3-cp313-cp313-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_28_x86_64.whl.metadata (7.7 kB)
+Collecting httpx-sse>=0.4 (from mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached httpx_sse-0.4.3-py3-none-any.whl.metadata (9.7 kB)
+Requirement already satisfied: pyjwt>=2.10.1 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pyjwt[crypto]>=2.10.1->mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.10.1)
+Collecting sse-starlette>=1.6.1 (from mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128)
+  Using cached sse_starlette-3.0.4-py3-none-any.whl.metadata (12 kB)
+Requirement already satisfied: cryptography>=3.4.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from pyjwt[crypto]>=2.10.1->mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (46.0.3)
+Requirement already satisfied: cffi>=2.0.0 in /workspace/aimo/miniconda/lib/python3.13/site-packages (from cryptography>=3.4.0->pyjwt[crypto]>=2.10.1->mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.0.0)
+Requirement already satisfied: pycparser in /workspace/aimo/miniconda/lib/python3.13/site-packages (from cffi>=2.0.0->cryptography>=3.4.0->pyjwt[crypto]>=2.10.1->mcp->vllm==0.14.0rc1.dev28+ga459abf5c.d20251222.cu128) (2.23)
+Using cached anthropic-0.71.0-py3-none-any.whl (355 kB)
+Using cached compressed_tensors-0.13.0-py3-none-any.whl (192 kB)
+Using cached depyf-0.20.0-py3-none-any.whl (39 kB)
+Using cached diskcache-5.6.3-py3-none-any.whl (45 kB)
+Using cached flashinfer_python-0.5.3-py3-none-any.whl (7.0 MB)
+Using cached lark-1.2.2-py3-none-any.whl (111 kB)
+Using cached lm_format_enforcer-0.11.3-py3-none-any.whl (45 kB)
+Using cached numba-0.61.2-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (3.9 MB)
+Using cached outlines_core-0.2.11-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.3 MB)
+Using cached torch-2.9.1-cp313-cp313-manylinux_2_28_x86_64.whl (899.7 MB)
+Using cached nvidia_nccl_cu12-2.27.5-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (322.3 MB)
+Using cached nvidia_nvshmem_cu12-3.3.20-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (124.7 MB)
+Using cached torchaudio-2.9.1-cp313-cp313-manylinux_2_28_x86_64.whl (2.1 MB)
+Using cached torchvision-0.24.1-cp313-cp313-manylinux_2_28_x86_64.whl (8.0 MB)
+Using cached triton-3.5.1-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (170.5 MB)
+Using cached xgrammar-0.1.27-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (8.9 MB)
+Using cached apache_tvm_ffi-0.1.6-cp312-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (2.0 MB)
+Using cached docstring_parser-0.17.0-py3-none-any.whl (36 kB)
+Using cached llguidance-1.3.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (3.0 MB)
+Using cached llvmlite-0.44.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (42.4 MB)
+Using cached model_hosting_container_standards-0.1.12-py3-none-any.whl (105 kB)
+Using cached email_validator-2.3.0-py3-none-any.whl (35 kB)
+Using cached dnspython-2.8.0-py3-none-any.whl (331 kB)
+Using cached fastapi_cli-0.0.16-py3-none-any.whl (12 kB)
+Using cached fastapi_cloud_cli-0.7.0-py3-none-any.whl (23 kB)
+Using cached fastar-0.8.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (821 kB)
+Using cached gguf-0.17.1-py3-none-any.whl (96 kB)
+Using cached interegular-0.3.3-py37-none-any.whl (23 kB)
+Using cached mistral_common-1.8.8-py3-none-any.whl (6.5 MB)
+Using cached nvidia_cudnn_frontend-1.17.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (2.0 MB)
+Using cached nvidia_cutlass_dsl-4.3.4-cp313-cp313-manylinux_2_28_x86_64.whl (58.6 MB)
+Using cached cuda_python-13.1.1-py3-none-any.whl (8.0 kB)
+Using cached cuda_bindings-13.1.1-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (15.9 MB)
+Using cached cuda_pathfinder-1.3.3-py3-none-any.whl (27 kB)
+Using cached opencv_python_headless-4.12.0.88-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (54.0 MB)
+Using cached prometheus_fastapi_instrumentator-7.1.0-py3-none-any.whl (19 kB)
+Using cached pydantic_extra_types-2.10.6-py3-none-any.whl (40 kB)
+Using cached pycountry-24.6.1-py3-none-any.whl (6.3 MB)
+Using cached python_multipart-0.0.21-py3-none-any.whl (24 kB)
+Using cached rich_toolkit-0.17.1-py3-none-any.whl (31 kB)
+Using cached rignore-0.7.6-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (959 kB)
+Using cached supervisor-4.3.0-py2.py3-none-any.whl (320 kB)
+Using cached astor-0.8.1-py2.py3-none-any.whl (27 kB)
+Using cached blake3-1.0.8-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (386 kB)
+Using cached cbor2-5.7.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (284 kB)
+Using cached cupy_cuda12x-13.6.0-cp313-cp313-manylinux2014_x86_64.whl (112.7 MB)
+Using cached fastrlock-0.8.3-cp313-cp313-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_28_x86_64.whl (52 kB)
+Using cached ijson-3.4.0.post0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (149 kB)
+Using cached jmespath-1.0.1-py3-none-any.whl (20 kB)
+Using cached loguru-0.7.3-py3-none-any.whl (61 kB)
+Using cached mcp-1.25.0-py3-none-any.whl (233 kB)
+Using cached httpx_sse-0.4.3-py3-none-any.whl (9.0 kB)
+Using cached sse_starlette-3.0.4-py3-none-any.whl (11 kB)
+Using cached nvidia_ml_py-13.590.44-py3-none-any.whl (50 kB)
+Using cached py_cpuinfo-9.0.0-py3-none-any.whl (22 kB)
+Using cached pybase64-1.4.3-cp313-cp313-manylinux1_x86_64.manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_5_x86_64.whl (71 kB)
+Using cached python_json_logger-4.0.0-py3-none-any.whl (15 kB)
+Using cached setproctitle-1.3.7-cp313-cp313-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (33 kB)
+Using cached tabulate-0.9.0-py3-none-any.whl (35 kB)
+Building wheels for collected packages: vllm
+  Building editable for vllm (pyproject.toml): started
+  Building editable for vllm (pyproject.toml): finished with status 'error'
+  error: subprocess-exited-with-error
+  
+  × Building editable for vllm (pyproject.toml) did not run successfully.
+  │ exit code: 1
+  ╰─> [253 lines of output]
+      /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:279: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+        cpu = _conversion_method_template(device=torch.device("cpu"))
+      /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools_scm/_integration/version_inference.py:51: UserWarning: version of None already set
+        warnings.warn(self.message)
+      running editable_wheel
+      creating /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info
+      writing /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/PKG-INFO
+      writing dependency_links to /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/dependency_links.txt
+      writing entry points to /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/entry_points.txt
+      writing requirements to /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/requires.txt
+      writing top-level names to /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/top_level.txt
+      writing manifest file '/tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/SOURCES.txt'
+      reading manifest template 'MANIFEST.in'
+      adding license file 'LICENSE'
+      writing manifest file '/tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm.egg-info/SOURCES.txt'
+      creating '/tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm-0.14.0rc1.dev28+ga459abf5c.d20251222.cu128.dist-info'
+      creating /tmp/pip-ephem-wheel-cache-vb9ht3b2/wheels/ca/b1/b5/e39def1490c6df5d87e1de88ccfecf1d6260f428ac0830ea45/tmp0lqeaa5o/.tmp-vx6v28ap/vllm-0.14.0rc1.dev28+ga459abf5c.d20251222.cu128.dist-info/WHEEL
+      running build_py
+      running build_ext
+      -- The CXX compiler identification is GNU 11.4.0
+      -- Detecting CXX compiler ABI info
+      -- Detecting CXX compiler ABI info - done
+      -- Check for working CXX compiler: /usr/bin/c++ - skipped
+      -- Detecting CXX compile features
+      -- Detecting CXX compile features - done
+      -- Build type: RelWithDebInfo
+      -- Target device: cuda
+      -- Found Python: /workspace/aimo/miniconda/bin/python3.13 (found version "3.13.9") found components: Interpreter Development.Module Development.SABIModule
+      -- Found python matching: /workspace/aimo/miniconda/bin/python3.13.
+      -- Found CUDA: /usr/local/cuda (found version "12.8")
+      -- The CUDA compiler identification is NVIDIA 12.8.93 with host compiler GNU 11.4.0
+      -- Detecting CUDA compiler ABI info
+      -- Detecting CUDA compiler ABI info - done
+      -- Check for working CUDA compiler: /usr/local/cuda/bin/nvcc - skipped
+      -- Detecting CUDA compile features
+      -- Detecting CUDA compile features - done
+      -- Found CUDAToolkit: /usr/local/cuda/include (found version "12.8.93")
+      -- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+      -- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+      -- Found Threads: TRUE
+      -- PyTorch: CUDA detected: 12.8
+      -- PyTorch: CUDA nvcc is: /usr/local/cuda/bin/nvcc
+      -- PyTorch: CUDA toolkit directory: /usr/local/cuda
+      -- PyTorch: Header version is: 12.8
+      -- Found Python: /workspace/aimo/miniconda/bin/python3.13 (found version "3.13.9") found components: Interpreter
+      CMake Warning at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:140 (message):
+        Failed to compute shorthash for libnvrtc.so
+      Call Stack (most recent call first):
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+        CMakeLists.txt:91 (find_package)
+      
+      
+      -- USE_CUDNN is set to 0. Compiling without cuDNN support
+      -- USE_CUSPARSELT is set to 0. Compiling without cuSPARSELt support
+      -- USE_CUDSS is set to 0. Compiling without cuDSS support
+      -- USE_CUFILE is set to 0. Compiling without cuFile support
+      -- Autodetected CUDA architecture(s):  12.0
+      CMake Warning at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Caffe2/public/cuda.cmake:323 (message):
+        pytorch is not compatible with `CMAKE_CUDA_ARCHITECTURES` and will ignore
+        its value.  Please configure `TORCH_CUDA_ARCH_LIST` instead.
+      Call Stack (most recent call first):
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Caffe2/Caffe2Config.cmake:86 (include)
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:68 (find_package)
+        CMakeLists.txt:91 (find_package)
+      
+      
+      -- Added CUDA NVCC flags for: -gencode;arch=compute_120,code=sm_120
+      CMake Warning at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:22 (message):
+        static library kineto_LIBRARY-NOTFOUND not found.
+      Call Stack (most recent call first):
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/share/cmake/Torch/TorchConfig.cmake:125 (append_torchlib_if_found)
+        CMakeLists.txt:91 (find_package)
+      
+      
+      -- Found Torch: /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/torch/lib/libtorch.so
+      -- CUDA target architectures: 12.0
+      -- CUDA supported target architectures: 12.0
+      -- FetchContent base directory: /workspace/aimo/LM/vllm/.deps
+      -- Enabling cumem allocator extension.
+      -- CMake Version: 4.2.1
+      -- CUTLASS 4.2.1
+      -- Found CUDAToolkit: /usr/local/cuda/targets/x86_64-linux/include (found version "12.8.93")
+      -- CUDART: /usr/local/cuda/lib64/libcudart.so
+      -- CUDA Driver: /usr/local/cuda/lib64/stubs/libcuda.so
+      -- NVRTC: /usr/local/cuda/lib64/libnvrtc.so
+      -- Default Install Location: install
+      -- Found Python3: /workspace/aimo/miniconda/bin/python3.13 (found suitable version "3.13.9", minimum required is "3.5") found components: Interpreter
+      -- CUDA Compilation Architectures: 70;72;75;80;86;87;89;90;90a;100;100a;120;120a;121;121a;101;101a
+      -- Enable caching of reference results in conv unit tests
+      -- Enable rigorous conv problem sizes in conv unit tests
+      -- Grid Dependency Control (GDC) is enabled for SM100 kernels (required for programmatic dependent launches).
+      -- Using the following NVCC flags:
+        --expt-relaxed-constexpr
+        -ftemplate-backtrace-limit=0
+        -DCUTLASS_TEST_LEVEL=0
+        -DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1
+        -DCUTLASS_CONV_UNIT_TEST_RIGOROUS_SIZE_ENABLED=1
+        -DCUTLASS_DEBUG_TRACE_LEVEL=0
+        -Xcompiler=-Wconversion
+        -Xcompiler=-fno-strict-aliasing
+        -lineinfo
+      -- Configuring cublas ...
+      -- cuBLAS Disabled.
+      -- Configuring cuBLAS ... done.
+      -- Marlin generation script hash: 52b2d3c3431795da0776daae5c607e56(ARCH:12.0)
+      -- Last run Marlin generate script hash:
+      -- Marlin generation completed successfully.
+      -- Building Marlin kernels for archs: 8.0+PTX
+      -- Not building AllSpark kernels as no compatible archs found in CUDA target architectures
+      -- Not building scaled_mm_c3x_sm90 as no compatible archs found in CUDA target architectures
+      -- Building scaled_mm_c3x_sm120 for archs: 12.0a
+      -- Not building scaled_mm_c3x_100 as no compatible archs found in CUDA target architectures
+      -- Building scaled_mm_c2x for archs: 8.9+PTX
+      -- Not building sparse_scaled_mm_c3x as no compatible archs found in CUDA target architectures
+      -- Building NVFP4 for archs: 12.0a
+      -- Not building NVFP4 as no compatible archs were found.
+      -- Building CUTLASS MLA for archs: 12.0a
+      -- Not building grouped_mm_c3x as no compatible archs found in CUDA target architectures.
+      -- Not building grouped_mm_c3x as no compatible archs found in CUDA target architectures.
+      -- Building moe_data for archs: 12.0a
+      -- Not building Machete kernels as no compatible archs found in CUDA target architectures
+      -- Not building W4A8 kernels as no compatible archs found in CUDA target architectures
+      -- Building hadacore
+      -- Enabling C extension.
+      -- Marlin MOE generation script hash with arch: 738f3cd7dda0e64ddbde204ce6c77bc1(ARCH:12.0)
+      -- Last run Marlin MOE generate script hash with arch:
+      -- Marlin MOE generation completed successfully.
+      -- Building Marlin MOE kernels for archs: 8.0+PTX
+      -- Enabling moe extension.
+      -- [triton_kernels] Fetch from https://github.com/triton-lang/triton.git:v3.5.0
+      -- [triton_kernels] triton_kernels is available at /workspace/aimo/LM/vllm/.deps/triton_kernels-src/python/triton_kernels/triton_kernels/
+      -- FlashMLA is available at /workspace/aimo/LM/vllm/.deps/flashmla-src
+      -- FlashMLA CUDA architectures: 9.0+PTX
+      CMake Warning (dev) at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/cmake/data/share/cmake-4.2/Modules/FetchContent.cmake:1963 (message):
+        Calling FetchContent_Populate(qutlass) is deprecated, call
+        FetchContent_MakeAvailable(qutlass) instead.  Policy CMP0169 can be set to
+        OLD to allow FetchContent_Populate(qutlass) to be called directly for now,
+        but the ability to call it with declared details will be removed completely
+        in a future version.
+      Call Stack (most recent call first):
+        cmake/external_projects/qutlass.cmake:27 (FetchContent_Populate)
+        CMakeLists.txt:1144 (include)
+      This warning is for project developers.  Use -Wno-dev to suppress it.
+      
+      -- [QUTLASS] QuTLASS is available at /workspace/aimo/LM/vllm/.deps/qutlass-src
+      -- Build type: RelWithDebInfo
+      -- Target device: cuda
+      -- Found Python: /workspace/aimo/miniconda/bin/python3.13 (found version "3.13.9") found components: Interpreter Development.Module Development.SABIModule
+      CMake Warning at .deps/vllm-flash-attn-src/CMakeLists.txt:77 (message):
+        Pytorch version 2.4.0 expected for CUDA build, saw 2.9.1 instead.
+      
+      
+      -- CUDA target architectures: 12.0
+      -- CUDA supported target architectures: 12.0
+      -- FA2_ARCHS: 8.0+PTX
+      -- FA3_ARCHS:
+      -- vllm-flash-attn is available at /workspace/aimo/LM/vllm/.deps/vllm-flash-attn-src
+      -- Configuring done (39.4s)
+      CMake Error at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/cmake/data/share/cmake-4.2/Modules/FindPython/Support.cmake:4439 (add_library):
+        Cannot find source file:
+      
+          csrc/spec_decode/specpv_kernels.cu
+      Call Stack (most recent call first):
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/cmake/data/share/cmake-4.2/Modules/FindPython.cmake:760:EVAL:2 (__Python_add_library)
+        cmake/utils.cmake:510 (Python_add_library)
+        CMakeLists.txt:931 (define_extension_target)
+      
+      
+      CMake Error at /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/cmake/data/share/cmake-4.2/Modules/FindPython/Support.cmake:4439 (add_library):
+        No SOURCES given to target: _C
+      Call Stack (most recent call first):
+        /tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/cmake/data/share/cmake-4.2/Modules/FindPython.cmake:760:EVAL:2 (__Python_add_library)
+        cmake/utils.cmake:510 (Python_add_library)
+        CMakeLists.txt:931 (define_extension_target)
+      
+      
+      CMake Generate step failed.  Build files cannot be regenerated correctly.
+      Traceback (most recent call last):
+        File "/workspace/aimo/miniconda/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 389, in <module>
+          main()
+          ~~~~^^
+        File "/workspace/aimo/miniconda/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 373, in main
+          json_out["return_val"] = hook(**hook_input["kwargs"])
+                                   ~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/workspace/aimo/miniconda/lib/python3.13/site-packages/pip/_vendor/pyproject_hooks/_in_process/_in_process.py", line 303, in build_editable
+          return hook(wheel_directory, config_settings, metadata_directory)
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/build_meta.py", line 468, in build_editable
+          return self._build_with_temp_dir(
+                 ~~~~~~~~~~~~~~~~~~~~~~~~~^
+              cmd, ".whl", wheel_directory, config_settings
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+          )
+          ^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/build_meta.py", line 404, in _build_with_temp_dir
+          self.run_setup()
+          ~~~~~~~~~~~~~~^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/build_meta.py", line 317, in run_setup
+          exec(code, locals())
+          ~~~~^^^^^^^^^^^^^^^^
+        File "<string>", line 791, in <module>
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/__init__.py", line 115, in setup
+          return distutils.core.setup(**attrs)
+                 ~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/core.py", line 186, in setup
+          return run_commands(dist)
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/core.py", line 202, in run_commands
+          dist.run_commands()
+          ~~~~~~~~~~~~~~~~~^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/dist.py", line 1002, in run_commands
+          self.run_command(cmd)
+          ~~~~~~~~~~~~~~~~^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/dist.py", line 1102, in run_command
+          super().run_command(command)
+          ~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+          cmd_obj.run()
+          ~~~~~~~~~~~^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/command/editable_wheel.py", line 139, in run
+          self._create_wheel_file(bdist_wheel)
+          ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/command/editable_wheel.py", line 349, in _create_wheel_file
+          files, mapping = self._run_build_commands(dist_name, unpacked, lib, tmp)
+                           ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/command/editable_wheel.py", line 272, in _run_build_commands
+          self._run_build_subcommands()
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/command/editable_wheel.py", line 299, in _run_build_subcommands
+          self.run_command(name)
+          ~~~~~~~~~~~~~~~~^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/cmd.py", line 357, in run_command
+          self.distribution.run_command(command)
+          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/dist.py", line 1102, in run_command
+          super().run_command(command)
+          ~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/dist.py", line 1021, in run_command
+          cmd_obj.run()
+          ~~~~~~~~~~~^^
+        File "<string>", line 277, in run
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/command/build_ext.py", line 96, in run
+          _build_ext.run(self)
+          ~~~~~~~~~~~~~~^^^^^^
+        File "/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_distutils/command/build_ext.py", line 368, in run
+          self.build_extensions()
+          ~~~~~~~~~~~~~~~~~~~~~^^
+        File "<string>", line 234, in build_extensions
+        File "<string>", line 211, in configure
+        File "/workspace/aimo/miniconda/lib/python3.13/subprocess.py", line 419, in check_call
+          raise CalledProcessError(retcode, cmd)
+      subprocess.CalledProcessError: Command '['cmake', '/workspace/aimo/LM/vllm', '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=RelWithDebInfo', '-DVLLM_TARGET_DEVICE=cuda', '-DVLLM_PYTHON_EXECUTABLE=/workspace/aimo/miniconda/bin/python3.13', '-DVLLM_PYTHON_PATH=/tmp/pip-build-env-ghlkbwee/site:/workspace/aimo/miniconda/lib/python313.zip:/workspace/aimo/miniconda/lib/python3.13:/workspace/aimo/miniconda/lib/python3.13/lib-dynload:/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages:/tmp/pip-build-env-ghlkbwee/normal/lib/python3.13/site-packages:/tmp/pip-build-env-ghlkbwee/overlay/lib/python3.13/site-packages/setuptools/_vendor', '-DFETCHCONTENT_BASE_DIR=/workspace/aimo/LM/vllm/.deps', '-DNVCC_THREADS=1', '-DCMAKE_JOB_POOL_COMPILE:STRING=compile', '-DCMAKE_JOB_POOLS:STRING=compile=12', '-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc']' returned non-zero exit status 1.
+      An error occurred when building editable wheel for vllm.
+      See debugging tips in: https://setuptools.pypa.io/en/latest/userguide/development_mode.html#debugging-tips
+      [end of output]
+  
+  note: This error originates from a subprocess, and is likely not a problem with pip.
+  ERROR: Failed building editable for vllm
+Failed to build vllm
+error: failed-wheel-build-for-install
+
+× Failed to build installable wheels for some pyproject.toml based projects
+╰─> vllm

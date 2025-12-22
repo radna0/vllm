@@ -188,6 +188,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &eagle_prepare_gen_eagle_inputs);
 
   ops.def(
+      "eagle_prepare_gen_eagle_inputs_padded(Tensor! next_sequence_lengths, "
+      "Tensor! next_context_lengths, Tensor! output_ids, Tensor! position_ids, "
+      "Tensor! spec_decoding_gen_lengths, "
+      "Tensor! spec_decoding_position_offsets, "
+      "Tensor! spec_decoding_packed_masks, Tensor! hidden_states_indices, "
+      "Tensor! last_token_indices, Tensor! num_last_token_indices, "
+      "Tensor! output_hidden_size_batch_starts_per_level, "
+      "Tensor! is_leaf_mask, Tensor! selected_draft_indices, "
+      "Tensor! selected_draft_pos_offsets, Tensor! num_selected_draft_indices, "
+      "Tensor! selected_masks, Tensor! cum_sum_generation_lengths, "
+      "Tensor! max_generation_length, Tensor! non_leaves_in_level_offsets, "
+      "Tensor! parent_non_leaf_in_level_offset, Tensor next_draft_ids, "
+      "Tensor eagle_net0_sequence_lengths, Tensor prev_context_lengths, "
+      "Tensor input_hidden_size_batch_starts_per_level, Tensor next_paths, "
+      "int level_idx, int max_path_len, int max_decoding_tokens, "
+      "int max_non_leaves_per_layer) -> ()");
+  ops.impl("eagle_prepare_gen_eagle_inputs_padded", torch::kCUDA,
+           &eagle_prepare_gen_eagle_inputs_padded);
+
+  ops.def(
       "eagle_update_scores(Tensor cur_log_probs, Tensor prev_layer_scores, "
       "int dynamic_tree_max_topk) -> ()");
   ops.impl("eagle_update_scores", torch::kCUDA, &eagle_update_scores);
@@ -320,6 +340,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "eagle_topk_logits_custom(Tensor logits, int top_k) -> (Tensor, Tensor)");
   ops.impl("eagle_topk_logits_custom", torch::kCUDA,
            &eagle_topk_logits_custom);
+
+
 
   // Attention ops
   // Compute the attention between an input query and the cached

@@ -385,8 +385,34 @@ class EagleProposer:
             torch.tensor(nodes, dtype=torch.int64, device=device)
             for nodes in self.tree_manager.nodes_per_level
         ]
+        self._tree_paths_flat = self.tree_manager.paths_flat_indices
+        self._tree_max_non_leaves = self.tree_manager.max_non_leaves_per_level
         self._tree_draft_tokens_buffer: torch.Tensor | None = None
         self._tree_new_draft_tokens: torch.Tensor | None = None
+        self._tree_paths_batch: torch.Tensor | None = None
+        self._tree_cuda_inputs_ready = False
+        self._tree_hidden_size_batch_starts_batch_size = 0
+        self._tree_input_hidden_size_batch_starts_per_level: torch.Tensor | None = None
+        self._tree_next_sequence_lengths: torch.Tensor | None = None
+        self._tree_next_context_lengths: torch.Tensor | None = None
+        self._tree_output_ids: torch.Tensor | None = None
+        self._tree_position_ids: torch.Tensor | None = None
+        self._tree_hidden_states_indices: torch.Tensor | None = None
+        self._tree_last_token_indices: torch.Tensor | None = None
+        self._tree_num_last_token_indices: torch.Tensor | None = None
+        self._tree_output_hidden_size_batch_starts_per_level: torch.Tensor | None = None
+        self._tree_is_leaf_mask: torch.Tensor | None = None
+        self._tree_selected_draft_indices: torch.Tensor | None = None
+        self._tree_selected_draft_pos_offsets: torch.Tensor | None = None
+        self._tree_num_selected_draft_indices: torch.Tensor | None = None
+        self._tree_selected_masks: torch.Tensor | None = None
+        self._tree_cum_sum_generation_lengths: torch.Tensor | None = None
+        self._tree_max_generation_length: torch.Tensor | None = None
+        self._tree_non_leaves_in_level_offsets: torch.Tensor | None = None
+        self._tree_parent_non_leaf_in_level_offset: torch.Tensor | None = None
+        self._tree_spec_decoding_gen_lengths: torch.Tensor | None = None
+        self._tree_spec_decoding_position_offsets: torch.Tensor | None = None
+        self._tree_spec_decoding_packed_masks: torch.Tensor | None = None
         if self._use_tree_cuda_draft and self._tree_total_drafts > 0:
             self._tree_draft_tokens_buffer = torch.full(
                 (self.max_num_reqs, self._tree_total_drafts + 1),
@@ -662,6 +688,129 @@ class EagleProposer:
         self._dyn_third_topks[:batch_size].zero_()
         self._dyn_use_paths_a = True
         self._dynamic_active_topk = 0
+
+    def _ensure_tree_cuda_inputs_buffers(self) -> None:
+        if self._tree_cuda_inputs_ready or not envs.VLLM_EAGLE_CUDA_TREE_INPUTS:
+            return
+        if self._tree_total_drafts <= 0:
+            return
+        device = self.device
+        max_decoding_tokens = self._tree_total_drafts + 1
+        max_path_len = self._tree_depth + 1
+        num_blocks = (max_decoding_tokens + 31) // 32
+        max_non_leaves = max(1, self._tree_max_non_leaves)
+        max_num_reqs = self.max_num_reqs
+
+        self._tree_paths_batch = self._tree_paths_flat.unsqueeze(0).expand(
+            max_num_reqs, -1, -1
+        ).contiguous()
+        self._tree_input_hidden_size_batch_starts_per_level = torch.empty(
+            (self._tree_depth * max_num_reqs + 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_next_sequence_lengths = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._tree_next_context_lengths = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._tree_output_ids = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_position_ids = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._tree_hidden_states_indices = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_last_token_indices = torch.empty(
+            (max_num_reqs * max_non_leaves,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_num_last_token_indices = torch.empty(
+            (1,), dtype=torch.int32, device=device
+        )
+        self._tree_output_hidden_size_batch_starts_per_level = torch.empty(
+            (self._tree_depth * max_num_reqs + 1),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_is_leaf_mask = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int8,
+            device=device,
+        )
+        self._tree_selected_draft_indices = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_selected_draft_pos_offsets = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_num_selected_draft_indices = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._tree_selected_masks = torch.empty(
+            (max_num_reqs * max_decoding_tokens * max_decoding_tokens,),
+            dtype=torch.bool,
+            device=device,
+        )
+        self._tree_cum_sum_generation_lengths = torch.empty(
+            (max_num_reqs + 1), dtype=torch.int32, device=device
+        )
+        self._tree_max_generation_length = torch.empty(
+            (1,), dtype=torch.int32, device=device
+        )
+        self._tree_non_leaves_in_level_offsets = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_parent_non_leaf_in_level_offset = torch.empty(
+            (max_num_reqs * max_decoding_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_spec_decoding_gen_lengths = torch.empty(
+            (max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self._tree_spec_decoding_position_offsets = torch.empty(
+            (max_num_reqs, max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_spec_decoding_packed_masks = torch.empty(
+            (max_num_reqs, max_decoding_tokens, num_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        self._tree_cuda_inputs_ready = True
+
+    def _update_tree_hidden_size_batch_starts(self, batch_size: int) -> None:
+        if (
+            self._tree_input_hidden_size_batch_starts_per_level is None
+            or batch_size <= 0
+        ):
+            return
+        if self._tree_hidden_size_batch_starts_batch_size == batch_size:
+            return
+        offsets = self._tree_input_hidden_size_batch_starts_per_level
+        offset = 0
+        for level, level_size in enumerate(self.num_drafts_per_level):
+            for req_idx in range(batch_size):
+                offsets[level * batch_size + req_idx] = offset + req_idx * level_size
+            offset += batch_size * level_size
+            offsets[level * batch_size + batch_size] = offset
+        self._tree_hidden_size_batch_starts_batch_size = batch_size
 
     def _dynamic_tree_update(
         self,
@@ -2200,8 +2349,18 @@ class EagleProposer:
         use_dynamic_masks = self._dynamic_tree and isinstance(
             attn_metadata_builder, TRTLLMAttentionMetadataBuilder
         )
+        use_cuda_tree_inputs = (
+            envs.VLLM_EAGLE_CUDA_TREE_INPUTS
+            and not self._dynamic_tree
+            and not self.uses_mrope
+            and isinstance(attn_metadata_builder, TRTLLMAttentionMetadataBuilder)
+            and self._tree_draft_tokens_buffer is not None
+            and hasattr(torch.ops.vllm, "eagle_prepare_gen_eagle_inputs_padded")
+        )
+        if use_cuda_tree_inputs:
+            self._ensure_tree_cuda_inputs_buffers()
         tree_attn_metadata_builder = None
-        if not use_dynamic_masks:
+        if not use_dynamic_masks and not use_cuda_tree_inputs:
             tree_attn_metadata_builder = self.runner.attn_groups[0][
                 0
             ].get_metadata_builder()
@@ -2219,6 +2378,8 @@ class EagleProposer:
             and hasattr(torch.ops.vllm, "eagle_extract_real_draft_tokens")
             and self._tree_max_top_k > 0
         )
+        if use_cuda_tree_inputs and not use_tree_cuda_draft:
+            use_cuda_tree_inputs = False
 
         # Sample a draft token for each child at the tree root level.
         root_num_children = self._tree_root_num_children
@@ -2566,6 +2727,129 @@ class EagleProposer:
                     common_attn_metadata=common_attn_metadata,
                     fast_build=True,
                 )
+            elif use_cuda_tree_inputs:
+                assert self._tree_draft_tokens_buffer is not None
+                assert self._tree_paths_batch is not None
+                assert self._tree_input_hidden_size_batch_starts_per_level is not None
+                assert self._tree_next_sequence_lengths is not None
+                assert self._tree_next_context_lengths is not None
+                assert self._tree_output_ids is not None
+                assert self._tree_position_ids is not None
+                assert self._tree_hidden_states_indices is not None
+                assert self._tree_last_token_indices is not None
+                assert self._tree_num_last_token_indices is not None
+                assert self._tree_output_hidden_size_batch_starts_per_level is not None
+                assert self._tree_is_leaf_mask is not None
+                assert self._tree_selected_draft_indices is not None
+                assert self._tree_selected_draft_pos_offsets is not None
+                assert self._tree_num_selected_draft_indices is not None
+                assert self._tree_selected_masks is not None
+                assert self._tree_cum_sum_generation_lengths is not None
+                assert self._tree_max_generation_length is not None
+                assert self._tree_non_leaves_in_level_offsets is not None
+                assert self._tree_parent_non_leaf_in_level_offset is not None
+                assert self._tree_spec_decoding_gen_lengths is not None
+                assert self._tree_spec_decoding_position_offsets is not None
+                assert self._tree_spec_decoding_packed_masks is not None
+
+                max_decoding_tokens = self._tree_total_drafts + 1
+                num_blocks = (max_decoding_tokens + 31) // 32
+                max_non_leaves = max(1, self._tree_max_non_leaves)
+                self._update_tree_hidden_size_batch_starts(batch_size)
+                self._tree_is_leaf_mask[
+                    : batch_size * max_decoding_tokens
+                ].fill_(1)
+                self._tree_selected_masks[
+                    : batch_size * max_decoding_tokens * max_decoding_tokens
+                ].zero_()
+                self._tree_hidden_states_indices[
+                    : batch_size * max_decoding_tokens
+                ].zero_()
+                torch.ops.vllm.eagle_prepare_gen_eagle_inputs_padded(
+                    self._tree_next_sequence_lengths[:batch_size],
+                    self._tree_next_context_lengths[:batch_size],
+                    self._tree_output_ids[: batch_size * max_decoding_tokens],
+                    self._tree_position_ids[:batch_size],
+                    self._tree_spec_decoding_gen_lengths[:batch_size],
+                    self._tree_spec_decoding_position_offsets[
+                        :batch_size, :max_decoding_tokens
+                    ],
+                    self._tree_spec_decoding_packed_masks[
+                        :batch_size, :max_decoding_tokens, :num_blocks
+                    ],
+                    self._tree_hidden_states_indices[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_last_token_indices[
+                        : batch_size * max_non_leaves
+                    ],
+                    self._tree_num_last_token_indices,
+                    self._tree_output_hidden_size_batch_starts_per_level[
+                        : self._tree_depth * batch_size + 1
+                    ],
+                    self._tree_is_leaf_mask[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_selected_draft_indices[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_selected_draft_pos_offsets[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_num_selected_draft_indices[:batch_size],
+                    self._tree_selected_masks[
+                        : batch_size * max_decoding_tokens * max_decoding_tokens
+                    ],
+                    self._tree_cum_sum_generation_lengths[:batch_size],
+                    self._tree_max_generation_length,
+                    self._tree_non_leaves_in_level_offsets[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_parent_non_leaf_in_level_offset[
+                        : batch_size * max_decoding_tokens
+                    ],
+                    self._tree_draft_tokens_buffer[
+                        :batch_size, : self._tree_total_drafts
+                    ],
+                    common_attn_metadata.seq_lens[:batch_size],
+                    common_attn_metadata.seq_lens[:batch_size],
+                    self._tree_input_hidden_size_batch_starts_per_level[
+                        : self._tree_depth * batch_size + 1
+                    ],
+                    self._tree_paths_batch[:batch_size],
+                    level + 1,
+                    self._tree_depth + 1,
+                    max_decoding_tokens,
+                    max_non_leaves,
+                )
+                common_attn_metadata = replace(
+                    common_attn_metadata,
+                    query_start_loc=self._tree_query_start_loc[level][
+                        : batch_size + 1
+                    ],
+                    seq_lens=self._tree_next_sequence_lengths[:batch_size],
+                    num_actual_tokens=batch_size * query_len,
+                    max_query_len=query_len,
+                    spec_decoding_generation_lengths=(
+                        self._tree_spec_decoding_gen_lengths[:batch_size]
+                    ),
+                    spec_decoding_position_offsets=(
+                        self._tree_spec_decoding_position_offsets[
+                            :batch_size, :query_len
+                        ]
+                    ),
+                    spec_decoding_packed_mask=(
+                        self._tree_spec_decoding_packed_masks[
+                            :batch_size, :query_len, :num_blocks
+                        ]
+                    ),
+                    spec_decoding_is_tree=True,
+                )
+                attn_metadata = attn_metadata_builder.build(
+                    common_prefix_len=0,
+                    common_attn_metadata=common_attn_metadata,
+                    fast_build=True,
+                )
             else:
                 common_attn_metadata = replace(
                     common_attn_metadata,
@@ -2596,7 +2880,20 @@ class EagleProposer:
 
             # Copy inputs to buffer for cudagraph.
             num_tokens = attn_metadata.num_actual_tokens
-            if use_tree_buffers:
+            if use_cuda_tree_inputs:
+                assert self._tree_output_ids is not None
+                assert self._tree_spec_decoding_position_offsets is not None
+                input_ids = self._tree_output_ids[
+                    : batch_size * query_len
+                ]
+                positions_offsets = self._tree_spec_decoding_position_offsets[
+                    :batch_size, :query_len
+                ]
+                positions_flat = (
+                    positions_view[:, :1] + positions_offsets
+                ).reshape(-1)
+                hidden_in = tree_hidden_states[:, :query_len].reshape(num_tokens, -1)
+            elif use_tree_buffers:
                 input_ids = tree_input_ids[:, :query_len].reshape(-1)
                 positions_flat = tree_positions[:, :query_len].reshape(-1)
                 hidden_in = tree_hidden_states[:, :query_len].reshape(num_tokens, -1)
@@ -2606,8 +2903,13 @@ class EagleProposer:
                 hidden_in = tree_hidden_states.view(num_tokens, -1)
 
             # Compute the slot mapping.
-            query_positions = flattened_draft_positions[:, level : level + query_len]
-            query_positions_flat = query_positions.reshape(-1)
+            if use_cuda_tree_inputs:
+                query_positions_flat = positions_flat
+            else:
+                query_positions = flattened_draft_positions[
+                    :, level : level + query_len
+                ]
+                query_positions_flat = query_positions.reshape(-1)
             slot_mapping = self._tree_slot_mapping[:num_tokens]
             BLOCK_SIZE_TOKENS = 256
             grid = (triton.cdiv(num_tokens, BLOCK_SIZE_TOKENS),)

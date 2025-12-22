@@ -61,12 +61,14 @@ if TYPE_CHECKING:
     VLLM_EAGLE_CUDA_SAMPLE: bool = False
     VLLM_EAGLE_CUDA_TREE_COPY: bool = False
     VLLM_EAGLE_CUDA_TREE_DRAFT: bool = False
+    VLLM_EAGLE_CUDA_TREE_INPUTS: bool = False
     VLLM_EAGLE_CUDA_KV_REWIND: bool = False
     VLLM_EAGLE_CUDA_KV_COMPACT: bool = False
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_ATTENTION_BACKEND: str | None = None
+    VLLM_FORCE_DISABLE_SINKS: bool = False
     VLLM_DISABLE_MLA_SPARSE: bool = False
     VLLM_MLA_SM120_DENSE_FALLBACK: bool = False
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
@@ -496,6 +498,7 @@ _EAGLE_OPT_OVERRIDES: dict[str, dict[str, bool]] = {
         "VLLM_EAGLE_CUDA_SAMPLE": False,
         "VLLM_EAGLE_CUDA_TREE_COPY": False,
         "VLLM_EAGLE_CUDA_TREE_DRAFT": False,
+        "VLLM_EAGLE_CUDA_TREE_INPUTS": False,
         "VLLM_EAGLE_CUDA_KV_REWIND": False,
         "VLLM_EAGLE_CUDA_KV_COMPACT": False,
         "VLLM_EAGLE_DYNAMIC_TREE": False,
@@ -510,6 +513,7 @@ _EAGLE_OPT_OVERRIDES: dict[str, dict[str, bool]] = {
         "VLLM_EAGLE_CUDA_SAMPLE": True,
         "VLLM_EAGLE_CUDA_TREE_COPY": True,
         "VLLM_EAGLE_CUDA_TREE_DRAFT": True,
+        "VLLM_EAGLE_CUDA_TREE_INPUTS": False,
         "VLLM_EAGLE_CUDA_KV_REWIND": True,
         "VLLM_EAGLE_CUDA_KV_COMPACT": True,
         "VLLM_EAGLE_DYNAMIC_TREE": False,
@@ -524,6 +528,7 @@ _EAGLE_OPT_OVERRIDES: dict[str, dict[str, bool]] = {
         "VLLM_EAGLE_CUDA_SAMPLE": True,
         "VLLM_EAGLE_CUDA_TREE_COPY": True,
         "VLLM_EAGLE_CUDA_TREE_DRAFT": True,
+        "VLLM_EAGLE_CUDA_TREE_INPUTS": True,
         "VLLM_EAGLE_CUDA_KV_REWIND": True,
         "VLLM_EAGLE_CUDA_KV_COMPACT": True,
         "VLLM_EAGLE_DYNAMIC_TREE": True,
@@ -791,6 +796,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EAGLE_CUDA_TREE_DRAFT": lambda: _eagle_bool_env(
         "VLLM_EAGLE_CUDA_TREE_DRAFT"
     ),
+    "VLLM_EAGLE_CUDA_TREE_INPUTS": lambda: _eagle_bool_env(
+        "VLLM_EAGLE_CUDA_TREE_INPUTS"
+    ),
+    "VLLM_FORCE_DISABLE_SINKS": lambda: os.getenv("VLLM_FORCE_DISABLE_SINKS", "0") == "1",
     "VLLM_EAGLE_CUDA_KV_REWIND": lambda: _eagle_bool_env(
         "VLLM_EAGLE_CUDA_KV_REWIND"
     ),
@@ -1868,6 +1877,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_EAGLE_CUDA_SAMPLE",
         "VLLM_EAGLE_CUDA_TREE_COPY",
         "VLLM_EAGLE_CUDA_TREE_DRAFT",
+        "VLLM_EAGLE_CUDA_TREE_INPUTS",
         "VLLM_EAGLE_CUDA_KV_REWIND",
         "VLLM_EAGLE_CUDA_KV_COMPACT",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",

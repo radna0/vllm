@@ -119,14 +119,14 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         return hidden_states, residual
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": -1,
-        "hidden_states": 0,
-        "input_embeds": 0,
-    }
-)
+# @support_torch_compile(
+#     dynamic_arg_dims={
+#         "input_ids": 0,
+#         "positions": -1,
+#         "hidden_states": 0,
+#         "input_embeds": 0,
+#     }
+# )
 class LlamaModel(nn.Module):
     def __init__(
         self,
@@ -198,6 +198,8 @@ class LlamaModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
+        if hidden_states.shape[-1] != input_embeds.shape[-1]:
+             print(f"DEBUG LlamaModel.forward: hidden_states.shape={hidden_states.shape}, input_embeds.shape={input_embeds.shape}")
         assert hidden_states.shape[-1] == input_embeds.shape[-1]
 
         residual = None

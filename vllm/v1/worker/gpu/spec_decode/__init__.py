@@ -15,4 +15,10 @@ def init_speculator(
         from vllm.v1.worker.gpu.spec_decode.eagle import EagleSpeculator
 
         return EagleSpeculator(vllm_config, device)
+
+    if speculative_config.method == "specpv":
+        from vllm.model_executor.layers.speculation.specpv import SpecPVSpeculator
+
+        return SpecPVSpeculator(vllm_config, device)
+
     raise NotImplementedError(f"{speculative_config.method} is not supported yet.")

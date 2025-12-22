@@ -100,6 +100,12 @@ class SpecTreeManager:
                 self.max_top_k = max(
                     self.max_top_k, int(top_k_tensor.max().item())
                 )
+        self.max_non_leaves_per_level = 0
+        for level_nodes in self.nodes_per_level[:-1]:
+            non_leaf = sum(1 for node in level_nodes if child_nodes[node])
+            self.max_non_leaves_per_level = max(
+                self.max_non_leaves_per_level, non_leaf
+            )
 
         self.level_offsets: list[int] = [0]
         for level in range(1, self.tree_depth):
@@ -117,6 +123,7 @@ class SpecTreeManager:
         self.spec_dec_mask_matrix = self._build_mask_matrix(device)
         self.spec_dec_packed_mask = self._pack_mask(self.spec_dec_mask_matrix)
         self.spec_dec_position_offsets = self._build_position_offsets(device)
+        self.paths_flat_indices = self._build_flat_paths(device)
         self.spec_dec_packed_mask_for_drafter_model = self._build_drafter_packed_mask(
             device
         )
@@ -243,3 +250,32 @@ class SpecTreeManager:
         for i, path in enumerate(self.tree_choices):
             offsets[i + 1] = len(path)
         return offsets
+
+    def _build_flat_paths(self, device: torch.device) -> torch.Tensor:
+        max_path_len = self.tree_depth + 1
+        max_decoding_tokens = self.total_drafts + 1
+        paths = torch.full(
+            (max_decoding_tokens, max_path_len),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        paths[0, 0] = 0
+
+        node_id_to_flat: dict[int, int] = {0: 0}
+        for level, nodes in enumerate(self.nodes_per_level[1:]):
+            base = self.level_offsets[level]
+            for idx, node_id in enumerate(nodes):
+                node_id_to_flat[node_id] = base + idx + 1
+
+        for path in self.tree_choices:
+            node_id = self.index_mapping[tuple(path)]
+            node_idx = node_id_to_flat[node_id]
+            indices = [0]
+            for depth in range(1, len(path) + 1):
+                prefix = self.index_mapping[tuple(path[:depth])]
+                indices.append(node_id_to_flat[prefix])
+            paths[node_idx, :len(indices)] = torch.tensor(
+                indices, dtype=torch.int32, device=device
+            )
+        return paths
