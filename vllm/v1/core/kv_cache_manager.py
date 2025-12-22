@@ -104,6 +104,7 @@ class KVCacheManager:
         dcp_world_size: int = 1,
         pcp_world_size: int = 1,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        prefix_cache_type: str = "hash",
     ) -> None:
         self.max_model_len = max_model_len
 
@@ -126,6 +127,7 @@ class KVCacheManager:
             pcp_world_size=pcp_world_size,
             hash_block_size=hash_block_size,
             metrics_collector=self.metrics_collector,
+            prefix_cache_type=prefix_cache_type,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
@@ -292,9 +294,9 @@ class KVCacheManager:
         if self.enable_caching:
             self.block_pool.touch(new_computed_block_list)
         else:
-            assert not any(new_computed_block_list), (
-                "Computed blocks should be empty when prefix caching is disabled"
-            )
+            assert not any(
+                new_computed_block_list
+            ), "Computed blocks should be empty when prefix caching is disabled"
 
         if new_computed_block_list is not self.empty_kv_cache_blocks.blocks:
             # Append the new computed blocks to the request blocks until now to

@@ -137,9 +137,11 @@ class KVCacheCoordinator(ABC):
         return tuple(
             manager.allocate_new_blocks(
                 request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
+                (
+                    num_encoder_tokens
+                    if isinstance(manager, CrossAttentionManager)
+                    else num_tokens
+                ),
             )
             for manager in self.single_type_managers
         )
@@ -300,12 +302,12 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             self.block_size *= pcp_world_size
         # For models using only Mamba, block_size is set to max_model_len when
         # prefix caching is disabled, and hash_block_size validation is skipped.
-        assert not enable_caching or (hash_block_size == self.block_size), (
-            "UnitaryKVCacheCoordinator assumes hash_block_size == block_size"
-        )
-        assert len(self.kv_cache_config.kv_cache_groups) == 1, (
-            "UnitaryKVCacheCoordinator assumes only one kv cache group"
-        )
+        assert not enable_caching or (
+            hash_block_size == self.block_size
+        ), "UnitaryKVCacheCoordinator assumes hash_block_size == block_size"
+        assert (
+            len(self.kv_cache_config.kv_cache_groups) == 1
+        ), "UnitaryKVCacheCoordinator assumes only one kv cache group"
 
     def find_longest_cache_hit(
         self,
@@ -405,9 +407,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             "HybridKVCacheCoordinator assumes exactly one type of full "
             "attention groups now."
         )
-        assert other_spec is not None, (
-            "HybridKVCacheCoordinator assumes exactly one type of other groups now."
-        )
+        assert (
+            other_spec is not None
+        ), "HybridKVCacheCoordinator assumes exactly one type of other groups now."
 
         self.full_attention_manager_cls = FullAttentionManager
         self.other_attention_cls = self.single_type_managers[
@@ -533,6 +535,7 @@ def get_kv_cache_coordinator(
     pcp_world_size: int,
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
+    prefix_cache_type: str = "hash",
 ) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
@@ -545,6 +548,25 @@ def get_kv_cache_coordinator(
             hash_block_size=hash_block_size,
             metrics_collector=metrics_collector,
         )
+
+    # Check for radix cache type
+    if prefix_cache_type == "radix":
+        # Import here to avoid circular imports and optional dependency
+        from vllm.v1.core.radix_kv_cache_coordinator import RadixKVCacheCoordinator
+
+        return RadixKVCacheCoordinator(
+            kv_cache_config,
+            max_model_len,
+            use_eagle,
+            enable_caching,
+            enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            hash_block_size=hash_block_size,
+            metrics_collector=metrics_collector,
+        )
+
+    # Default hash-based coordinators
     if len(kv_cache_config.kv_cache_groups) == 1:
         return UnitaryKVCacheCoordinator(
             kv_cache_config,

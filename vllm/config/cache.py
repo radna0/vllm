@@ -32,6 +32,7 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
+PrefixCacheType = Literal["hash", "radix"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
 
@@ -97,6 +98,11 @@ class CacheConfig:
     benefits before turning this on.\n
     - "xxhash_cbor" combines canonical CBOR serialization with xxHash for
     reproducible hashing. Requires the optional ``xxhash`` package."""
+    prefix_cache_type: PrefixCacheType = "hash"
+    """Type of prefix cache to use:
+    - "hash" (default): Hash-based block lookup with LRU eviction.
+    - "radix": SGLang-style RadixCache with tree-based prefix matching
+      and leaf-first eviction. Better for high shared-prefix workloads."""
     cpu_offload_gb: float = Field(default=0, ge=0)
     """The space in GiB to offload to CPU, per GPU. Default is 0, which means
     no offloading. Intuitively, this argument can be seen as a virtual way to

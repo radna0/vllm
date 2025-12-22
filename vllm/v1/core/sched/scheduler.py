@@ -110,9 +110,9 @@ class Scheduler(SchedulerInterface):
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
         if self.vllm_config.kv_transfer_config is not None:
-            assert not self.is_encoder_decoder, (
-                "Encoder-decoder models are not currently supported with KV connectors"
-            )
+            assert (
+                not self.is_encoder_decoder
+            ), "Encoder-decoder models are not currently supported with KV connectors"
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
@@ -216,6 +216,7 @@ class Scheduler(SchedulerInterface):
             pcp_world_size=self.pcp_world_size,
             hash_block_size=self.block_size,
             metrics_collector=self.kv_metrics_collector,
+            prefix_cache_type=self.cache_config.prefix_cache_type,
         )
         self._init_kv_cache_byte_metrics()
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -265,8 +266,7 @@ class Scheduler(SchedulerInterface):
                     data_bytes = expected_per_block
                     scale_bytes = 0
                 logger.debug(
-                    "Adjusted KV cache byte breakdown for %s: expected %d, "
-                    "got %d.",
+                    "Adjusted KV cache byte breakdown for %s: expected %d, " "got %d.",
                     layer_name,
                     expected_per_block,
                     data_bytes + scale_bytes,
@@ -275,8 +275,7 @@ class Scheduler(SchedulerInterface):
             self._kv_cache_scale_bytes_per_block += scale_bytes
 
         self._kv_cache_bytes_per_block = (
-            self._kv_cache_data_bytes_per_block
-            + self._kv_cache_scale_bytes_per_block
+            self._kv_cache_data_bytes_per_block + self._kv_cache_scale_bytes_per_block
         )
         self._kv_cache_data_bytes_total = (
             self._kv_cache_data_bytes_per_block * num_blocks
@@ -843,9 +842,9 @@ class Scheduler(SchedulerInterface):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        assert (
+            request.status == RequestStatus.RUNNING
+        ), "Only running requests can be preempted"
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED

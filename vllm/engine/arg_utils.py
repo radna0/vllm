@@ -62,6 +62,7 @@ from vllm.config.cache import (
     CacheDType,
     KVOffloadingBackend,
     MambaDType,
+    PrefixCacheType,
     PrefixCachingHashAlgo,
 )
 from vllm.config.device import Device
@@ -181,9 +182,9 @@ def collection_to_kwargs(type_hints: set[TypeHint], type: TypeHint) -> dict[str,
     elem_type = types[0]
 
     # Handle Ellipsis
-    assert all(t is elem_type for t in types if t is not Ellipsis), (
-        f"All non-Ellipsis elements must be of the same type. Got {types}."
-    )
+    assert all(
+        t is elem_type for t in types if t is not Ellipsis
+    ), f"All non-Ellipsis elements must be of the same type. Got {types}."
 
     # Handle Union types
     if get_origin(elem_type) in {Union, UnionType}:
@@ -432,6 +433,7 @@ class EngineArgs:
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
+    prefix_cache_type: PrefixCacheType = CacheConfig.prefix_cache_type
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     swap_space: float = CacheConfig.swap_space
@@ -549,9 +551,7 @@ class EngineArgs:
     model_impl: str = ModelConfig.model_impl
     override_attention_dtype: str = ModelConfig.override_attention_dtype
     attention_backend: AttentionBackendEnum | None = AttentionConfig.backend
-    nvfp4_attention_backend: AttentionBackendEnum | None = (
-        AttentionConfig.nvfp4_backend
-    )
+    nvfp4_attention_backend: AttentionBackendEnum | None = AttentionConfig.nvfp4_backend
 
     calculate_kv_scales: bool = CacheConfig.calculate_kv_scales
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
@@ -922,6 +922,9 @@ class EngineArgs:
         cache_group.add_argument(
             "--prefix-caching-hash-algo", **cache_kwargs["prefix_caching_hash_algo"]
         )
+        cache_group.add_argument(
+            "--prefix-cache-type", **cache_kwargs["prefix_cache_type"]
+        )
         cache_group.add_argument("--cpu-offload-gb", **cache_kwargs["cpu_offload_gb"])
         cache_group.add_argument(
             "--calculate-kv-scales", **cache_kwargs["calculate_kv_scales"]
@@ -1278,9 +1281,9 @@ class EngineArgs:
                     self.model_loader_extra_config.to_serializable()
                 )
             self.model_loader_extra_config["tensorizer_config"] = {}
-            self.model_loader_extra_config["tensorizer_config"]["tensorizer_dir"] = (
-                self.model
-            )
+            self.model_loader_extra_config["tensorizer_config"][
+                "tensorizer_dir"
+            ] = self.model
             self.validate_tensorizer_args()
 
         return LoadConfig(
@@ -1389,9 +1392,7 @@ class EngineArgs:
                     f"{self.kv_cache_dtype}. Enable NVFP4 or choose a "
                     "different kv_cache_dtype."
                 )
-            logger.info(
-                "NVFP4 KV cache is disabled; falling back to auto cache dtype."
-            )
+            logger.info("NVFP4 KV cache is disabled; falling back to auto cache dtype.")
             resolved_cache_dtype = "auto"
 
         cache_config = CacheConfig(
@@ -1405,6 +1406,7 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
+            prefix_cache_type=self.prefix_cache_type,
             cpu_offload_gb=self.cpu_offload_gb,
             calculate_kv_scales=self.calculate_kv_scales,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
@@ -1443,15 +1445,15 @@ class EngineArgs:
             # but we should not do this here.
             placement_group = ray.util.get_current_placement_group()
 
-        assert not headless or not self.data_parallel_hybrid_lb, (
-            "data_parallel_hybrid_lb is not applicable in headless mode"
-        )
-        assert not (self.data_parallel_hybrid_lb and self.data_parallel_external_lb), (
-            "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
-        )
-        assert self.data_parallel_backend == "mp" or self.nnodes == 1, (
-            "nnodes > 1 is only supported with data_parallel_backend=mp"
-        )
+        assert (
+            not headless or not self.data_parallel_hybrid_lb
+        ), "data_parallel_hybrid_lb is not applicable in headless mode"
+        assert not (
+            self.data_parallel_hybrid_lb and self.data_parallel_external_lb
+        ), "data_parallel_hybrid_lb and data_parallel_external_lb cannot both be True."
+        assert (
+            self.data_parallel_backend == "mp" or self.nnodes == 1
+        ), "nnodes > 1 is only supported with data_parallel_backend=mp"
         inferred_data_parallel_rank = 0
         if self.nnodes > 1:
             world_size = (
@@ -1463,12 +1465,12 @@ class EngineArgs:
                 self.pipeline_parallel_size * self.tensor_parallel_size
             )
             local_world_size = world_size // self.nnodes
-            assert world_size % self.nnodes == 0, (
-                f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
-            )
-            assert self.node_rank < self.nnodes, (
-                f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
-            )
+            assert (
+                world_size % self.nnodes == 0
+            ), f"world_size={world_size} must be divisible by nnodes={self.nnodes}."
+            assert (
+                self.node_rank < self.nnodes
+            ), f"node_rank={self.node_rank} must be less than nnodes={self.nnodes}."
             inferred_data_parallel_rank = (
                 self.node_rank * local_world_size
             ) // world_size_within_dp
@@ -1531,9 +1533,9 @@ class EngineArgs:
                     self.node_rank,
                 )
         else:
-            assert not self.data_parallel_hybrid_lb, (
-                "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
-            )
+            assert (
+                not self.data_parallel_hybrid_lb
+            ), "data_parallel_size_local must be set to use data_parallel_hybrid_lb."
 
             if self.data_parallel_backend == "ray" and (
                 envs.VLLM_RAY_DP_PACK_STRATEGY == "span"
@@ -1655,9 +1657,11 @@ class EngineArgs:
                 default_mm_loras=self.default_mm_loras,
                 fully_sharded_loras=self.fully_sharded_loras,
                 lora_dtype=self.lora_dtype,
-                max_cpu_loras=self.max_cpu_loras
-                if self.max_cpu_loras and self.max_cpu_loras > 0
-                else None,
+                max_cpu_loras=(
+                    self.max_cpu_loras
+                    if self.max_cpu_loras and self.max_cpu_loras > 0
+                    else None
+                ),
             )
             if self.enable_lora
             else None
