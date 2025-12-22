@@ -2613,6 +2613,256 @@ void eagle_prepare_gen_eagle_inputs(
       spec_decoding_packed_masks.data_ptr<int32_t>());
 }
 
+__global__ void eagle_get_packed_mask_padded_kernel(
+    const int32_t* __restrict__ gen_lengths,
+    const int32_t* __restrict__ max_generation_lengths,
+    const bool* __restrict__ mask,
+    int32_t max_decoding_tokens,
+    int32_t* __restrict__ packed_mask) {
+  const int32_t batch_idx = static_cast<int32_t>(blockIdx.y);
+  const int32_t token_idx = static_cast<int32_t>(blockIdx.x);
+  const int32_t num_tokens = gen_lengths[batch_idx];
+  const int32_t max_generation_length = max_generation_lengths[0];
+  const int32_t num_packed_masks = eagle_div_up(max_decoding_tokens, 32);
+  int32_t* output_ptr = packed_mask +
+      (batch_idx * max_decoding_tokens + token_idx) * num_packed_masks;
+
+  if (token_idx >= num_tokens) {
+    for (int32_t mask_id = static_cast<int32_t>(threadIdx.x);
+         mask_id < num_packed_masks;
+         mask_id += static_cast<int32_t>(blockDim.x)) {
+      output_ptr[mask_id] = 0;
+    }
+    return;
+  }
+  if (token_idx == 0) {
+    for (int32_t mask_id = static_cast<int32_t>(threadIdx.x);
+         mask_id < num_packed_masks;
+         mask_id += static_cast<int32_t>(blockDim.x)) {
+      output_ptr[mask_id] = (mask_id == 0) ? 1 : 0;
+    }
+    return;
+  }
+  const bool* mask_ptr =
+      mask + (batch_idx * max_decoding_tokens + token_idx) * max_decoding_tokens;
+  extern __shared__ char sh_mask[];
+  for (int32_t ti = static_cast<int32_t>(threadIdx.x);
+       ti < max_generation_length;
+       ti += static_cast<int32_t>(blockDim.x)) {
+    const int32_t sh_index = max_generation_length - 1 - ti;
+    sh_mask[sh_index] = mask_ptr[ti] ? '1' : '0';
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    eagle_mask_to_packed(output_ptr, sh_mask, max_generation_length,
+                         num_packed_masks);
+  }
+}
+
+void eagle_prepare_gen_eagle_inputs_padded(
+    torch::Tensor next_sequence_lengths,
+    torch::Tensor next_context_lengths,
+    torch::Tensor output_ids,
+    torch::Tensor position_ids,
+    torch::Tensor spec_decoding_gen_lengths,
+    torch::Tensor spec_decoding_position_offsets,
+    torch::Tensor spec_decoding_packed_masks,
+    torch::Tensor hidden_states_indices,
+    torch::Tensor last_token_indices,
+    torch::Tensor num_last_token_indices,
+    torch::Tensor output_hidden_size_batch_starts_per_level,
+    torch::Tensor is_leaf_mask,
+    torch::Tensor selected_draft_indices,
+    torch::Tensor selected_draft_pos_offsets,
+    torch::Tensor num_selected_draft_indices,
+    torch::Tensor selected_masks,
+    torch::Tensor cum_sum_generation_lengths,
+    torch::Tensor max_generation_length,
+    torch::Tensor non_leaves_in_level_offsets,
+    torch::Tensor parent_non_leaf_in_level_offset,
+    torch::Tensor next_draft_ids,
+    torch::Tensor eagle_net0_sequence_lengths,
+    torch::Tensor prev_context_lengths,
+    torch::Tensor input_hidden_size_batch_starts_per_level,
+    torch::Tensor next_paths,
+    int64_t level_idx,
+    int64_t max_path_len,
+    int64_t max_decoding_tokens,
+    int64_t max_non_leaves_per_layer) {
+  TORCH_CHECK(next_sequence_lengths.is_cuda(),
+              "next_sequence_lengths must be a CUDA tensor");
+  TORCH_CHECK(next_context_lengths.is_cuda(),
+              "next_context_lengths must be a CUDA tensor");
+  TORCH_CHECK(output_ids.is_cuda(), "output_ids must be a CUDA tensor");
+  TORCH_CHECK(position_ids.is_cuda(), "position_ids must be a CUDA tensor");
+  TORCH_CHECK(spec_decoding_gen_lengths.is_cuda(),
+              "spec_decoding_gen_lengths must be a CUDA tensor");
+  TORCH_CHECK(spec_decoding_position_offsets.is_cuda(),
+              "spec_decoding_position_offsets must be a CUDA tensor");
+  TORCH_CHECK(spec_decoding_packed_masks.is_cuda(),
+              "spec_decoding_packed_masks must be a CUDA tensor");
+  TORCH_CHECK(hidden_states_indices.is_cuda(),
+              "hidden_states_indices must be a CUDA tensor");
+  TORCH_CHECK(last_token_indices.is_cuda(),
+              "last_token_indices must be a CUDA tensor");
+  TORCH_CHECK(num_last_token_indices.is_cuda(),
+              "num_last_token_indices must be a CUDA tensor");
+  TORCH_CHECK(output_hidden_size_batch_starts_per_level.is_cuda(),
+              "output_hidden_size_batch_starts_per_level must be a CUDA tensor");
+  TORCH_CHECK(is_leaf_mask.is_cuda(), "is_leaf_mask must be a CUDA tensor");
+  TORCH_CHECK(selected_draft_indices.is_cuda(),
+              "selected_draft_indices must be a CUDA tensor");
+  TORCH_CHECK(selected_draft_pos_offsets.is_cuda(),
+              "selected_draft_pos_offsets must be a CUDA tensor");
+  TORCH_CHECK(num_selected_draft_indices.is_cuda(),
+              "num_selected_draft_indices must be a CUDA tensor");
+  TORCH_CHECK(selected_masks.is_cuda(),
+              "selected_masks must be a CUDA tensor");
+  TORCH_CHECK(cum_sum_generation_lengths.is_cuda(),
+              "cum_sum_generation_lengths must be a CUDA tensor");
+  TORCH_CHECK(max_generation_length.is_cuda(),
+              "max_generation_length must be a CUDA tensor");
+  TORCH_CHECK(non_leaves_in_level_offsets.is_cuda(),
+              "non_leaves_in_level_offsets must be a CUDA tensor");
+  TORCH_CHECK(parent_non_leaf_in_level_offset.is_cuda(),
+              "parent_non_leaf_in_level_offset must be a CUDA tensor");
+  TORCH_CHECK(next_draft_ids.is_cuda(), "next_draft_ids must be a CUDA tensor");
+  TORCH_CHECK(eagle_net0_sequence_lengths.is_cuda(),
+              "eagle_net0_sequence_lengths must be a CUDA tensor");
+  TORCH_CHECK(prev_context_lengths.is_cuda(),
+              "prev_context_lengths must be a CUDA tensor");
+  TORCH_CHECK(input_hidden_size_batch_starts_per_level.is_cuda(),
+              "input_hidden_size_batch_starts_per_level must be a CUDA tensor");
+  TORCH_CHECK(next_paths.is_cuda(), "next_paths must be a CUDA tensor");
+  TORCH_CHECK(next_sequence_lengths.scalar_type() == torch::kInt32,
+              "next_sequence_lengths must be int32");
+  TORCH_CHECK(next_context_lengths.scalar_type() == torch::kInt32,
+              "next_context_lengths must be int32");
+  TORCH_CHECK(output_ids.scalar_type() == torch::kInt32,
+              "output_ids must be int32");
+  TORCH_CHECK(position_ids.scalar_type() == torch::kInt32,
+              "position_ids must be int32");
+  TORCH_CHECK(spec_decoding_gen_lengths.scalar_type() == torch::kInt32,
+              "spec_decoding_gen_lengths must be int32");
+  TORCH_CHECK(spec_decoding_position_offsets.scalar_type() == torch::kInt32,
+              "spec_decoding_position_offsets must be int32");
+  TORCH_CHECK(spec_decoding_packed_masks.scalar_type() == torch::kInt32,
+              "spec_decoding_packed_masks must be int32");
+  TORCH_CHECK(hidden_states_indices.scalar_type() == torch::kInt32,
+              "hidden_states_indices must be int32");
+  TORCH_CHECK(last_token_indices.scalar_type() == torch::kInt32,
+              "last_token_indices must be int32");
+  TORCH_CHECK(num_last_token_indices.scalar_type() == torch::kInt32,
+              "num_last_token_indices must be int32");
+  TORCH_CHECK(output_hidden_size_batch_starts_per_level.scalar_type() ==
+                  torch::kInt32,
+              "output_hidden_size_batch_starts_per_level must be int32");
+  TORCH_CHECK(is_leaf_mask.scalar_type() == torch::kInt8,
+              "is_leaf_mask must be int8");
+  TORCH_CHECK(selected_draft_indices.scalar_type() == torch::kInt32,
+              "selected_draft_indices must be int32");
+  TORCH_CHECK(selected_draft_pos_offsets.scalar_type() == torch::kInt32,
+              "selected_draft_pos_offsets must be int32");
+  TORCH_CHECK(num_selected_draft_indices.scalar_type() == torch::kInt32,
+              "num_selected_draft_indices must be int32");
+  TORCH_CHECK(selected_masks.scalar_type() == torch::kBool,
+              "selected_masks must be bool");
+  TORCH_CHECK(cum_sum_generation_lengths.scalar_type() == torch::kInt32,
+              "cum_sum_generation_lengths must be int32");
+  TORCH_CHECK(max_generation_length.scalar_type() == torch::kInt32,
+              "max_generation_length must be int32");
+  TORCH_CHECK(non_leaves_in_level_offsets.scalar_type() == torch::kInt32,
+              "non_leaves_in_level_offsets must be int32");
+  TORCH_CHECK(parent_non_leaf_in_level_offset.scalar_type() == torch::kInt32,
+              "parent_non_leaf_in_level_offset must be int32");
+  TORCH_CHECK(next_draft_ids.scalar_type() == torch::kInt32,
+              "next_draft_ids must be int32");
+  TORCH_CHECK(eagle_net0_sequence_lengths.scalar_type() == torch::kInt32,
+              "eagle_net0_sequence_lengths must be int32");
+  TORCH_CHECK(prev_context_lengths.scalar_type() == torch::kInt32,
+              "prev_context_lengths must be int32");
+  TORCH_CHECK(input_hidden_size_batch_starts_per_level.scalar_type() ==
+                  torch::kInt32,
+              "input_hidden_size_batch_starts_per_level must be int32");
+  TORCH_CHECK(next_paths.scalar_type() == torch::kInt32,
+              "next_paths must be int32");
+  const int32_t batch_size = static_cast<int32_t>(next_draft_ids.size(0));
+  if (batch_size == 0) {
+    return;
+  }
+  constexpr int kBlockSize = 512;
+  TORCH_CHECK(batch_size <= kBlockSize,
+              "batch_size exceeds prepare_gen_eagle_inputs limit");
+  c10::cuda::CUDAGuard device_guard(next_draft_ids.device());
+
+  const int32_t max_decoding_tokens_i32 =
+      static_cast<int32_t>(max_decoding_tokens);
+  const int32_t max_path_len_i32 = static_cast<int32_t>(max_path_len);
+  dim3 leaf_grid(batch_size, max_path_len_i32 - 1);
+  eagle_build_leaf_mask_kernel<<<leaf_grid, kBlockSize, 0,
+                                 at::cuda::getDefaultCUDAStream()>>>(
+      is_leaf_mask.data_ptr<int8_t>(),
+      next_paths.data_ptr<int32_t>(),
+      max_decoding_tokens_i32,
+      max_path_len_i32);
+
+  const size_t smem_size =
+      4 * max_decoding_tokens_i32 * sizeof(int32_t);
+  eagle_get_non_leaf_subtree_kernel<<<batch_size, kBlockSize, smem_size,
+                                      at::cuda::getDefaultCUDAStream()>>>(
+      selected_draft_indices.data_ptr<int32_t>(),
+      selected_draft_pos_offsets.data_ptr<int32_t>(),
+      selected_masks.data_ptr<bool>(),
+      num_selected_draft_indices.data_ptr<int32_t>(),
+      parent_non_leaf_in_level_offset.data_ptr<int32_t>(),
+      non_leaves_in_level_offsets.data_ptr<int32_t>(),
+      is_leaf_mask.data_ptr<int8_t>(),
+      next_paths.data_ptr<int32_t>(),
+      static_cast<int32_t>(level_idx),
+      max_decoding_tokens_i32,
+      max_path_len_i32);
+
+  eagle_prepare_gen_inputs_kernel<kBlockSize>
+      <<<1, kBlockSize, 0, at::cuda::getDefaultCUDAStream()>>>(
+          next_sequence_lengths.data_ptr<int32_t>(),
+          next_context_lengths.data_ptr<int32_t>(),
+          output_ids.data_ptr<int32_t>(),
+          position_ids.data_ptr<int32_t>(),
+          spec_decoding_gen_lengths.data_ptr<int32_t>(),
+          spec_decoding_position_offsets.data_ptr<int32_t>(),
+          spec_decoding_packed_masks.data_ptr<int32_t>(),
+          hidden_states_indices.data_ptr<int32_t>(),
+          last_token_indices.data_ptr<int32_t>(),
+          num_last_token_indices.data_ptr<int32_t>(),
+          output_hidden_size_batch_starts_per_level.data_ptr<int32_t>(),
+          cum_sum_generation_lengths.data_ptr<int32_t>(),
+          max_generation_length.data_ptr<int32_t>(),
+          next_draft_ids.data_ptr<int32_t>(),
+          selected_draft_indices.data_ptr<int32_t>(),
+          selected_draft_pos_offsets.data_ptr<int32_t>(),
+          num_selected_draft_indices.data_ptr<int32_t>(),
+          eagle_net0_sequence_lengths.data_ptr<int32_t>(),
+          prev_context_lengths.data_ptr<int32_t>(),
+          input_hidden_size_batch_starts_per_level.data_ptr<int32_t>(),
+          parent_non_leaf_in_level_offset.data_ptr<int32_t>(),
+          static_cast<int32_t>(level_idx),
+          batch_size,
+          max_path_len_i32,
+          max_decoding_tokens_i32,
+          static_cast<int32_t>(max_non_leaves_per_layer));
+
+  dim3 pack_block(32);
+  dim3 pack_grid(max_decoding_tokens_i32, batch_size);
+  size_t pack_smem = max_decoding_tokens_i32 * sizeof(char);
+  eagle_get_packed_mask_padded_kernel<<<pack_grid, pack_block, pack_smem,
+                                        at::cuda::getDefaultCUDAStream()>>>(
+      spec_decoding_gen_lengths.data_ptr<int32_t>(),
+      max_generation_length.data_ptr<int32_t>(),
+      selected_masks.data_ptr<bool>(),
+      max_decoding_tokens_i32,
+      spec_decoding_packed_masks.data_ptr<int32_t>());
+}
+
 __device__ inline void eagle_insertion_sort_int32(int32_t* data,
                                                   int32_t n) {
   for (int32_t i = 1; i < n; ++i) {
@@ -5025,6 +5275,50 @@ void eagle_prepare_gen_eagle_inputs(
     int64_t max_decoding_tokens,
     int64_t max_non_leaves_per_layer) {
   vllm::eagle_prepare_gen_eagle_inputs(
+      next_sequence_lengths, next_context_lengths, output_ids, position_ids,
+      spec_decoding_gen_lengths, spec_decoding_position_offsets,
+      spec_decoding_packed_masks, hidden_states_indices, last_token_indices,
+      num_last_token_indices, output_hidden_size_batch_starts_per_level,
+      is_leaf_mask, selected_draft_indices, selected_draft_pos_offsets,
+      num_selected_draft_indices, selected_masks, cum_sum_generation_lengths,
+      max_generation_length, non_leaves_in_level_offsets,
+      parent_non_leaf_in_level_offset, next_draft_ids,
+      eagle_net0_sequence_lengths, prev_context_lengths,
+      input_hidden_size_batch_starts_per_level, next_paths, level_idx,
+      max_path_len, max_decoding_tokens, max_non_leaves_per_layer);
+}
+
+void eagle_prepare_gen_eagle_inputs_padded(
+    torch::Tensor next_sequence_lengths,
+    torch::Tensor next_context_lengths,
+    torch::Tensor output_ids,
+    torch::Tensor position_ids,
+    torch::Tensor spec_decoding_gen_lengths,
+    torch::Tensor spec_decoding_position_offsets,
+    torch::Tensor spec_decoding_packed_masks,
+    torch::Tensor hidden_states_indices,
+    torch::Tensor last_token_indices,
+    torch::Tensor num_last_token_indices,
+    torch::Tensor output_hidden_size_batch_starts_per_level,
+    torch::Tensor is_leaf_mask,
+    torch::Tensor selected_draft_indices,
+    torch::Tensor selected_draft_pos_offsets,
+    torch::Tensor num_selected_draft_indices,
+    torch::Tensor selected_masks,
+    torch::Tensor cum_sum_generation_lengths,
+    torch::Tensor max_generation_length,
+    torch::Tensor non_leaves_in_level_offsets,
+    torch::Tensor parent_non_leaf_in_level_offset,
+    torch::Tensor next_draft_ids,
+    torch::Tensor eagle_net0_sequence_lengths,
+    torch::Tensor prev_context_lengths,
+    torch::Tensor input_hidden_size_batch_starts_per_level,
+    torch::Tensor next_paths,
+    int64_t level_idx,
+    int64_t max_path_len,
+    int64_t max_decoding_tokens,
+    int64_t max_non_leaves_per_layer) {
+  vllm::eagle_prepare_gen_eagle_inputs_padded(
       next_sequence_lengths, next_context_lengths, output_ids, position_ids,
       spec_decoding_gen_lengths, spec_decoding_position_offsets,
       spec_decoding_packed_masks, hidden_states_indices, last_token_indices,

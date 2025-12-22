@@ -1,0 +1,819 @@
+Running Standalone Benchmark...
+Hash: 0.0134s, HitRate: 31.38%
+DEBUG: Req u2_64 TokenLen 80
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_64
+DEBUG: Req u1_64 TokenLen 80
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=4
+DEBUG: Hit 4 blocks for u1_64
+DEBUG: Req u3_64 TokenLen 80
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=4
+DEBUG: Hit 4 blocks for u3_64
+DEBUG: Req u2_80 TokenLen 96
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=5
+DEBUG: Hit 5 blocks for u2_80
+DEBUG: Req u2_96 TokenLen 112
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=6
+DEBUG: Hit 6 blocks for u2_96
+DEBUG: Req u0_64 TokenLen 80
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=4
+DEBUG: Hit 4 blocks for u0_64
+DEBUG: Req u3_80 TokenLen 96
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=5
+DEBUG: Hit 5 blocks for u3_80
+DEBUG: Req u0_80 TokenLen 96
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=5
+DEBUG: Hit 5 blocks for u0_80
+DEBUG: Req u4_64 TokenLen 80
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=4
+DEBUG: Hit 4 blocks for u4_64
+DEBUG: Req u3_96 TokenLen 112
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=6
+DEBUG: Hit 6 blocks for u3_96
+DEBUG: Req u3_112 TokenLen 128
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=7
+DEBUG: Hit 7 blocks for u3_112
+DEBUG: Req u3_128 TokenLen 144
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=8
+DEBUG: Hit 8 blocks for u3_128
+DEBUG: Req u2_112 TokenLen 128
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=7
+DEBUG: Hit 7 blocks for u2_112
+DEBUG: Req u3_144 TokenLen 160
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=9
+DEBUG: Hit 9 blocks for u3_144
+DEBUG: Req u2_128 TokenLen 144
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=8
+DEBUG: Hit 8 blocks for u2_128
+DEBUG: Evicting node 3. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263028177
+DEBUG: Evicting node 9. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263189749
+DEBUG: Evicting node 7. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263182519
+DEBUG: Evicting node 10. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263209229
+DEBUG: Evicting node 15. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263395081
+DEBUG: Evicting node 13. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263379001
+DEBUG: Evicting node 12. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263379001
+DEBUG: Evicting node 11. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263379001
+DEBUG: Evicting node 8. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263379001
+DEBUG: Req u0_96 TokenLen 112
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=4
+DEBUG: Hit 4 blocks for u0_96
+DEBUG: Evicting node 4. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263379001
+DEBUG: Evicting node 16. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263497022
+DEBUG: Evicting node 14. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263481702
+DEBUG: Evicting node 6. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263481702
+DEBUG: Evicting node 5. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263481702
+DEBUG: Evicting node 1. KeyLen 16. IsSys: False. ParentIsSys: False. Prio: 1430853.263481702
+DEBUG: Evicting node 2. KeyLen 64. IsSys: False. ParentIsSys: False. Prio: 1430853.263503842
+DEBUG: Req u3_160 TokenLen 176
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_160
+DEBUG: Req u4_80 TokenLen 96
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_80
+DEBUG: Req u1_80 TokenLen 96
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_80
+DEBUG: Req u2_144 TokenLen 160
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_144
+DEBUG: Req u4_96 TokenLen 112
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_96
+DEBUG: Req u0_112 TokenLen 128
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_112
+DEBUG: Req u4_112 TokenLen 128
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_112
+DEBUG: Req u4_128 TokenLen 144
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_128
+DEBUG: Req u2_160 TokenLen 176
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_160
+DEBUG: Req u1_96 TokenLen 112
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_96
+DEBUG: Req u1_112 TokenLen 128
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_112
+DEBUG: Req u2_176 TokenLen 192
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_176
+DEBUG: Req u1_128 TokenLen 144
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_128
+DEBUG: Req u2_192 TokenLen 208
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_192
+DEBUG: Req u1_144 TokenLen 160
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_144
+DEBUG: Req u2_208 TokenLen 224
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_208
+DEBUG: Req u1_160 TokenLen 176
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_160
+DEBUG: Req u4_144 TokenLen 160
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_144
+DEBUG: Req u1_176 TokenLen 192
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_176
+DEBUG: Req u0_128 TokenLen 144
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_128
+DEBUG: Req u4_160 TokenLen 176
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_160
+DEBUG: Req u0_144 TokenLen 160
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_144
+DEBUG: Req u0_160 TokenLen 176
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_160
+DEBUG: Req u1_192 TokenLen 208
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_192
+DEBUG: Req u0_176 TokenLen 192
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_176
+DEBUG: Req u1_208 TokenLen 224
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_208
+DEBUG: Req u0_192 TokenLen 208
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_192
+DEBUG: Req u2_224 TokenLen 240
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_224
+DEBUG: Req u3_176 TokenLen 192
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_176
+DEBUG: Req u1_224 TokenLen 240
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_224
+DEBUG: Req u4_176 TokenLen 192
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_176
+DEBUG: Req u4_192 TokenLen 208
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_192
+DEBUG: Req u0_208 TokenLen 224
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_208
+DEBUG: Req u1_240 TokenLen 256
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_240
+DEBUG: Req u1_256 TokenLen 272
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_256
+DEBUG: Req u4_208 TokenLen 224
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_208
+DEBUG: Req u2_240 TokenLen 256
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_240
+DEBUG: Req u0_224 TokenLen 240
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_224
+DEBUG: Req u3_192 TokenLen 208
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_192
+DEBUG: Req u1_272 TokenLen 288
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_272
+DEBUG: Req u2_256 TokenLen 272
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_256
+DEBUG: Req u2_272 TokenLen 288
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_272
+DEBUG: Req u2_288 TokenLen 304
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_288
+DEBUG: Req u1_288 TokenLen 304
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_288
+DEBUG: Req u1_304 TokenLen 320
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_304
+DEBUG: Req u2_304 TokenLen 320
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_304
+DEBUG: Req u4_224 TokenLen 240
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_224
+DEBUG: Req u3_208 TokenLen 224
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_208
+DEBUG: Req u4_240 TokenLen 256
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_240
+DEBUG: Req u4_256 TokenLen 272
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_256
+DEBUG: Req u3_224 TokenLen 240
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_224
+DEBUG: Req u4_272 TokenLen 288
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_272
+DEBUG: Req u0_240 TokenLen 256
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_240
+DEBUG: Req u4_288 TokenLen 304
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_288
+DEBUG: Req u1_320 TokenLen 336
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_320
+DEBUG: Req u2_320 TokenLen 336
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_320
+DEBUG: Req u2_336 TokenLen 352
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_336
+DEBUG: Req u3_240 TokenLen 256
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_240
+DEBUG: Req u2_352 TokenLen 368
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_352
+DEBUG: Req u2_368 TokenLen 384
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_368
+DEBUG: Req u3_256 TokenLen 272
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_256
+DEBUG: Req u3_272 TokenLen 288
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_272
+DEBUG: Req u0_256 TokenLen 272
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_256
+DEBUG: Req u3_288 TokenLen 304
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_288
+DEBUG: Req u1_336 TokenLen 352
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_336
+DEBUG: Req u0_272 TokenLen 288
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_272
+DEBUG: Req u1_352 TokenLen 368
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_352
+DEBUG: Req u3_304 TokenLen 320
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_304
+DEBUG: Req u4_304 TokenLen 320
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_304
+DEBUG: Req u2_384 TokenLen 400
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_384
+DEBUG: Req u0_288 TokenLen 304
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_288
+DEBUG: Req u0_304 TokenLen 320
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_304
+DEBUG: Req u2_400 TokenLen 416
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_400
+DEBUG: Req u2_416 TokenLen 432
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_416
+DEBUG: Req u4_320 TokenLen 336
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_320
+DEBUG: Req u0_320 TokenLen 336
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_320
+DEBUG: Req u3_320 TokenLen 336
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_320
+DEBUG: Req u3_336 TokenLen 352
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_336
+DEBUG: Req u3_352 TokenLen 368
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_352
+DEBUG: Req u3_368 TokenLen 384
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_368
+DEBUG: Req u0_336 TokenLen 352
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_336
+DEBUG: Req u2_432 TokenLen 448
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_432
+DEBUG: Req u3_384 TokenLen 400
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_384
+DEBUG: Req u3_400 TokenLen 416
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_400
+DEBUG: Req u1_368 TokenLen 384
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_368
+DEBUG: Req u1_384 TokenLen 400
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_384
+DEBUG: Req u1_400 TokenLen 416
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_400
+DEBUG: Req u2_448 TokenLen 464
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_448
+DEBUG: Req u4_336 TokenLen 352
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_336
+DEBUG: Req u3_416 TokenLen 432
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_416
+DEBUG: Req u0_352 TokenLen 368
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_352
+DEBUG: Req u1_416 TokenLen 432
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_416
+DEBUG: Req u3_432 TokenLen 448
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_432
+DEBUG: Req u0_368 TokenLen 384
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_368
+DEBUG: Req u2_464 TokenLen 480
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_464
+DEBUG: Req u4_352 TokenLen 368
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_352
+DEBUG: Req u2_480 TokenLen 496
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_480
+DEBUG: Req u0_384 TokenLen 400
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_384
+DEBUG: Req u1_432 TokenLen 448
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_432
+DEBUG: Req u1_448 TokenLen 464
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_448
+DEBUG: Req u1_464 TokenLen 480
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_464
+DEBUG: Req u4_368 TokenLen 384
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_368
+DEBUG: Req u0_400 TokenLen 416
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_400
+DEBUG: Req u0_416 TokenLen 432
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_416
+DEBUG: Req u1_480 TokenLen 496
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_480
+DEBUG: Req u2_496 TokenLen 512
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_496
+DEBUG: Req u2_512 TokenLen 528
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_512
+DEBUG: Req u2_528 TokenLen 544
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_528
+DEBUG: Req u3_448 TokenLen 464
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_448
+DEBUG: Req u4_384 TokenLen 400
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_384
+DEBUG: Req u0_432 TokenLen 448
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_432
+DEBUG: Req u4_400 TokenLen 416
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_400
+DEBUG: Req u2_544 TokenLen 560
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_544
+DEBUG: Req u2_560 TokenLen 576
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_560
+DEBUG: Req u4_416 TokenLen 432
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_416
+DEBUG: Req u1_496 TokenLen 512
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_496
+DEBUG: Req u3_464 TokenLen 480
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_464
+DEBUG: Req u1_512 TokenLen 528
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_512
+DEBUG: Req u1_528 TokenLen 544
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_528
+DEBUG: Req u3_480 TokenLen 496
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_480
+DEBUG: Req u3_496 TokenLen 512
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_496
+DEBUG: Req u3_512 TokenLen 528
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_512
+DEBUG: Req u0_448 TokenLen 464
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_448
+DEBUG: Req u2_576 TokenLen 592
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_576
+DEBUG: Req u2_592 TokenLen 608
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_592
+DEBUG: Req u1_544 TokenLen 560
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_544
+DEBUG: Req u4_432 TokenLen 448
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_432
+DEBUG: Req u2_608 TokenLen 624
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_608
+DEBUG: Req u3_528 TokenLen 544
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_528
+DEBUG: Req u1_560 TokenLen 576
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_560
+DEBUG: Req u4_448 TokenLen 464
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_448
+DEBUG: Req u4_464 TokenLen 480
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_464
+DEBUG: Req u1_576 TokenLen 592
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_576
+DEBUG: Req u1_592 TokenLen 608
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_592
+DEBUG: Req u4_480 TokenLen 496
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_480
+DEBUG: Req u3_544 TokenLen 560
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_544
+DEBUG: Req u3_560 TokenLen 576
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_560
+DEBUG: Req u4_496 TokenLen 512
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_496
+DEBUG: Req u1_608 TokenLen 624
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_608
+DEBUG: Req u1_624 TokenLen 640
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_624
+DEBUG: Req u0_464 TokenLen 480
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_464
+DEBUG: Req u2_624 TokenLen 640
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_624
+DEBUG: Req u1_640 TokenLen 656
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_640
+DEBUG: Req u1_656 TokenLen 672
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_656
+DEBUG: Req u2_640 TokenLen 656
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_640
+DEBUG: Req u4_512 TokenLen 528
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_512
+DEBUG: Req u1_672 TokenLen 688
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_672
+DEBUG: Req u1_688 TokenLen 704
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_688
+DEBUG: Req u4_528 TokenLen 544
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_528
+DEBUG: Req u0_480 TokenLen 496
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_480
+DEBUG: Req u1_704 TokenLen 720
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_704
+DEBUG: Req u2_656 TokenLen 672
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_656
+DEBUG: Req u2_672 TokenLen 688
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_672
+DEBUG: Req u3_576 TokenLen 592
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_576
+DEBUG: Req u4_544 TokenLen 560
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_544
+DEBUG: Req u1_720 TokenLen 736
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_720
+DEBUG: Req u1_736 TokenLen 752
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_736
+DEBUG: Req u4_560 TokenLen 576
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_560
+DEBUG: Req u0_496 TokenLen 512
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_496
+DEBUG: Req u2_688 TokenLen 704
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_688
+DEBUG: Req u2_704 TokenLen 720
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_704
+DEBUG: Req u4_576 TokenLen 592
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_576
+DEBUG: Req u1_752 TokenLen 768
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_752
+DEBUG: Req u4_592 TokenLen 608
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_592
+DEBUG: Req u2_720 TokenLen 736
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_720
+DEBUG: Req u3_592 TokenLen 608
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_592
+DEBUG: Req u4_608 TokenLen 624
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_608
+DEBUG: Req u2_736 TokenLen 752
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_736
+DEBUG: Req u4_624 TokenLen 640
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_624
+DEBUG: Req u4_640 TokenLen 656
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_640
+DEBUG: Req u3_608 TokenLen 624
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_608
+DEBUG: Req u3_624 TokenLen 640
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_624
+DEBUG: Req u4_656 TokenLen 672
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_656
+DEBUG: Req u3_640 TokenLen 656
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u3_640
+DEBUG: Req u4_672 TokenLen 688
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_672
+DEBUG: Req u1_768 TokenLen 784
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_768
+DEBUG: Req u4_688 TokenLen 704
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_688
+DEBUG: Req u1_784 TokenLen 800
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u1_784
+DEBUG: Req u0_512 TokenLen 528
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u0_512
+DEBUG: Req u4_704 TokenLen 720
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_704
+DEBUG: Req u4_720 TokenLen 736
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_720
+DEBUG: Req u2_752 TokenLen 768
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_752
+DEBUG: Req u2_768 TokenLen 784
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u2_768
+DEBUG: Req u4_736 TokenLen 752
+DEBUG: match_prefix tokens[0]=846
+DEBUG: match_prefix result len=0
+DEBUG: Miss for u4_736
+Radix: 0.0018s, HitRate: 1.72%

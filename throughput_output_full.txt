@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "/workspace/aimo/DEV_VERSIONS/vllm_sglang/tests/cache/benchmark_radix_throughput.py", line 50, in <module>
+    spec.loader.exec_module(radix_cache_module)
+    ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap_external>", line 1027, in exec_module
+  File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+  File "/workspace/aimo/DEV_VERSIONS/vllm_sglang/vllm/v1/core/radix_cache.py", line 10, in <module>
+    from vllm.v1.core.evict_policy import (
+    ...<7 lines>...
+    )
+ModuleNotFoundError: No module named 'vllm'

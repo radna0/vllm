@@ -1,0 +1,18 @@
+Generating data: Batch=8, Context=65536, Shared=64512...
+Starting Benchmark Loop...
+Req 0: Hit=0, Needed=65536. Match=0.403ms, Insert=0.928ms
+Req 1: Hit=64512 (Expected ~64512), MatchTime=5.561ms
+Req 2: Hit=64512 (Expected ~64512), MatchTime=4.119ms
+Req 3: Hit=64512 (Expected ~64512), MatchTime=4.238ms
+Req 4: Hit=64512 (Expected ~64512), MatchTime=4.097ms
+Req 5: Hit=64512 (Expected ~64512), MatchTime=4.070ms
+Req 6: Hit=64512 (Expected ~64512), MatchTime=28.588ms
+Req 7: Hit=64512 (Expected ~64512), MatchTime=17.624ms
+Total Time: 0.1166s
+Throughput (Input Processing): 4496128.65 tokens/s
+
+--- Running Hash-Based Baseline ---
+Total Time (Hash): 0.1343s
+Throughput (Hash): 3903307.99 tokens/s
+
+Speedup Radix vs Hash: 1.15x

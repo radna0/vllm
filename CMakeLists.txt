@@ -204,6 +204,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   endif()
 endif()
 
+# SGLang Kernels Include
+include_directories(csrc/sgl_kernels/include)
+
 #
 # Use FetchContent for C++ dependencies that are compiled as part of vLLM's build process.
 # setup.py will override FETCHCONTENT_BASE_DIR to play nicely with sccache.
@@ -302,7 +305,24 @@ set(VLLM_EXT_SRC
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
   "csrc/spec_decode_kernels.cu"
-  "csrc/torch_bindings.cpp")
+  "csrc/torch_bindings.cpp"
+  # SGLang Kernels
+  "csrc/sgl_kernels/speculative/eagle_utils.cu"
+  "csrc/sgl_kernels/speculative/ngram_utils.cu"
+  # "csrc/sgl_kernels/speculative/packbit.cu"
+  # "csrc/sgl_kernels/speculative/speculative_sampling.cu"
+  "csrc/sgl_kernels/moe/cutlass_moe_helper.cu"
+  "csrc/sgl_kernels/moe/fp8_blockwise_moe_kernel.cu"
+  "csrc/sgl_kernels/moe/fused_qknorm_rope_kernel.cu"
+  "csrc/sgl_kernels/moe/kimi_k2_moe_fused_gate.cu"
+  "csrc/sgl_kernels/moe/moe_align_kernel.cu"
+  "csrc/sgl_kernels/moe/moe_fused_gate.cu"
+  "csrc/sgl_kernels/moe/moe_sum.cu"
+  "csrc/sgl_kernels/moe/moe_sum_reduce.cu"
+  "csrc/sgl_kernels/moe/moe_topk_sigmoid_kernels.cu"
+  "csrc/sgl_kernels/moe/moe_topk_softmax_kernels.cu"
+  "csrc/sgl_kernels/moe/nvfp4_blockwise_moe.cu"
+  "csrc/sgl_kernels/moe/prepare_moe_input.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")

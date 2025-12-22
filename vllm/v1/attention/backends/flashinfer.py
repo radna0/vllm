@@ -11,12 +11,31 @@ from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,
     BatchPrefillWithPagedKVCacheWrapper,
     BatchPrefillWithRaggedKVCacheWrapper,
+    BatchDecodeWithPagedKVCacheWrapper,
+    BatchPrefillWithPagedKVCacheWrapper,
+    BatchPrefillWithRaggedKVCacheWrapper,
     MultiLevelCascadeAttentionWrapper,
 )
 from flashinfer.decode import _get_range_buf, trtllm_batch_decode_with_kv_cache
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 from flashinfer.utils import FP4Tensor
 from typing_extensions import override
+
+
+@dataclass
+class MultiItemScoringParams:
+    """Parameters for multi-item scoring in FlashInfer attention."""
+
+    prefix_len_ptr: torch.Tensor | None = None
+    token_pos_in_items_ptr: torch.Tensor | None = None
+    token_pos_in_items_len: int = 0
+    max_item_len_ptr: torch.Tensor | None = None
+
+    def is_enabled(self) -> bool:
+        return (
+            self.prefix_len_ptr is not None and self.token_pos_in_items_ptr is not None
+        )
+
 
 from vllm import envs
 from vllm.attention.backends.abstract import (
@@ -1087,9 +1106,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ## DECODE PATHWAY
         if num_decodes > 0:
             if decode_use_trtllm:
-                assert num_decode_tokens % num_decodes == 0, (
-                    "TRTLLM decode requires uniform query lengths per request."
-                )
+                assert (
+                    num_decode_tokens % num_decodes == 0
+                ), "TRTLLM decode requires uniform query lengths per request."
                 attn_metadata.decode = TRTLLMDecode(
                     block_tables=block_table_tensor[:num_decodes],
                     seq_lens=seq_lens[:num_decodes],
@@ -1310,25 +1329,25 @@ class FlashInferImpl(AttentionImpl):
 
         # The attn+quant fusion happens when output_scale is provided.
         if output_scale is None:
-            assert output_block_scale is None, (
-                "output_block_scale is not supported when fusion has not happened"
-            )
+            assert (
+                output_block_scale is None
+            ), "output_block_scale is not supported when fusion has not happened"
         else:
-            assert attn_metadata.q_data_type == FP8_DTYPE, (
-                "Query must be FP8 when attn+quant fusion happened."
-            )
+            assert (
+                attn_metadata.q_data_type == FP8_DTYPE
+            ), "Query must be FP8 when attn+quant fusion happened."
             assert (attn_metadata.num_prefills == 0 or prefill_use_trtllm) and (
                 attn_metadata.num_decodes == 0 or decode_use_trtllm
             ), "Must use TRT-LLM attn"
 
             if output.dtype == FP8_DTYPE:
-                assert output_block_scale is None, (
-                    "output_block_scale should not be provided for fp8 output"
-                )
+                assert (
+                    output_block_scale is None
+                ), "output_block_scale should not be provided for fp8 output"
             elif output.dtype == FP4_DTYPE:
-                assert output_block_scale is not None, (
-                    "output_block_scale is required for nvfp4 output"
-                )
+                assert (
+                    output_block_scale is not None
+                ), "output_block_scale is required for nvfp4 output"
             else:
                 raise ValueError(f"Unsupported output dtype: {output.dtype}")
 

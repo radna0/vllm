@@ -1,0 +1,12 @@
+Generating data: Batch=8, Context=65536, Shared=64512...
+Starting Benchmark Loop...
+Req 0: Hit=0, Needed=65536. Match=0.425ms, Insert=0.117ms
+Req 1: Hit=64512 (Expected ~64512), MatchTime=13.500ms
+Req 2: Hit=64512 (Expected ~64512), MatchTime=7.156ms
+Req 3: Hit=64512 (Expected ~64512), MatchTime=7.214ms
+Req 4: Hit=64512 (Expected ~64512), MatchTime=8.291ms
+Req 5: Hit=64512 (Expected ~64512), MatchTime=8.107ms
+Req 6: Hit=64512 (Expected ~64512), MatchTime=10.179ms
+Req 7: Hit=64512 (Expected ~64512), MatchTime=10.880ms
+Total Time: 0.1307s
+Throughput (Input Processing): 4012812.67 tokens/s

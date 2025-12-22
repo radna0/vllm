@@ -5,6 +5,7 @@
 
 #include <torch/library.h>
 #include <torch/version.h>
+#include "sgl_kernel_ops.h"
 
 // Ensure we bind to vllm:: symbols from CUDA TU (spec_decode_kernels, etc.).
 using namespace vllm;
@@ -186,6 +187,26 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int max_non_leaves_per_layer) -> ()");
   ops.impl("eagle_prepare_gen_eagle_inputs", torch::kCUDA,
            &eagle_prepare_gen_eagle_inputs);
+
+  ops.def(
+      "eagle_prepare_gen_eagle_inputs_padded(Tensor! next_sequence_lengths, "
+      "Tensor! next_context_lengths, Tensor! output_ids, Tensor! position_ids, "
+      "Tensor! spec_decoding_gen_lengths, "
+      "Tensor! spec_decoding_position_offsets, "
+      "Tensor! spec_decoding_packed_masks, Tensor! hidden_states_indices, "
+      "Tensor! last_token_indices, Tensor! num_last_token_indices, "
+      "Tensor! output_hidden_size_batch_starts_per_level, "
+      "Tensor! is_leaf_mask, Tensor! selected_draft_indices, "
+      "Tensor! selected_draft_pos_offsets, Tensor! num_selected_draft_indices, "
+      "Tensor! selected_masks, Tensor! cum_sum_generation_lengths, "
+      "Tensor! max_generation_length, Tensor! non_leaves_in_level_offsets, "
+      "Tensor! parent_non_leaf_in_level_offset, Tensor next_draft_ids, "
+      "Tensor eagle_net0_sequence_lengths, Tensor prev_context_lengths, "
+      "Tensor input_hidden_size_batch_starts_per_level, Tensor next_paths, "
+      "int level_idx, int max_path_len, int max_decoding_tokens, "
+      "int max_non_leaves_per_layer) -> ()");
+  ops.impl("eagle_prepare_gen_eagle_inputs_padded", torch::kCUDA,
+           &eagle_prepare_gen_eagle_inputs_padded);
 
   ops.def(
       "eagle_update_scores(Tensor cur_log_probs, Tensor prev_layer_scores, "
@@ -694,95 +715,138 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "ggml_moe_a8_vec(Tensor X, Tensor W, "
       "Tensor topk_ids, int top_k, "
       "int type, SymInt row, SymInt tokens) -> Tensor");
-  ops.impl("ggml_moe_a8_vec", torch::kCUDA, &ggml_moe_a8_vec);
-
-  ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
-
-#ifndef USE_ROCM
-  // CUTLASS nvfp4 block scaled GEMM
-  ops.def(
-      "cutlass_scaled_fp4_mm(Tensor! out, Tensor a, Tensor b,"
-      "                      Tensor block_scale_a, Tensor block_scale_b,"
-      "                      Tensor alpha) -> ()");
-  ops.impl("cutlass_scaled_fp4_mm", torch::kCUDA, &cutlass_scaled_fp4_mm);
-
-  // cutlass nvfp4 block scaled group GEMM
-  ops.def(
-      "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
-      " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()");
-  // conditionally compiled so impl registration is in source file
-
-  // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
-  // quantization, as well as bias
-  ops.def(
-      "cutlass_scaled_mm(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor? bias) -> ()");
-  ops.impl("cutlass_scaled_mm", torch::kCUDA, &cutlass_scaled_mm);
-
-  // CUTLASS w8a8 GEMM, supporting asymmetric per-tensor or per-row/column
-  // quantization.
-  ops.def(
-      "cutlass_scaled_mm_azp(Tensor! out, Tensor a,"
-      "                  Tensor b, Tensor a_scales,"
-      "                  Tensor b_scales, Tensor azp_adj,"
-      "                  Tensor? azp, Tensor? bias) -> ()");
-  ops.impl("cutlass_scaled_mm_azp", torch::kCUDA, &cutlass_scaled_mm_azp);
-
-  // Check if cutlass scaled_mm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_scaled_mm_supports_fp8(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_scaled_mm_supports_fp8", &cutlass_scaled_mm_supports_fp8);
-
-  // Check if cutlass grouped gemm is supported for CUDA devices of the given
-  // capability
-  ops.def("cutlass_group_gemm_supported(int cuda_device_capability) -> bool");
-  ops.impl("cutlass_group_gemm_supported", &cutlass_group_gemm_supported);
-
-  // CUTLASS w8a8 grouped GEMM
-  ops.def(
-      "cutlass_moe_mm(Tensor! out_tensors, Tensor a_tensors, Tensor b_tensors, "
-      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
-      "               Tensor problem_sizes, Tensor a_strides, "
-      "               Tensor b_strides, Tensor c_strides, bool per_act_token, "
-      "               bool per_out_ch) -> ()");
-  ops.impl("cutlass_moe_mm", torch::kCUDA, &cutlass_moe_mm);
-
-  // A function that computes data required to run fused MoE with w8a8 grouped
-  // GEMM. It takes topk_ids as an input, and computes expert_offsets
-  // (token start indices of each expert). In addition to this, it computes
-  // problem sizes for each expert's multiplication used by the two mms called
-  // from fused MoE operation, and arrays with permutations required to shuffle
-  // and de-shuffle the input/output of the fused operation.
-  ops.def(
-      "get_cutlass_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
-      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
-      "                        Tensor! input_permutation, "
-      "                        Tensor! output_permutation, int num_experts, "
-      "                        int n, int k, Tensor? blockscale_offsets) -> "
-      "()");
-  ops.impl("get_cutlass_moe_mm_data", torch::kCUDA, &get_cutlass_moe_mm_data);
-
-  // A function that computes problem sizes for each expert's multiplication
-  // used by the two mms called from fused MoE operation. It takes topk_ids as
-  // an input, and computes problem_sizes1 and problem_sizes2 only.
-  ops.def(
-      "get_cutlass_moe_mm_problem_sizes(Tensor topk_ids, "
-      "                                 Tensor! problem_sizes1, "
-      "                                 Tensor! problem_sizes2, "
-      "                                 int num_experts, int n, int k, "
-      "                                 Tensor? blockscale_offsets, "
       "                                 bool? force_swap_ab) -> ()");
   ops.impl("get_cutlass_moe_mm_problem_sizes", torch::kCUDA,
            &get_cutlass_moe_mm_problem_sizes);
+
+#endif
+
+  // =========================================================================
+  // SGLang Kernels
+  // =========================================================================
+  
+  /*
+   * From csrc/speculative
+   */
+  // ops.def(
+  //     "tree_speculative_sampling_target_only(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+  //     "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+  //     "Tensor uniform_samples, Tensor uniform_samples_for_final_sampling, Tensor target_probs, Tensor draft_probs, "
+  //     "float threshold_single, float threshold_acc, "
+  //     "bool deterministic) -> ()");
+  // ops.impl("tree_speculative_sampling_target_only", torch::kCUDA, &sglang::tree_speculative_sampling_target_only);
+
+  ops.def(
+      "verify_tree_greedy(Tensor! predicts, Tensor! accept_index, Tensor! accept_token_num, "
+      "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "Tensor target_predict) -> ()");
+  ops.impl("verify_tree_greedy", torch::kCUDA, &sglang::verify_tree_greedy);
+
+  ops.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, Tensor positions, "
+      "Tensor retrive_index, Tensor retrive_next_token, Tensor retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  ops.impl("reconstruct_indices_from_tree_mask", torch::kCUDA, &sglang::reconstruct_indices_from_tree_mask);
+
+  ops.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, Tensor verified_seq_len, "
+      "Tensor! tree_mask, Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, int draft_token_num, int tree_mask_mode) -> "
+      "()");
+  ops.impl("build_tree_kernel_efficient", torch::kCUDA, &sglang::build_tree_kernel_efficient);
+
+  // ops.def(
+  //     "segment_packbits(Tensor x, Tensor input_indptr, Tensor output_indptr, Tensor! y, int batch_size, "
+  //     "int cuda_stream) -> ()");
+  // ops.impl("segment_packbits", torch::kCUDA, &sglang::segment_packbits);
+
+  /*
+   * From csrc/moe
+   */
+  ops.def(
+      "moe_align_block_size(Tensor topk_ids, int num_experts, int block_size, Tensor! sorted_token_ids, Tensor! "
+      "experts_ids, Tensor! num_tokens_post_pad, Tensor! cumsum_buffer, bool "
+      "pad_sorted_token_ids) -> ()");
+  ops.impl("moe_align_block_size", torch::kCUDA, &sglang::moe_align_block_size);
+
+  ops.def(
+      "topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, float "
+      "moe_softcapping, Tensor? correction_bias) -> ()");
+  ops.impl("topk_softmax", torch::kCUDA, &sglang::topk_softmax);
+
+  ops.def(
+      "topk_sigmoid(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  ops.impl("topk_sigmoid", torch::kCUDA, &sglang::topk_sigmoid);
+
+  ops.def("moe_sum_reduce(Tensor input, Tensor output, float routed_scaling_factor) -> ()");
+  ops.impl("moe_sum_reduce", torch::kCUDA, &sglang::moe_sum_reduce);
+
+  ops.def("moe_sum(Tensor input, Tensor! output) -> ()");
+  ops.impl("moe_sum", torch::kCUDA, &sglang::moe_sum);
+
+  ops.def(
+      "moe_fused_gate(Tensor input, Tensor bias, int num_expert_group, int topk_group, int topk, int "
+      "num_fused_shared_experts, float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  ops.impl("moe_fused_gate", torch::kCUDA, &sglang::moe_fused_gate);
+
+  ops.def(
+      "kimi_k2_moe_fused_gate(Tensor input, Tensor bias, int topk, bool renormalize, "
+      "float routed_scaling_factor, bool apply_routed_scaling_factor_on_output) -> "
+      "(Tensor[])");
+  ops.impl("kimi_k2_moe_fused_gate", torch::kCUDA, &sglang::kimi_k2_moe_fused_gate);
+
+  ops.def(
+      "fp8_blockwise_scaled_grouped_mm(Tensor output, Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor "
+      "a_scales_ptrs, Tensor b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, Tensor "
+      "stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, Tensor problem_sizes, Tensor "
+      "expert_offsets, Tensor workspace) -> ()");
+  ops.impl("fp8_blockwise_scaled_grouped_mm", torch::kCUDA, &sglang::fp8_blockwise_scaled_grouped_mm);
+
+  ops.def(
+      "prepare_moe_input(Tensor topk_ids, Tensor expert_offsets, Tensor? blockscale_offsets, Tensor problem_sizes1,"
+      " Tensor problem_sizes2, Tensor input_permutation, Tensor output_permutation, int num_experts, int n, int k) -> "
+      "()");
+  ops.impl("prepare_moe_input", torch::kCUDA, &sglang::prepare_moe_input);
+
+  ops.def("shuffle_rows(Tensor input, Tensor dst2src_map, Tensor output) -> ()");
+  ops.impl("shuffle_rows", torch::kCUDA, &sglang::shuffle_rows);
+
+  ops.def("apply_shuffle_mul_sum(Tensor input, Tensor output, Tensor permutation, Tensor? factors) -> ()");
+  ops.impl("apply_shuffle_mul_sum", torch::kCUDA, &sglang::apply_shuffle_mul_sum);
+
+  ops.def(
+      "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+      "int num_heads_k, int num_heads_v, int head_dim, float eps, "
+      "Tensor q_weight, Tensor k_weight, float base, "
+      "bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor) -> ()");
+  ops.impl("fused_qk_norm_rope", torch::kCUDA, &sglang::fused_qk_norm_rope);
+
+  /*
+   * From csrc/moe/cutlass_moe/w4a8
+   */
+  ops.def(
+      "get_cutlass_w4a8_moe_mm_data(Tensor topk_ids, Tensor! expert_offsets, "
+      "                        Tensor! problem_sizes1, Tensor! problem_sizes2, "
+      "                        Tensor! input_permutation, "
+      "                        Tensor! output_permutation, int num_experts, "
+      "                        int n, int k) -> ()");
+  ops.impl("get_cutlass_w4a8_moe_mm_data", torch::kCUDA, &sglang::get_cutlass_w4a8_moe_mm_data);
+
+  ops.def(
+      "cutlass_w4a8_moe_mm(Tensor! d, Tensor a, Tensor b, "
+      "               Tensor a_scales, Tensor b_scales, Tensor expert_offsets, "
+      "               Tensor problem_sizes, Tensor a_strides, "
+      "               Tensor b_strides, Tensor d_strides, Tensor s_strides,"
+      "               int chunk_size, int topk) -> ()");
+  ops.impl("cutlass_w4a8_moe_mm", torch::kCUDA, &sglang::cutlass_w4a8_moe_mm);
 
   // A function that computes data required to run fused MoE with w8a8 grouped
   // GEMM and PPLX. It takes expert_num_tokens and non_zero_expert_idxs
   // as an input, and computes expert_offsets (token start indices of each
   // expert). In addition to this, it computes problem sizes for each expert's
   // multiplication used by the two mms called from fused MoE operation.
-  ops.def(
       "get_cutlass_pplx_moe_mm_data(Tensor! expert_offsets, "
       "                             Tensor! problem_sizes1, "
       "                             Tensor! problem_sizes2, "
@@ -790,7 +854,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "                             int num_local_experts, int padded_m, "
       "                             int n, int k) -> ()");
   ops.impl("get_cutlass_pplx_moe_mm_data", torch::kCUDA,
-           &get_cutlass_pplx_moe_mm_data);
+           &sglang::get_cutlass_pplx_moe_mm_data);
 
   // Check if cutlass scaled_mm supports block quantization (used by DeepSeekV3)
   ops.def(
