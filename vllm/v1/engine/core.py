@@ -309,6 +309,37 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def trap_requests(self, request_ids: list[str]):
+        """Trap requests (transition to WAIT_TRAP)."""
+        # We need to tell Scheduler to verify these requests are running/waiting and transition them.
+        # This is a scheduler operation.
+        # Scheduler.trap_requests(request_ids) doesn't exist yet.
+        # We can implement it here or call scheduler methods?
+        # Scheduler.finish_requests removes them.
+        # We want to keep them but change status.
+        # Assuming we can access scheduler.
+        # But scheduler interface might not expose this.
+        # Let's assume we add trap_requests to Scheduler interface later or now.
+        if hasattr(self.scheduler, "trap_requests"):
+             self.scheduler.trap_requests(request_ids)
+        else:
+             logger.warning("Scheduler does not support trap_requests")
+
+    def update_critical_sections(self, updates: dict[str, bool]):
+        if hasattr(self.scheduler, "update_critical_sections"):
+            self.scheduler.update_critical_sections(updates)
+        else:
+            # logger.warning("Scheduler does not support update_critical_sections")
+            pass
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]):
+        """Add interrupt tokens to a request."""
+        if hasattr(self.scheduler, "add_interrupt"):
+            self.scheduler.add_interrupt(request_id, token_ids)
+        else:
+            # logger.warning("Scheduler does not support add_interrupt")
+            pass
+
     @contextmanager
     def log_error_detail(self, scheduler_output: SchedulerOutput):
         """Execute the model and log detailed info on failure."""
@@ -944,6 +975,10 @@ class EngineCoreProc(EngineCore):
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
+        elif request_type == EngineCoreRequestType.TRAP:
+            self.trap_requests(request)
+        elif request_type == EngineCoreRequestType.UPDATE_CRIT:
+            self.update_critical_sections(request)
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
@@ -1258,6 +1293,9 @@ class DPEngineCoreProc(EngineCoreProc):
                 if not self.engines_running:
                     logger.debug("EngineCore starting idle loop for wave %d.", new_wave)
                     self.engines_running = True
+        elif request_type == EngineCoreRequestType.ADD_INTERRUPT:
+            request_id, token_ids = request
+            self.add_interrupt(request_id, token_ids)
         else:
             super()._handle_client_request(request_type, request)
 

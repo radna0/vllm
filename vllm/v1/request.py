@@ -22,9 +22,31 @@ from vllm.v1.engine import (
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
 
+
+from dataclasses import dataclass, field
+from collections import deque
+
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+
+
+@dataclass
+class AsyncToolState:
+    """State for tracking async tool execution and interrupts."""
+
+    fsm_state: str = "TEXT"
+    in_critical_section: bool = False
+    call_buffer_tokens: list[int] = field(default_factory=list)
+    pending_interrupts: deque = field(default_factory=deque)
+    trap_seen: bool = False
+    # Registry of tool calls: call_id -> metadata
+    call_registry: dict[str, Any] = field(default_factory=dict)
+    # P0.2: Track injected tokens so they can be filtered from stream
+    injected_token_count: int = 0  # Total injected tokens (cumulative)
+    last_injection_boundary: int = (
+        0  # Index in output_token_ids where last injection ended
+    )
 
 
 class Request:
@@ -137,6 +159,21 @@ class Request:
 
         self.skip_reading_prefix_cache = self.get_skip_reading_prefix_cache()
 
+        # AsyncLM state
+        self.tool_state = AsyncToolState()
+
+    @property
+    def is_interruptible(self) -> bool:
+        return not self.tool_state.in_critical_section
+
+    @property
+    def is_critical_section(self) -> bool:
+        return self.tool_state.in_critical_section
+
+    @is_critical_section.setter
+    def is_critical_section(self, value: bool) -> None:
+        self.tool_state.in_critical_section = value
+
     @classmethod
     def from_engine_core_request(
         cls,
@@ -247,6 +284,9 @@ class RequestStatus(enum.IntEnum):
     WAITING = enum.auto()
     WAITING_FOR_FSM = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
+    WAITING_FOR_TOOL = enum.auto()
+    WAIT_TRAP = enum.auto()
+    APPEND_PREFILL = enum.auto()
     RUNNING = enum.auto()
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered

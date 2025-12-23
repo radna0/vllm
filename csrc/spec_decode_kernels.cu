@@ -2028,7 +2028,7 @@ void eagle_prepare_ctx_eagle_inputs(
   if (batch_size == 0) {
     return;
   }
-  constexpr int kBlockSize = 512;
+  constexpr int kBlockSize = 1024;
   TORCH_CHECK(batch_size <= kBlockSize,
               "batch_size exceeds prepare_ctx_eagle_inputs limit");
   c10::cuda::CUDAGuard device_guard(input_ids.device());
@@ -2209,32 +2209,31 @@ __global__ void eagle_get_non_leaf_subtree_kernel(
 
 template <int BLOCK_SIZE>
 __global__ void eagle_prepare_gen_inputs_kernel(
-    int32_t* __restrict__ next_sequence_lengths,
-    int32_t* __restrict__ next_context_lengths,
-    int32_t* __restrict__ output_ids,
-    int32_t* __restrict__ position_ids,
-    int32_t* __restrict__ spec_decoding_gen_lengths,
-    int32_t* __restrict__ spec_decoding_position_offsets,
-    int32_t* __restrict__ spec_decoding_packed_masks,
-    int32_t* __restrict__ hidden_states_indices,
-    int32_t* __restrict__ last_token_indices,
-    int32_t* __restrict__ num_last_token_indices,
-    int32_t* __restrict__ output_hidden_size_batch_starts_per_level,
-    int32_t* __restrict__ cum_sum_generation_lengths,
-    int32_t* __restrict__ max_generation_length,
-    const int32_t* __restrict__ next_draft_ids,
-    const int32_t* __restrict__ selected_draft_indices,
-    const int32_t* __restrict__ selected_draft_pos_offsets,
-    const int32_t* __restrict__ num_selected_draft_indices,
-    const int32_t* __restrict__ eagle_net0_sequence_lengths,
-    const int32_t* __restrict__ prev_context_lengths,
-    const int32_t* __restrict__ input_hidden_size_batch_starts_per_level,
-    const int32_t* __restrict__ parent_non_leaf_in_level_offset,
-    int32_t level_idx,
-    int32_t batch_size,
-    int32_t max_path_len,
-    int32_t max_decoding_tokens,
-    int32_t max_non_leaves_per_layer) {
+    int32_t* next_sequence_lengths,        // [batch_size]
+    int32_t* next_context_lengths,         // [batch_size]
+    int32_t* output_ids,                         // [max_buffer_tokens]
+    int32_t* position_ids,                       // [max_buffer_tokens]
+    int32_t* spec_decoding_gen_lengths,          // [batch_size]
+    int32_t* spec_decoding_position_offsets,     // [batch_size, max_decoding_tokens]
+    int32_t* spec_decoding_packed_masks,         // [batch_size, max_num_masks]
+    int32_t* hidden_states_indices,              // [max_buffer_tokens]
+    int32_t* last_token_indices,                 // [batch_size]
+    int32_t* num_last_token_indices,             // [1]
+    int32_t* output_hidden_size_batch_starts_per_level,
+    int32_t* cum_sum_generation_lengths,         // [batch_size + 1]
+    int32_t* max_generation_length,              // [1]
+    const int32_t* next_draft_ids,               // [batch_size, max_decoding_tokens - 1]
+    const int32_t* selected_draft_indices,       // [batch_size, max_decoding_tokens - 1]
+    const int32_t* selected_draft_pos_offsets,   // [batch_size, max_decoding_tokens - 1]
+    const int32_t* num_selected_draft_indices,   // [batch_size]
+    const int32_t* eagle_net0_sequence_lengths,  // [batch_size]
+    const int32_t* prev_context_lengths,         // [batch_size]
+    const int32_t* input_hidden_size_batch_starts_per_level,
+    const int32_t* parent_non_leaf_in_level_offset,
+    const int32_t level_idx, const int32_t batch_size,
+    const int32_t max_path_len,
+    const int32_t max_decoding_tokens,
+    const int32_t max_non_leaves_per_layer) {
   using BlockScan = cub::BlockScan<int32_t, BLOCK_SIZE>;
   using BlockReduce = cub::BlockReduce<int32_t, BLOCK_SIZE>;
   __shared__ union {
@@ -2242,9 +2241,11 @@ __global__ void eagle_prepare_gen_inputs_kernel(
     typename BlockReduce::TempStorage reduce;
   } temp_storage;
 
-  const int32_t bid = static_cast<int32_t>(threadIdx.x);
+  // Grid-stride loop
   const int32_t max_decoding_draft_tokens = max_decoding_tokens - 1;
-  bool is_valid = bid < batch_size;
+  for (int bid = blockIdx.x * blockDim.x + threadIdx.x; bid < batch_size;
+       bid += gridDim.x * blockDim.x) {
+    bool is_valid = true;
   int32_t next_draft_len = 0;
   int32_t num_next_logits = 0;
   if (is_valid) {
@@ -2325,6 +2326,7 @@ __global__ void eagle_prepare_gen_inputs_kernel(
         output_hidden_size_batch_starts_per_level[level_idx * batch_size +
                                                   batch_size - 1] +
         max_non_leaves_per_layer;
+  }
   }
 }
 
@@ -2540,9 +2542,11 @@ void eagle_prepare_gen_eagle_inputs(
   if (batch_size == 0) {
     return;
   }
-  constexpr int kBlockSize = 512;
-  TORCH_CHECK(batch_size <= kBlockSize,
-              "batch_size exceeds prepare_gen_eagle_inputs limit");
+  // const int kBlockSize = 512;
+  // Use a sensible block size (e.g., 256 or 512) and calculate grid size
+  constexpr int kBlockSize = 256;
+  const int grid_size = (batch_size + kBlockSize - 1) / kBlockSize; 
+  // No more check: batch_size can be arbitrarily large now
   c10::cuda::CUDAGuard device_guard(next_draft_ids.device());
 
   const int32_t max_decoding_tokens_i32 =
@@ -2573,7 +2577,7 @@ void eagle_prepare_gen_eagle_inputs(
       max_path_len_i32);
 
   eagle_prepare_gen_inputs_kernel<kBlockSize>
-      <<<1, kBlockSize, 0, at::cuda::getDefaultCUDAStream()>>>(
+      <<<grid_size, kBlockSize, 0, at::cuda::getDefaultCUDAStream()>>>(
           next_sequence_lengths.data_ptr<int32_t>(),
           next_context_lengths.data_ptr<int32_t>(),
           output_ids.data_ptr<int32_t>(),
@@ -2790,9 +2794,9 @@ void eagle_prepare_gen_eagle_inputs_padded(
   if (batch_size == 0) {
     return;
   }
-  constexpr int kBlockSize = 512;
-  TORCH_CHECK(batch_size <= kBlockSize,
-              "batch_size exceeds prepare_gen_eagle_inputs limit");
+  // const int kBlockSize = 512;
+  constexpr int kBlockSize = 256;
+  const int grid_size = (batch_size + kBlockSize - 1) / kBlockSize;
   c10::cuda::CUDAGuard device_guard(next_draft_ids.device());
 
   const int32_t max_decoding_tokens_i32 =
@@ -5007,539 +5011,5 @@ std::vector<torch::Tensor> eagle_topk_logits_custom(torch::Tensor logits,
   return {out_ids, out_logprobs};
 }
 
-}  // namespace vllm
 
-// Global wrappers for torch_bindings.cpp symbol resolution.
-torch::Tensor pack_accepted_tokens(torch::Tensor output_token_ids,
-                                   torch::Tensor offsets,
-                                   torch::Tensor counts,
-                                   int64_t total_tokens) {
-  return vllm::pack_accepted_tokens(output_token_ids, offsets, counts,
-                                    total_tokens);
-}
-
-void build_spec_decode_indices(torch::Tensor num_draft_tokens,
-                               torch::Tensor cu_num_scheduled_tokens,
-                               torch::Tensor cu_num_draft_tokens,
-                               torch::Tensor cu_num_sampled_tokens,
-                               torch::Tensor logits_indices,
-                               torch::Tensor target_logits_indices,
-                               torch::Tensor bonus_logits_indices) {
-  vllm::build_spec_decode_indices(num_draft_tokens, cu_num_scheduled_tokens,
-                                  cu_num_draft_tokens, cu_num_sampled_tokens,
-                                  logits_indices, target_logits_indices,
-                                  bonus_logits_indices);
-}
-
-void eagle_rewind_slot_mapping(torch::Tensor cu_num_draft_tokens,
-                               torch::Tensor valid_sampled_tokens_count,
-                               torch::Tensor query_start_loc,
-                               torch::Tensor slot_mapping,
-                               int64_t pad_id) {
-  vllm::eagle_rewind_slot_mapping(cu_num_draft_tokens,
-                                 valid_sampled_tokens_count, query_start_loc,
-                                 slot_mapping, pad_id);
-}
-
-void eagle_compute_slot_mapping(torch::Tensor positions,
-                                torch::Tensor block_table,
-                                int64_t block_table_stride,
-                                int64_t block_size,
-                                int64_t max_model_len,
-                                torch::Tensor slot_mapping,
-                                int64_t pad_id) {
-  vllm::eagle_compute_slot_mapping(positions, block_table, block_table_stride,
-                                   block_size, max_model_len, slot_mapping,
-                                   pad_id);
-}
-
-void eagle_update_draft_state(torch::Tensor draft_tokens,
-                              torch::Tensor output_hidden_states,
-                              int64_t output_hidden_states_stride,
-                              torch::Tensor input_ids,
-                              torch::Tensor positions,
-                              int64_t positions_stride0,
-                              torch::Tensor input_hidden_states,
-                              int64_t input_hidden_states_stride,
-                              torch::Tensor seq_lens,
-                              torch::Tensor slot_mapping,
-                              torch::Tensor block_table,
-                              int64_t block_table_stride,
-                              int64_t hidden_size,
-                              int64_t block_size,
-                              int64_t max_model_len,
-                              int64_t pad_id,
-                              bool use_mrope) {
-  vllm::eagle_update_draft_state(
-      draft_tokens, output_hidden_states, output_hidden_states_stride,
-      input_ids, positions, positions_stride0, input_hidden_states,
-      input_hidden_states_stride, seq_lens, slot_mapping, block_table,
-      block_table_stride, hidden_size, block_size, max_model_len, pad_id,
-      use_mrope);
-}
-
-torch::Tensor eagle_sample_argmax(torch::Tensor logits) {
-  return vllm::eagle_sample_argmax(logits);
-}
-
-torch::Tensor eagle_sample_topk_topp_gumbel(
-    torch::Tensor logits,
-    std::optional<torch::Tensor> top_k,
-    std::optional<torch::Tensor> top_p,
-    std::optional<torch::Tensor> temperature,
-    double sampling_eps) {
-  return vllm::eagle_sample_topk_topp_gumbel(logits, top_k, top_p, temperature,
-                                             sampling_eps);
-}
-
-torch::Tensor eagle_expand_draft_tokens(torch::Tensor draft_token_ids,
-                                        torch::Tensor cu_num_draft_tokens,
-                                        int64_t max_draft_len,
-                                        int64_t pad_id) {
-  return vllm::eagle_expand_draft_tokens(draft_token_ids, cu_num_draft_tokens,
-                                         max_draft_len, pad_id);
-}
-
-void eagle_update_draft_state_and_tokens(torch::Tensor draft_tokens,
-                                         torch::Tensor output_hidden_states,
-                                         int64_t output_hidden_states_stride,
-                                         torch::Tensor input_ids,
-                                         torch::Tensor positions,
-                                         int64_t positions_stride0,
-                                         torch::Tensor input_hidden_states,
-                                         int64_t input_hidden_states_stride,
-                                         torch::Tensor seq_lens,
-                                         torch::Tensor slot_mapping,
-                                         torch::Tensor block_table,
-                                         int64_t block_table_stride,
-                                         torch::Tensor output_draft_tokens,
-                                         int64_t output_draft_stride,
-                                         int64_t step,
-                                         int64_t hidden_size,
-                                         int64_t block_size,
-                                         int64_t max_model_len,
-                                         int64_t pad_id,
-                                         bool use_mrope) {
-  vllm::eagle_update_draft_state_and_tokens(
-      draft_tokens, output_hidden_states, output_hidden_states_stride,
-      input_ids, positions, positions_stride0, input_hidden_states,
-      input_hidden_states_stride, seq_lens, slot_mapping, block_table,
-      block_table_stride, output_draft_tokens, output_draft_stride, step,
-      hidden_size, block_size, max_model_len, pad_id, use_mrope);
-}
-
-void eagle_tree_copy_level(torch::Tensor draft_token_ids,
-                           torch::Tensor draft_positions,
-                           torch::Tensor draft_hidden_states,
-                           torch::Tensor tree_input_ids,
-                           torch::Tensor tree_positions,
-                           torch::Tensor tree_hidden_states,
-                           int64_t level_offset,
-                           int64_t hidden_size) {
-  vllm::eagle_tree_copy_level(draft_token_ids, draft_positions,
-                              draft_hidden_states, tree_input_ids,
-                              tree_positions, tree_hidden_states, level_offset,
-                              hidden_size);
-}
-
-void eagle_tree_select_next_tokens(torch::Tensor topk_ids,
-                                   torch::Tensor parent_indices,
-                                   torch::Tensor child_indices,
-                                   torch::Tensor output_tokens) {
-  vllm::eagle_tree_select_next_tokens(topk_ids, parent_indices, child_indices,
-                                      output_tokens);
-}
-
-void eagle_tree_gather_hidden_states(torch::Tensor hidden_states,
-                                     torch::Tensor parent_indices,
-                                     torch::Tensor output_hidden_states) {
-  vllm::eagle_tree_gather_hidden_states(hidden_states, parent_indices,
-                                        output_hidden_states);
-}
-
-void eagle_assemble_target_logits_offsets(torch::Tensor logits_ptrs,
-                                          torch::Tensor decoding_tokens,
-                                          torch::Tensor logits,
-                                          torch::Tensor draft_decoding_tokens,
-                                          int64_t max_decoding_tokens) {
-  vllm::eagle_assemble_target_logits_offsets(logits_ptrs, decoding_tokens,
-                                             logits, draft_decoding_tokens,
-                                             max_decoding_tokens);
-}
-
-void eagle_assemble_draft_logits_offsets(torch::Tensor logits_ptrs,
-                                         torch::Tensor logits,
-                                         torch::Tensor output_ids_ptrs,
-                                         torch::Tensor output_ids,
-                                         torch::Tensor skip_decode,
-                                         torch::Tensor num_valid_logits,
-                                         int64_t num_input_logits,
-                                         int64_t max_decoding_draft_tokens) {
-  vllm::eagle_assemble_draft_logits_offsets(
-      logits_ptrs, logits, output_ids_ptrs, output_ids, skip_decode,
-      num_valid_logits, num_input_logits, max_decoding_draft_tokens);
-}
-
-void eagle_copy_output_tokens_ids(torch::Tensor tmp_output_ids_ptrs,
-                                  torch::Tensor top_ks,
-                                  torch::Tensor top_k_offsets,
-                                  torch::Tensor input_draft_ids,
-                                  torch::Tensor input_draft_lens,
-                                  torch::Tensor num_valid_logits,
-                                  torch::Tensor output_draft_ids,
-                                  torch::Tensor output_draft_lens,
-                                  int64_t layer_id,
-                                  torch::Tensor input_paths,
-                                  torch::Tensor output_paths,
-                                  int64_t max_path_len) {
-  vllm::eagle_copy_output_tokens_ids(
-      tmp_output_ids_ptrs, top_ks, top_k_offsets, input_draft_ids,
-      input_draft_lens, num_valid_logits, output_draft_ids,
-      output_draft_lens, layer_id, input_paths, output_paths, max_path_len);
-}
-
-void eagle_extract_real_draft_tokens(int64_t cur_draft_idx,
-                                     int64_t max_draft_len,
-                                     int64_t max_total_draft_tokens,
-                                     int64_t max_top_k,
-                                     int64_t num_tokens_expand_this_layer,
-                                     torch::Tensor tokens_gather_idx,
-                                     torch::Tensor top_k_list,
-                                     torch::Tensor draft_tokens_indices_cumsum,
-                                     torch::Tensor new_draft_tokens,
-                                     torch::Tensor draft_tokens_buffer) {
-  vllm::eagle_extract_real_draft_tokens(
-      cur_draft_idx, max_draft_len, max_total_draft_tokens, max_top_k,
-      num_tokens_expand_this_layer, tokens_gather_idx, top_k_list,
-      draft_tokens_indices_cumsum, new_draft_tokens, draft_tokens_buffer);
-}
-
-void eagle_prepare_ctx_eagle_inputs(
-    torch::Tensor eagle_seq_lens,
-    torch::Tensor eagle_ctx_lens,
-    torch::Tensor output_ids,
-    torch::Tensor position_ids,
-    torch::Tensor hidden_states_indices,
-    torch::Tensor last_token_indices,
-    torch::Tensor num_last_token_indices,
-    torch::Tensor hidden_size_batch_level_starts,
-    torch::Tensor input_ids,
-    torch::Tensor chunked_context_next_tokens,
-    torch::Tensor base_seq_lens,
-    torch::Tensor base_ctx_lens,
-    torch::Tensor accepted_tokens,
-    torch::Tensor accepted_lens,
-    torch::Tensor prev_draft_lens,
-    torch::Tensor prev_paths,
-    torch::Tensor best_path_ids,
-    int64_t max_path_len,
-    int64_t max_decoding_tokens,
-    int64_t max_non_leaves_per_layer) {
-  vllm::eagle_prepare_ctx_eagle_inputs(
-      eagle_seq_lens, eagle_ctx_lens, output_ids, position_ids,
-      hidden_states_indices, last_token_indices, num_last_token_indices,
-      hidden_size_batch_level_starts, input_ids, chunked_context_next_tokens,
-      base_seq_lens, base_ctx_lens, accepted_tokens, accepted_lens,
-      prev_draft_lens, prev_paths, best_path_ids, max_path_len,
-      max_decoding_tokens, max_non_leaves_per_layer);
-}
-
-void eagle_prepare_gen_eagle_inputs(
-    torch::Tensor next_sequence_lengths,
-    torch::Tensor next_context_lengths,
-    torch::Tensor output_ids,
-    torch::Tensor position_ids,
-    torch::Tensor spec_decoding_gen_lengths,
-    torch::Tensor spec_decoding_position_offsets,
-    torch::Tensor spec_decoding_packed_masks,
-    torch::Tensor hidden_states_indices,
-    torch::Tensor last_token_indices,
-    torch::Tensor num_last_token_indices,
-    torch::Tensor output_hidden_size_batch_starts_per_level,
-    torch::Tensor is_leaf_mask,
-    torch::Tensor selected_draft_indices,
-    torch::Tensor selected_draft_pos_offsets,
-    torch::Tensor num_selected_draft_indices,
-    torch::Tensor selected_masks,
-    torch::Tensor cum_sum_generation_lengths,
-    torch::Tensor max_generation_length,
-    torch::Tensor non_leaves_in_level_offsets,
-    torch::Tensor parent_non_leaf_in_level_offset,
-    torch::Tensor next_draft_ids,
-    torch::Tensor eagle_net0_sequence_lengths,
-    torch::Tensor prev_context_lengths,
-    torch::Tensor input_hidden_size_batch_starts_per_level,
-    torch::Tensor next_paths,
-    int64_t level_idx,
-    int64_t max_path_len,
-    int64_t max_decoding_tokens,
-    int64_t max_non_leaves_per_layer) {
-  vllm::eagle_prepare_gen_eagle_inputs(
-      next_sequence_lengths, next_context_lengths, output_ids, position_ids,
-      spec_decoding_gen_lengths, spec_decoding_position_offsets,
-      spec_decoding_packed_masks, hidden_states_indices, last_token_indices,
-      num_last_token_indices, output_hidden_size_batch_starts_per_level,
-      is_leaf_mask, selected_draft_indices, selected_draft_pos_offsets,
-      num_selected_draft_indices, selected_masks, cum_sum_generation_lengths,
-      max_generation_length, non_leaves_in_level_offsets,
-      parent_non_leaf_in_level_offset, next_draft_ids,
-      eagle_net0_sequence_lengths, prev_context_lengths,
-      input_hidden_size_batch_starts_per_level, next_paths, level_idx,
-      max_path_len, max_decoding_tokens, max_non_leaves_per_layer);
-}
-
-void eagle_prepare_gen_eagle_inputs_padded(
-    torch::Tensor next_sequence_lengths,
-    torch::Tensor next_context_lengths,
-    torch::Tensor output_ids,
-    torch::Tensor position_ids,
-    torch::Tensor spec_decoding_gen_lengths,
-    torch::Tensor spec_decoding_position_offsets,
-    torch::Tensor spec_decoding_packed_masks,
-    torch::Tensor hidden_states_indices,
-    torch::Tensor last_token_indices,
-    torch::Tensor num_last_token_indices,
-    torch::Tensor output_hidden_size_batch_starts_per_level,
-    torch::Tensor is_leaf_mask,
-    torch::Tensor selected_draft_indices,
-    torch::Tensor selected_draft_pos_offsets,
-    torch::Tensor num_selected_draft_indices,
-    torch::Tensor selected_masks,
-    torch::Tensor cum_sum_generation_lengths,
-    torch::Tensor max_generation_length,
-    torch::Tensor non_leaves_in_level_offsets,
-    torch::Tensor parent_non_leaf_in_level_offset,
-    torch::Tensor next_draft_ids,
-    torch::Tensor eagle_net0_sequence_lengths,
-    torch::Tensor prev_context_lengths,
-    torch::Tensor input_hidden_size_batch_starts_per_level,
-    torch::Tensor next_paths,
-    int64_t level_idx,
-    int64_t max_path_len,
-    int64_t max_decoding_tokens,
-    int64_t max_non_leaves_per_layer) {
-  vllm::eagle_prepare_gen_eagle_inputs_padded(
-      next_sequence_lengths, next_context_lengths, output_ids, position_ids,
-      spec_decoding_gen_lengths, spec_decoding_position_offsets,
-      spec_decoding_packed_masks, hidden_states_indices, last_token_indices,
-      num_last_token_indices, output_hidden_size_batch_starts_per_level,
-      is_leaf_mask, selected_draft_indices, selected_draft_pos_offsets,
-      num_selected_draft_indices, selected_masks, cum_sum_generation_lengths,
-      max_generation_length, non_leaves_in_level_offsets,
-      parent_non_leaf_in_level_offset, next_draft_ids,
-      eagle_net0_sequence_lengths, prev_context_lengths,
-      input_hidden_size_batch_starts_per_level, next_paths, level_idx,
-      max_path_len, max_decoding_tokens, max_non_leaves_per_layer);
-}
-
-void eagle_update_scores(torch::Tensor cur_log_probs,
-                         torch::Tensor prev_layer_scores,
-                         int64_t dynamic_tree_max_topk) {
-  vllm::eagle_update_scores(cur_log_probs, prev_layer_scores,
-                            dynamic_tree_max_topk);
-}
-
-void eagle_update_path(int64_t layer_idx,
-                       int64_t dynamic_tree_max_topk,
-                       torch::Tensor prev_paths,
-                       torch::Tensor second_topk_output_ids,
-                       torch::Tensor new_paths,
-                       torch::Tensor next_expand_indices) {
-  vllm::eagle_update_path(layer_idx, dynamic_tree_max_topk, prev_paths,
-                          second_topk_output_ids, new_paths,
-                          next_expand_indices);
-}
-
-void eagle_update_draft_tokens_and_scores(int64_t layer_idx,
-                                          int64_t dynamic_tree_max_topk,
-                                          torch::Tensor cur_draft_ids,
-                                          torch::Tensor input_draft_ids,
-                                          torch::Tensor input_draft_lens,
-                                          torch::Tensor output_draft_ids,
-                                          torch::Tensor output_draft_lens,
-                                          torch::Tensor cur_layer_scores,
-                                          torch::Tensor output_current_scores) {
-  vllm::eagle_update_draft_tokens_and_scores(
-      layer_idx, dynamic_tree_max_topk, cur_draft_ids, input_draft_ids,
-      input_draft_lens, output_draft_ids, output_draft_lens, cur_layer_scores,
-      output_current_scores);
-}
-
-void eagle_copy_scores_and_draft_token_ids(
-    int64_t layer_idx,
-    int64_t num_eagle_layers,
-    int64_t max_decoding_draft_tokens,
-    int64_t dynamic_tree_max_topk,
-    torch::Tensor current_expand_indices,
-    torch::Tensor input_all_layers_scores,
-    torch::Tensor input_all_layers_draft_ids,
-    torch::Tensor input_all_layers_predecessor,
-    torch::Tensor output_all_layers_scores,
-    torch::Tensor output_all_layers_draft_ids,
-    torch::Tensor output_all_layers_predecessor,
-    torch::Tensor first_topk_logprobs,
-    torch::Tensor first_topk_ids) {
-  vllm::eagle_copy_scores_and_draft_token_ids(
-      layer_idx, num_eagle_layers, max_decoding_draft_tokens,
-      dynamic_tree_max_topk, current_expand_indices, input_all_layers_scores,
-      input_all_layers_draft_ids, input_all_layers_predecessor,
-      output_all_layers_scores, output_all_layers_draft_ids,
-      output_all_layers_predecessor, first_topk_logprobs, first_topk_ids);
-}
-
-void eagle_copy_final_draft_tokens(torch::Tensor third_topk_output_ptrs,
-                                   torch::Tensor all_layers_draft_token_ids,
-                                   torch::Tensor output_draft_token_ids,
-                                   torch::Tensor output_draft_lens,
-                                   int64_t num_eagle_layers,
-                                   int64_t max_decoding_draft_tokens,
-                                   int64_t max_nodes_on_final_tree) {
-  vllm::eagle_copy_final_draft_tokens(
-      third_topk_output_ptrs, all_layers_draft_token_ids,
-      output_draft_token_ids, output_draft_lens, num_eagle_layers,
-      max_decoding_draft_tokens, max_nodes_on_final_tree);
-}
-
-void eagle_set_topks_from_dynamic_tree(int64_t layer_idx,
-                                       torch::Tensor top_ks,
-                                       torch::Tensor top_k_offsets,
-                                       int64_t dynamic_tree_max_topk,
-                                       torch::Tensor num_valid_logits) {
-  vllm::eagle_set_topks_from_dynamic_tree(layer_idx, top_ks, top_k_offsets,
-                                          dynamic_tree_max_topk,
-                                          num_valid_logits);
-}
-
-void eagle_assemble_second_topk_inputs(torch::Tensor first_topk_logprobs,
-                                       torch::Tensor second_topk_input_ptrs,
-                                       torch::Tensor second_topk_output_ids,
-                                       torch::Tensor second_topk_output_ptrs,
-                                       int64_t dynamic_tree_max_topk) {
-  vllm::eagle_assemble_second_topk_inputs(
-      first_topk_logprobs, second_topk_input_ptrs, second_topk_output_ids,
-      second_topk_output_ptrs, dynamic_tree_max_topk);
-}
-
-void eagle_extract_scores_and_real_draft_tokens(
-    torch::Tensor second_topk_input_ptrs,
-    torch::Tensor second_topk_output_ptrs,
-    torch::Tensor first_topk_output_ids,
-    torch::Tensor second_topk_output_logprobs,
-    int64_t dynamic_tree_max_topk) {
-  vllm::eagle_extract_scores_and_real_draft_tokens(
-      second_topk_input_ptrs, second_topk_output_ptrs, first_topk_output_ids,
-      second_topk_output_logprobs, dynamic_tree_max_topk);
-}
-
-void eagle_assemble_third_topk_inputs(torch::Tensor all_layers_scores,
-                                      torch::Tensor third_topk_input_ptrs,
-                                      torch::Tensor third_topk_output_ids,
-                                      torch::Tensor third_topk_output_ptrs,
-                                      torch::Tensor third_topks,
-                                      int64_t num_eagle_layers,
-                                      int64_t max_nodes_on_final_tree) {
-  vllm::eagle_assemble_third_topk_inputs(
-      all_layers_scores, third_topk_input_ptrs, third_topk_output_ids,
-      third_topk_output_ptrs, third_topks, num_eagle_layers,
-      max_nodes_on_final_tree);
-}
-
-void eagle_reconstruct_final_path(torch::Tensor third_topk_output_ptrs,
-                                  torch::Tensor all_layers_predecessor,
-                                  torch::Tensor output_paths,
-                                  int64_t dynamic_tree_max_topk,
-                                  int64_t max_decoding_draft_tokens,
-                                  int64_t max_decoding_tokens,
-                                  int64_t max_path_len,
-                                  int64_t num_eagle_layers,
-                                  int64_t max_nodes_on_final_tree) {
-  vllm::eagle_reconstruct_final_path(
-      third_topk_output_ptrs, all_layers_predecessor, output_paths,
-      dynamic_tree_max_topk, max_decoding_draft_tokens, max_decoding_tokens,
-      max_path_len, num_eagle_layers, max_nodes_on_final_tree);
-}
-
-void eagle_kv_cache_rewind(torch::Tensor kv_cache,
-                           torch::Tensor cu_num_draft_tokens,
-                           torch::Tensor valid_sampled_tokens_count,
-                           torch::Tensor query_start_loc,
-                           torch::Tensor slot_mapping,
-                           int64_t block_size,
-                           int64_t pad_id) {
-  vllm::eagle_kv_cache_rewind(kv_cache, cu_num_draft_tokens,
-                             valid_sampled_tokens_count, query_start_loc,
-                             slot_mapping, block_size, pad_id);
-}
-
-void eagle_compact_slot_mapping(torch::Tensor cu_num_draft_tokens,
-                                torch::Tensor query_start_loc,
-                                torch::Tensor accepted_offsets,
-                                torch::Tensor packed_indices,
-                                torch::Tensor slot_mapping,
-                                int64_t pad_id) {
-  vllm::eagle_compact_slot_mapping(cu_num_draft_tokens, query_start_loc,
-                                   accepted_offsets, packed_indices,
-                                   slot_mapping, pad_id);
-}
-
-void eagle_build_tree_accepted_indices(torch::Tensor draft_token_ids,
-                                       torch::Tensor sampled_token_ids,
-                                       torch::Tensor valid_sampled_tokens_count,
-                                       torch::Tensor level_offsets,
-                                       torch::Tensor level_sizes,
-                                       torch::Tensor children_offsets,
-                                       torch::Tensor children_offsets_start,
-                                       torch::Tensor output_indices,
-                                       torch::Tensor output_counts) {
-  vllm::eagle_build_tree_accepted_indices(
-      draft_token_ids, sampled_token_ids, valid_sampled_tokens_count,
-      level_offsets, level_sizes, children_offsets, children_offsets_start,
-      output_indices, output_counts);
-}
-
-void eagle_kv_cache_compact(torch::Tensor kv_cache,
-                            torch::Tensor cu_num_draft_tokens,
-                            torch::Tensor query_start_loc,
-                            torch::Tensor slot_mapping,
-                            torch::Tensor accepted_offsets,
-                            torch::Tensor packed_indices,
-                            int64_t block_size,
-                            int64_t pad_id) {
-  vllm::eagle_kv_cache_compact(kv_cache, cu_num_draft_tokens, query_start_loc,
-                               slot_mapping, accepted_offsets, packed_indices,
-                               block_size, pad_id);
-}
-
-void eagle_kv_cache_compact_packed(torch::Tensor kv_cache,
-                                   torch::Tensor cu_num_draft_tokens,
-                                   torch::Tensor query_start_loc,
-                                   torch::Tensor slot_mapping,
-                                   torch::Tensor accepted_offsets,
-                                   torch::Tensor packed_indices,
-                                   int64_t block_size,
-                                   int64_t pad_id) {
-  vllm::eagle_kv_cache_compact_packed(
-      kv_cache, cu_num_draft_tokens, query_start_loc, slot_mapping,
-      accepted_offsets, packed_indices, block_size, pad_id);
-}
-
-std::vector<torch::Tensor> eagle_topk_small(torch::Tensor scores,
-                                            int64_t top_k) {
-  return vllm::eagle_topk_small(scores, top_k);
-}
-
-torch::Tensor eagle_build_packed_tree_mask(torch::Tensor paths,
-                                           int64_t tree_len,
-                                           bool exclude_root) {
-  return vllm::eagle_build_packed_tree_mask(paths, tree_len, exclude_root);
-}
-
-std::vector<torch::Tensor> eagle_topk_logits(torch::Tensor logits,
-                                             int64_t top_k) {
-  return vllm::eagle_topk_logits(logits, top_k);
-}
-
-std::vector<torch::Tensor> eagle_topk_logits_custom(torch::Tensor logits,
-                                                    int64_t top_k) {
-  return vllm::eagle_topk_logits_custom(logits, top_k);
-}
+} // namespace vllm

@@ -42,9 +42,7 @@ class _EagleSpeculatorDraftLoop(nn.Module):
         attn_metadata: dict[str, Any],
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
-        self.speculator._draft_loop_impl(
-            num_reqs, attn_metadata, num_tokens_across_dp
-        )
+        self.speculator._draft_loop_impl(num_reqs, attn_metadata, num_tokens_across_dp)
 
 
 class EagleSpeculator:
@@ -87,7 +85,11 @@ class EagleSpeculator:
         self.max_nodes_on_final_tree = self.num_speculative_steps + 1
         self.max_non_leaves_per_layer = self.max_total_draft_tokens
 
-        self.num_capture_layers = getattr(vllm_config.speculative_config.draft_model_config.hf_config, "num_capture_layers", 3)
+        self.num_capture_layers = getattr(
+            vllm_config.speculative_config.draft_model_config.hf_config,
+            "num_capture_layers",
+            3,
+        )
         self.hidden_states = torch.zeros(
             self.max_num_reqs,
             self.max_decoding_tokens,
@@ -96,18 +98,36 @@ class EagleSpeculator:
             device=device,
         )
         # Hidden state read/write indices for persistent resource management (TRT-LLM style)
-        self.hidden_states_read_indices = torch.zeros(self.max_num_tokens, dtype=torch.long, device=device)
-        self.hidden_states_write_indices = torch.zeros(self.max_num_tokens, dtype=torch.long, device=device)
-        
+        self.hidden_states_read_indices = torch.zeros(
+            self.max_num_tokens, dtype=torch.long, device=device
+        )
+        self.hidden_states_write_indices = torch.zeros(
+            self.max_num_tokens, dtype=torch.long, device=device
+        )
+
         # Resource slot management
-        self.slot_start_indices = torch.zeros(self.max_num_reqs, dtype=torch.long, device=device)
-        self.slot_seq_lens = torch.zeros(self.max_num_reqs, dtype=torch.int32, device=device)
-        self.is_first_draft = torch.ones(self.max_num_reqs, dtype=torch.bool, device=device)
+        self.slot_start_indices = torch.zeros(
+            self.max_num_reqs, dtype=torch.long, device=device
+        )
+        self.slot_seq_lens = torch.zeros(
+            self.max_num_reqs, dtype=torch.int32, device=device
+        )
+        self.is_first_draft = torch.ones(
+            self.max_num_reqs, dtype=torch.bool, device=device
+        )
         self.current_slots: torch.Tensor | None = None
         # Gather/scatter buffers for drafting loop
-        self.draft_hidden_states = torch.zeros((self.max_num_reqs, self.hidden_size * self.num_capture_layers), dtype=self.dtype, device=device)
-        self.temp_hidden_states = torch.zeros((self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device)
-        self.hidden_states_indices_int64 = torch.zeros((self.max_num_tokens,), dtype=torch.int64, device=device)
+        self.draft_hidden_states = torch.zeros(
+            (self.max_num_reqs, self.hidden_size * self.num_capture_layers),
+            dtype=self.dtype,
+            device=device,
+        )
+        self.temp_hidden_states = torch.zeros(
+            (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
+        )
+        self.hidden_states_indices_int64 = torch.zeros(
+            (self.max_num_tokens,), dtype=torch.int64, device=device
+        )
 
         self.temperature = torch.zeros(
             self.max_num_reqs,
@@ -137,62 +157,180 @@ class EagleSpeculator:
         )
         self._num_valid_reqs = torch.zeros((), dtype=torch.int32, device=device)
 
-
         # Context drafting buffers
-        self.eagle_seq_lens = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.eagle_ctx_lens = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.eagle_position_ids = torch.zeros((self.max_num_reqs * self.max_decoding_tokens,), dtype=torch.int32, device=device)
-        self.eagle_output_ids = torch.zeros((self.max_num_reqs * self.max_decoding_tokens,), dtype=torch.int32, device=device)
-        self.hidden_states_indices = torch.zeros((self.max_num_reqs * self.max_decoding_tokens,), dtype=torch.int32, device=device)
-        self.last_token_indices = torch.zeros((self.max_num_reqs * self.max_non_leaves_per_layer,), dtype=torch.int32, device=device)
-        self.num_last_token_indices = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.hidden_size_batch_level_starts = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.chunked_context_next_tokens = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
+        self.eagle_seq_lens = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.eagle_ctx_lens = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        # Ensure buffers are large enough for both decoding and graph capture padding
+        # Use max_num_tokens (16384) to cover all cases including chunked prefill
+        max_buffer_tokens = self.max_num_tokens
+        print(f"DEBUG: EagleSpeculator init: max_num_reqs={self.max_num_reqs}, max_num_tokens={self.max_num_tokens}, max_decoding={self.max_decoding_tokens}, max_non_leaves={self.max_non_leaves_per_layer}, max_buffer_tokens={max_buffer_tokens}")
+
+        self.eagle_position_ids = torch.zeros(
+            (max_buffer_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.eagle_output_ids = torch.zeros(
+            (max_buffer_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.hidden_states_indices = torch.zeros(
+            (max_buffer_tokens,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.last_token_indices = torch.zeros(
+            (self.max_num_reqs * self.max_non_leaves_per_layer,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.num_last_token_indices = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.hidden_size_batch_level_starts = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.chunked_context_next_tokens = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
 
         # Gen drafting buffers
         mask_blocks = (self.max_decoding_tokens + 31) // 32
-        self.next_sequence_lengths = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.next_context_lengths = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.spec_dec_position_offsets = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int32, device=device)
-        self.spec_dec_packed_masks = torch.zeros((self.max_num_reqs, self.max_decoding_tokens, mask_blocks), dtype=torch.int32, device=device)
-        self.spec_dec_gen_lengths = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.output_hidden_size_batch_starts_per_level = torch.zeros((self.max_path_len, self.max_num_reqs + 1), dtype=torch.int32, device=device)
-        self.is_leaf_mask = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int8, device=device)
-        self.selected_draft_indices = torch.zeros((self.max_num_reqs, self.max_total_draft_tokens), dtype=torch.int32, device=device)
-        self.selected_draft_pos_offsets = torch.zeros((self.max_num_reqs, self.max_total_draft_tokens), dtype=torch.int32, device=device)
-        self.num_selected_draft_indices = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.selected_masks = torch.zeros((self.max_num_reqs, self.max_total_draft_tokens, mask_blocks), dtype=torch.int32, device=device)
-        self.cum_sum_generation_lengths = torch.zeros((self.max_num_reqs + 1,), dtype=torch.int32, device=device)
+        self.next_sequence_lengths = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.next_context_lengths = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.spec_dec_position_offsets = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.spec_dec_packed_masks = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens, mask_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.spec_dec_gen_lengths = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.output_hidden_size_batch_starts_per_level = torch.zeros(
+            (self.max_path_len, self.max_num_reqs + 1), dtype=torch.int32, device=device
+        )
+        self.is_leaf_mask = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int8,
+            device=device,
+        )
+        self.selected_draft_indices = torch.zeros(
+            (self.max_num_reqs, self.max_total_draft_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.selected_draft_pos_offsets = torch.zeros(
+            (self.max_num_reqs, self.max_total_draft_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.num_selected_draft_indices = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.selected_masks = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens, self.max_decoding_tokens),
+            dtype=torch.bool,
+            device=device,
+        )
+        self.cum_sum_generation_lengths = torch.zeros(
+            (self.max_num_reqs + 1,), dtype=torch.int32, device=device
+        )
         self.max_generation_length = torch.zeros((1,), dtype=torch.int32, device=device)
-        self.non_leaves_in_level_offsets = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int32, device=device)
-        self.parent_non_leaf_in_level_offset = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int32, device=device)
-        self.input_hidden_size_batch_starts_per_level = torch.zeros((self.max_path_len, self.max_num_reqs + 1), dtype=torch.int32, device=device)
+        self.non_leaves_in_level_offsets = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.parent_non_leaf_in_level_offset = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.input_hidden_size_batch_starts_per_level = torch.zeros(
+            (self.max_path_len, self.max_num_reqs + 1), dtype=torch.int32, device=device
+        )
 
         # Slot Management (TRT-LLM style)
         self.req_id_to_slot = {}
         self.free_slots = list(range(self.max_num_reqs))
 
-        self.best_path_ids = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.accepted_lens = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.accepted_tokens = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int32, device=device)
-        self.prev_draft_lens = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.prev_paths = torch.zeros((self.max_num_reqs, self.max_decoding_tokens, self.max_path_len), dtype=torch.int32, device=device)
+        self.best_path_ids = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.accepted_lens = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.accepted_tokens = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.prev_draft_lens = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.prev_paths = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens, self.max_path_len),
+            dtype=torch.int32,
+            device=device,
+        )
 
         # Missing input buffers for prepare_gen
-        self.next_draft_ids = torch.zeros((self.max_num_reqs, self.max_decoding_tokens), dtype=torch.int32, device=device)
-        self.eagle_net0_sequence_lengths = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.prev_context_lengths = torch.zeros((self.max_num_reqs,), dtype=torch.int32, device=device)
-        self.next_paths = torch.zeros((self.max_num_reqs, self.max_decoding_tokens, self.max_path_len), dtype=torch.int32, device=device)
+        self.next_draft_ids = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.eagle_net0_sequence_lengths = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.prev_context_lengths = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int32, device=device
+        )
+        self.next_paths = torch.zeros(
+            (self.max_num_reqs, self.max_decoding_tokens, self.max_path_len),
+            dtype=torch.int32,
+            device=device,
+        )
 
         # Pointer and state buffers for logits assembly
-        self.logits_ptrs = torch.zeros((self.max_num_reqs,), dtype=torch.int64, device=device)
-        self.output_ids_ptrs = torch.zeros((self.max_num_reqs,), dtype=torch.int64, device=device)
-        self.skip_decode = torch.zeros((self.max_num_reqs,), dtype=torch.bool, device=device)
+        self.logits_ptrs = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int64, device=device
+        )
+        self.output_ids_ptrs = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.int64, device=device
+        )
+        self.skip_decode = torch.zeros(
+            (self.max_num_reqs,), dtype=torch.bool, device=device
+        )
 
         # Tree management (TRT-LLM style)
-        self.tokens_gather_idx = torch.zeros((self.max_path_len, self.max_total_draft_tokens), dtype=torch.int32, device=device)
-        self.top_k_list = torch.zeros((self.max_path_len, self.max_total_draft_tokens), dtype=torch.int32, device=device)
-        self.draft_tokens_indices_cumsum = torch.zeros((self.max_path_len + 1,), dtype=torch.int32, device=device)
+        self.tokens_gather_idx = torch.zeros(
+            (self.max_path_len, self.max_total_draft_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.top_k_list = torch.zeros(
+            (self.max_path_len, self.max_total_draft_tokens),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.draft_tokens_indices_cumsum = torch.zeros(
+            (self.max_path_len + 1,), dtype=torch.int32, device=device
+        )
 
         self.cudagraph_manager = EagleCudaGraphManager(vllm_config, device)
         self.prefill_cudagraph_manager = EaglePrefillCudaGraphManager(
@@ -221,7 +359,9 @@ class EagleSpeculator:
             if rid not in self.req_id_to_slot:
                 if not self.free_slots:
                     # Should not normally happen if max_num_reqs is correctly set
-                    raise RuntimeError("No free slots available for EAGLE3 Resource Manager")
+                    raise RuntimeError(
+                        "No free slots available for EAGLE3 Resource Manager"
+                    )
                 slot = self.free_slots.pop(0)
                 self.req_id_to_slot[rid] = slot
                 self.is_first_draft[slot] = True
@@ -290,12 +430,14 @@ class EagleSpeculator:
         num_tokens_across_dp: torch.Tensor | None,
     ) -> None:
         is_capturing = torch.cuda.is_current_stream_capturing()
-        
+
         # Step 0: Initial context input preparation
         self.prepare_ctx_inputs(num_reqs)
-        
+
         self.input_buffers.input_ids[:num_reqs].copy_(self.eagle_output_ids[:num_reqs])
-        self.input_buffers.positions[:num_reqs].copy_(self.eagle_position_ids[:num_reqs])
+        self.input_buffers.positions[:num_reqs].copy_(
+            self.eagle_position_ids[:num_reqs]
+        )
 
         # Persistent storage view
         hs_flat = self.hidden_states.view(-1, self.hidden_states.shape[-1])
@@ -303,19 +445,37 @@ class EagleSpeculator:
         for step in range(0, self.num_speculative_steps):
             level_idx = step + 1
             if is_capturing:
-                num_tokens = num_reqs if step == 0 else num_reqs * self.max_non_leaves_per_layer
+                num_tokens = (
+                    num_reqs if step == 0 else num_reqs * self.max_non_leaves_per_layer
+                )
             else:
-                num_tokens = num_reqs if step == 0 else int(self.num_selected_draft_indices.sum().item())
-            
+                num_tokens = (
+                    num_reqs
+                    if step == 0
+                    else int(self.num_selected_draft_indices.sum().item())
+                )
+
             if step == 0:
                 # Gather root hidden states (capture layers) from slots at index 0
                 # parent_indices for root: self.current_slots * self.max_decoding_tokens
-                root_indices = (self.current_slots * self.max_decoding_tokens).to(torch.long)
+                # During CUDA graph capture, current_slots may be None - use dummy indices
+                if self.current_slots is None:
+                    current_slots = torch.arange(
+                        num_reqs, dtype=torch.int32, device=self.device
+                    )
+                else:
+                    current_slots = self.current_slots[:num_reqs]
+                root_indices = (current_slots * self.max_decoding_tokens).to(torch.long)
                 # We need all capture layers for combining
-                self.gather_tree_hidden_states(root_indices, self.draft_hidden_states[:num_reqs].unsqueeze(1), 
-                                              width=self.hidden_size * self.num_capture_layers)
+                self.gather_tree_hidden_states(
+                    root_indices,
+                    self.draft_hidden_states[:num_reqs].unsqueeze(1),
+                    width=self.hidden_size * self.num_capture_layers,
+                )
                 # Combine them for the draft model's initial layer
-                input_hs = self.model.combine_hidden_states(self.draft_hidden_states[:num_reqs])
+                input_hs = self.model.combine_hidden_states(
+                    self.draft_hidden_states[:num_reqs]
+                )
             else:
                 # Prepare inputs for the current generation step (reads from parents in previous levels)
                 if is_capturing:
@@ -323,38 +483,52 @@ class EagleSpeculator:
                 else:
                     self.prepare_gen_inputs(step, num_reqs)
 
-                self.input_buffers.input_ids[:num_tokens].copy_(self.eagle_output_ids[:num_tokens])
-                self.input_buffers.positions[:num_tokens].copy_(self.eagle_position_ids[:num_tokens])
+                self.input_buffers.input_ids[:num_tokens].copy_(
+                    self.eagle_output_ids[:num_tokens]
+                )
+                self.input_buffers.positions[:num_tokens].copy_(
+                    self.eagle_position_ids[:num_tokens]
+                )
 
                 # Gather from tree nodes using indices calculated by prepare_gen_inputs
                 indices = self.hidden_states_indices[:num_tokens].to(torch.long)
                 # Slice to hidden_size for the draft model forward
-                input_hs = hs_flat[indices][:, :self.hidden_size]
+                input_hs = hs_flat[indices][:, : self.hidden_size]
 
             last_hidden_states, hidden_states = self.run_model(
                 num_tokens, attn_metadata, num_tokens_across_dp, hidden_states=input_hs
             )
-            
+
             # Scatter/save the generated hidden states to the persistent buffer for next steps.
             if is_capturing:
                 # Use fixed layout for CUDA graph
-                starts = self.output_hidden_size_batch_starts_per_level[level_idx, :num_reqs].to(torch.long)
-                local_offsets = torch.arange(self.max_non_leaves_per_layer, device=self.device)
+                starts = self.output_hidden_size_batch_starts_per_level[
+                    level_idx, :num_reqs
+                ].to(torch.long)
+                local_offsets = torch.arange(
+                    self.max_non_leaves_per_layer, device=self.device
+                )
                 write_indices = (starts.unsqueeze(1) + local_offsets).view(-1)
-                hs_flat[write_indices, :self.hidden_size] = hidden_states
+                hs_flat[write_indices, : self.hidden_size] = hidden_states
             else:
-                starts = self.output_hidden_size_batch_starts_per_level[level_idx, :num_reqs].to(torch.long)
+                starts = self.output_hidden_size_batch_starts_per_level[
+                    level_idx, :num_reqs
+                ].to(torch.long)
                 # For eager mode, we'd need to map the actually produced tokens to their slots
                 # For now, we reuse the same logic if possible or finalize eagerly
                 pass
 
             logits = self.model.compute_logits(last_hidden_states)
-            
+
             if is_capturing:
                 draft_tokens = ops.eagle_sample_argmax(logits)
             else:
                 draft_tokens = torch.argmax(logits, dim=-1).to(torch.int32)
-            
+
+            # C++ kernel requires at least 2D, add batch dimension if needed
+            if draft_tokens.dim() == 1:
+                draft_tokens = draft_tokens.unsqueeze(-1)
+
             self.extract_real_draft_tokens(step, num_reqs, draft_tokens)
 
     def capture_model(self) -> None:
@@ -457,18 +631,20 @@ class EagleSpeculator:
         batch_size: int,
         new_draft_tokens: torch.Tensor,
     ) -> None:
-        num_tokens_expand_this_layer = 1 if cur_draft_idx == 0 else self.max_total_draft_tokens + 1
+        num_tokens_expand_this_layer = (
+            1 if cur_draft_idx == 0 else self.max_total_draft_tokens + 1
+        )
         ops.eagle_extract_real_draft_tokens(
             cur_draft_idx,
             self.num_speculative_steps,
             self.max_total_draft_tokens,
-            self.max_decoding_tokens - 1, # max_top_k
+            self.max_decoding_tokens - 1,  # max_top_k
             num_tokens_expand_this_layer,
             self.tokens_gather_idx[cur_draft_idx],
             self.top_k_list[cur_draft_idx],
             self.draft_tokens_indices_cumsum,
             new_draft_tokens,
-            self.accepted_tokens[:batch_size], # buffer
+            self.accepted_tokens[:batch_size],  # buffer
         )
 
     def prepare_gen_inputs(self, level_idx: int, num_reqs: int) -> None:
@@ -537,7 +713,9 @@ class EagleSpeculator:
             self.max_non_leaves_per_layer,
         )
 
-    def compact_kv_cache(self, kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+    def compact_kv_cache(
+        self, kv_cache: torch.Tensor, slot_mapping: torch.Tensor
+    ) -> None:
         ops.eagle_kv_cache_compact(
             kv_cache,
             slot_mapping,
@@ -545,40 +723,81 @@ class EagleSpeculator:
             self.max_decoding_tokens,
         )
 
-    def gather_tree_hidden_states(self, parent_indices: torch.Tensor, output_hidden_states: torch.Tensor, width: int | None = None) -> None:
+    def gather_tree_hidden_states(
+        self,
+        parent_indices: torch.Tensor,
+        output_hidden_states: torch.Tensor,
+        width: int | None = None,
+    ) -> None:
         # self.hidden_states is 3D (num_reqs, max_decoding_tokens, hidden)
+        # parent_indices is 1D with indices into the second dimension
+        # output_hidden_states is the destination tensor
+        #
+        # The C++ kernel expects output_hidden_states.size(1) == parent_indices.numel()
+        # but the call site uses output with size(1) == 1 in some cases.
+        # Use Python fallback for flexibility.
+
         if width is None:
             width = self.hidden_size
-        ops.eagle_tree_gather_hidden_states(
-            self.hidden_states,
-            parent_indices,
-            output_hidden_states,
-            width,
-        )
 
-    def update_dynamic_tree_scores(self, cur_log_probs: torch.Tensor, prev_layer_scores: torch.Tensor) -> None:
+        num_reqs = output_hidden_states.size(0)
+        output_seq_len = output_hidden_states.size(1)
+        num_parents = parent_indices.numel()
+
+        # Check if we can use C++ kernel (shapes match)
+        if output_seq_len == num_parents and width == self.hidden_states.size(2):
+            try:
+                ops.eagle_tree_gather_hidden_states(
+                    self.hidden_states,
+                    parent_indices,
+                    output_hidden_states,
+                )
+                return
+            except RuntimeError:
+                pass  # Fall through to Python implementation
+
+        # Python fallback: gather hidden states at parent indices
+        # For each request, gather from self.hidden_states using parent_indices
+        for req_idx in range(num_reqs):
+            for out_idx, parent_idx in enumerate(parent_indices.tolist()):
+                if out_idx >= output_seq_len:
+                    break
+                # Copy width elements from hidden_states[req, parent, :width]
+                # to output[req, out_idx, :]
+                src = self.hidden_states[req_idx, parent_idx, :width]
+                output_hidden_states[req_idx, out_idx, :] = src
+
+    def update_dynamic_tree_scores(
+        self, cur_log_probs: torch.Tensor, prev_layer_scores: torch.Tensor
+    ) -> None:
         ops.eagle_update_scores(
             cur_log_probs,
             prev_layer_scores,
             self.max_non_leaves_per_layer,
         )
 
-    def _prepare_hidden_states_indices(self, input_batch: InputBatch, slots: torch.Tensor) -> None:
+    def _prepare_hidden_states_indices(
+        self, input_batch: InputBatch, slots: torch.Tensor
+    ) -> None:
         num_reqs = input_batch.num_reqs
         num_tokens = input_batch.num_tokens_after_padding
         qsl = input_batch.query_start_loc_np
-        
+
         # We populate self.hidden_states_write_indices with flat indices into 3D buffer (slot, token_idx)
-        write_indices = torch.zeros(num_tokens, dtype=torch.long, device=self.hidden_states.device)
+        write_indices = torch.zeros(
+            num_tokens, dtype=torch.long, device=self.hidden_states.device
+        )
         for i in range(num_reqs):
             slot = int(slots[i])
-            start, end = qsl[i], qsl[i+1]
+            start, end = qsl[i], qsl[i + 1]
             count = end - start
             # Each slot has a reserved window of self.max_decoding_tokens
             base_idx = slot * self.max_decoding_tokens
-            write_indices[start:end] = torch.arange(base_idx, base_idx + count, device=self.hidden_states.device)
+            write_indices[start:end] = torch.arange(
+                base_idx, base_idx + count, device=self.hidden_states.device
+            )
             self.slot_seq_lens[slot] = count
-            
+
         self.hidden_states_write_indices[:num_tokens].copy_(write_indices)
         self.hidden_states_read_indices[:num_tokens].copy_(write_indices)
 
@@ -602,7 +821,7 @@ class EagleSpeculator:
     ) -> torch.Tensor:
         slots = self._assign_slots(input_batch.req_ids)
         num_tokens = input_batch.num_tokens_after_padding
-        
+
         if aux_hidden_states:
             assert self.method == "eagle3"
             cat_hidden_states = torch.cat(aux_hidden_states, dim=-1)
@@ -610,17 +829,23 @@ class EagleSpeculator:
             self._prepare_hidden_states_indices(input_batch, self.current_slots)
             # Use flattened view to use 1D index_copy_
             hs_flat = self.hidden_states.view(-1, self.hidden_states.shape[-1])
-            hs_flat.index_copy_(0, self.hidden_states_write_indices[:num_tokens], cat_hidden_states)
-            
+            hs_flat.index_copy_(
+                0, self.hidden_states_write_indices[:num_tokens], cat_hidden_states
+            )
+
             # Combine auxiliary hidden states and store for unified gathering in later steps
             hidden_states = self.model.combine_hidden_states(cat_hidden_states)
             # We save combined roots into the first hidden_size part of slot 0
-            hs_flat[self.hidden_states_write_indices[:num_tokens], :self.hidden_size] = hidden_states
+            hs_flat[
+                self.hidden_states_write_indices[:num_tokens], : self.hidden_size
+            ] = hidden_states
         else:
             hidden_states = last_hidden_states
             # Fallback for non-EAGLE3 Or single-layer
             # Initialize slot 0 with current hidden states
-            self.hidden_states[self.current_slots, 0, :self.hidden_size].copy_(hidden_states)
+            self.hidden_states[self.current_slots, 0, : self.hidden_size].copy_(
+                hidden_states
+            )
 
         # Get the input ids and last token indices for the speculator.
         last_token_indices = prepare_eagle_inputs(
@@ -631,12 +856,14 @@ class EagleSpeculator:
             last_sampled,
             next_prefill_tokens,
         )
-        
+
         # Pre-fill starting offsets for the draft loop
         self.input_hidden_size_batch_starts_per_level.fill_(0)
         for i, slot in enumerate(self.current_slots):
             # Request i starts at slot * max_decoding_tokens in the flat hidden_states buffer
-            self.input_hidden_size_batch_starts_per_level[0, i] = int(slot) * self.max_decoding_tokens
+            self.input_hidden_size_batch_starts_per_level[0, i] = (
+                int(slot) * self.max_decoding_tokens
+            )
 
         prefill_cudagraph_size = (
             self.prefill_cudagraph_manager.get_cudagraph_size(num_tokens)

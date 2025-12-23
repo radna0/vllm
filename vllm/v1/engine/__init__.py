@@ -196,6 +196,9 @@ class EngineCoreRequestType(enum.Enum):
     ABORT = b"\x01"
     START_DP_WAVE = b"\x02"
     UTILITY = b"\x03"
+    TRAP = b"\x05"
+    UPDATE_CRIT = b"\x06"
+    ADD_INTERRUPT = b"\x07"
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b"\x04"
 

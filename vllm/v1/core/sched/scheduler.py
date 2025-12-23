@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from typing import Any
 
@@ -110,9 +110,9 @@ class Scheduler(SchedulerInterface):
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
         if self.vllm_config.kv_transfer_config is not None:
-            assert not self.is_encoder_decoder, (
-                "Encoder-decoder models are not currently supported with KV connectors"
-            )
+            assert (
+                not self.is_encoder_decoder
+            ), "Encoder-decoder models are not currently supported with KV connectors"
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
@@ -159,6 +159,7 @@ class Scheduler(SchedulerInterface):
         # current steps. This is used to notify the workers about the finished
         # requests so that they can free the cached states for those requests.
         # This is flushed at the end of each scheduling step.
+        self.waiting_for_tool: set[Request] = set()
         self.finished_req_ids: set[str] = set()
 
         # KV Connector: requests in process of async KV loading or recving
@@ -265,8 +266,7 @@ class Scheduler(SchedulerInterface):
                     data_bytes = expected_per_block
                     scale_bytes = 0
                 logger.debug(
-                    "Adjusted KV cache byte breakdown for %s: expected %d, "
-                    "got %d.",
+                    "Adjusted KV cache byte breakdown for %s: expected %d, " "got %d.",
                     layer_name,
                     expected_per_block,
                     data_bytes + scale_bytes,
@@ -275,8 +275,7 @@ class Scheduler(SchedulerInterface):
             self._kv_cache_scale_bytes_per_block += scale_bytes
 
         self._kv_cache_bytes_per_block = (
-            self._kv_cache_data_bytes_per_block
-            + self._kv_cache_scale_bytes_per_block
+            self._kv_cache_data_bytes_per_block + self._kv_cache_scale_bytes_per_block
         )
         self._kv_cache_data_bytes_total = (
             self._kv_cache_data_bytes_per_block * num_blocks
@@ -295,6 +294,147 @@ class Scheduler(SchedulerInterface):
         num_free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
         used_blocks = (num_blocks - 1) - num_free_blocks
         return max(0, used_blocks)
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        """Add interrupt tokens to a request from a completed tool execution."""
+        if request_id not in self.requests:
+            logger.warning("Request %s not found for interrupt.", request_id)
+            return
+
+        request = self.requests[request_id]
+
+        if not request.is_interruptible:
+            request.tool_state.pending_interrupts.append(token_ids)
+            logger.info(
+                "Request %s is in critical section, queued interrupt (%d tokens).",
+                request_id,
+                len(token_ids),
+            )
+            return
+
+        self._apply_interrupt(request, token_ids)
+
+    def _apply_interrupt(self, request: Request, token_ids: list[int]) -> None:
+        # Inject tokens
+        request.append_output_token_ids(token_ids)
+
+        # Transition state
+        if request in self.waiting_for_tool:
+            self.waiting_for_tool.remove(request)
+
+        # Force prefill by ensuring it goes back to waiting state
+        # The scheduler will see the new tokens and schedule them.
+        # Boost priority to ensure it gets scheduled ASAP
+        request.priority -= 1
+        request.status = RequestStatus.WAITING
+        request.status = RequestStatus.WAITING
+        self.waiting.prepend_request(request)
+        logger.info(
+            "Interrupted request %s with %d tokens.", request.request_id, len(token_ids)
+        )
+
+    def trap_requests(self, request_ids: list[str]) -> None:
+        """Transition requests to WAIT_TRAP status (AsyncLM)."""
+        for req_id in request_ids:
+            if req_id not in self.requests:
+                logger.warning("Request %s not found for trap.", req_id)
+                continue
+
+            request = self.requests[req_id]
+            if request.status == RequestStatus.WAIT_TRAP:
+                continue
+
+            # Remove from running if present
+            if request in self.running:
+                self.running.remove(request)
+
+            # If the request is in the waiting queue, it will be skipped
+            # during scheduling because its status is not WAITING.
+
+            request.status = RequestStatus.WAIT_TRAP
+            self.waiting_for_tool.add(request)
+            request.tool_state.trap_seen = True
+            logger.info("Trapped request %s.", req_id)
+
+    def update_critical_sections(self, updates: dict[str, bool]) -> None:
+        """Update critical section state for requests (AsyncLM)."""
+        for req_id, in_crit in updates.items():
+            if req_id not in self.requests:
+                continue
+            request = self.requests[req_id]
+
+            # State transition
+            was_in_crit = request.tool_state.in_critical_section
+            request.tool_state.in_critical_section = in_crit
+
+            # If exiting critical section, check for pending interrupts
+            if was_in_crit and not in_crit:
+                if request.tool_state.pending_interrupts:
+                    # Apply the first pending interrupt
+                    token_ids = request.tool_state.pending_interrupts.popleft()
+                    self._apply_interrupt(request, token_ids)
+
+    def _apply_interrupt(self, request: Request, token_ids: list[int]) -> None:
+        """Apply interrupt tokens to a request and ensure it is rescheduled."""
+        # P0.2: Track injection boundary BEFORE appending
+        injection_start_idx = len(request._output_token_ids)
+
+        # 1. Append tokens
+        request.append_output_token_ids(token_ids)
+
+        # P0.2: Update injection tracking for stream filtering
+        request.tool_state.injected_token_count += len(token_ids)
+        request.tool_state.last_injection_boundary = len(request._output_token_ids)
+
+        # P0.3: The injected tokens need prefill/append processing.
+        # By NOT incrementing num_computed_tokens, we signal to the scheduler
+        # that these tokens are "new unprocessed input" requiring a prefill pass.
+        # num_computed_tokens stays unchanged; the delta from num_tokens will be picked up.
+
+        # 2. Reset trap seen
+        request.tool_state.trap_seen = False
+
+        # 3. Transition to WAITING
+        if request in self.waiting_for_tool:
+            self.waiting_for_tool.remove(request)
+
+        old_status = request.status
+        request.status = RequestStatus.WAITING
+
+        # 4. Update Scheduler collections
+        if old_status == RequestStatus.RUNNING:
+            if request in self.running:
+                self.running.remove(request)
+
+        # Add to waiting queue (preempt to front)
+        self.waiting.appendleft(request)
+
+        logger.info(
+            "Applied interrupt to request %s (status %s -> WAITING) with %d tokens (injected at idx %d).",
+            request.request_id,
+            old_status,
+            len(token_ids),
+            injection_start_idx,
+        )
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        """Add interrupt tokens to a request and reschedule it."""
+        request = self.requests.get(request_id)
+        if request is None:
+            logger.warning(
+                "Attempted to add interrupt to non-existent request: %s", request_id
+            )
+            return
+
+        if request.is_critical_section:
+            # Queue interrupt
+            request.tool_state.pending_interrupts.append(token_ids)
+            logger.info(
+                "Queued interrupt for request %s (in critical section).", request_id
+            )
+        else:
+            # Apply immediately
+            self._apply_interrupt(request, token_ids)
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -843,9 +983,9 @@ class Scheduler(SchedulerInterface):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        assert (
+            request.status == RequestStatus.RUNNING
+        ), "Only running requests can be preempted"
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED

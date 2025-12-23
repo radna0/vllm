@@ -724,3 +724,59 @@ size_t SuffixTree::estimate_memory() const {
     }
     return total;
 }
+
+std::string SuffixTree::check_integrity() {
+    return _check_node_integrity(_root.get());
+}
+
+std::string SuffixTree::_check_node_integrity(Node* node) {
+    // Basic integrity checks
+    CHECK_OR_RETURN(node != nullptr);
+    CHECK_OR_RETURN(node->count >= 0);
+    CHECK_OR_RETURN(node->length >= 0);
+    
+    // Check children recursively
+    for (const auto& [token, child] : node->children) {
+        CHECK_OR_RETURN(child != nullptr);
+        CHECK_OR_RETURN(child->parent == node);
+        CHECK_OR_RETURN(child->token == token);
+        std::string result = _check_node_integrity(child.get());
+        if (!result.empty()) return result;
+    }
+    return "";
+}
+
+Draft SuffixTree::speculate(Span<const int32_t> context,
+                            int max_spec_tokens,
+                            float max_spec_factor,
+                            float max_spec_offset,
+                            float min_token_prob,
+                            bool use_tree_spec) {
+    // Match the context in the tree
+    auto [node, idx] = _match_context(context);
+    
+    if (node == nullptr) {
+        // No match found, return empty draft
+        return Draft();
+    }
+    
+    // Calculate dynamic max tokens based on match quality
+    int dynamic_max_tokens = std::min(
+        max_spec_tokens,
+        static_cast<int>(context.size() * max_spec_factor + max_spec_offset)
+    );
+    dynamic_max_tokens = std::max(dynamic_max_tokens, 1);
+    
+    Draft result;
+    result.match_len = static_cast<int>(context.size());
+    
+    if (use_tree_spec) {
+        result = _speculate_tree(node, idx, dynamic_max_tokens, min_token_prob);
+    } else {
+        result = _speculate_path(node, idx, dynamic_max_tokens, min_token_prob);
+    }
+    result.match_len = static_cast<int>(context.size());
+    
+    return result;
+}
+

@@ -162,6 +162,15 @@ class EngineCoreClient(ABC):
     def abort_requests(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    def trap_requests(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    def update_critical_sections(self, updates: dict[str, bool]) -> None:
+        raise NotImplementedError
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        raise NotImplementedError
+
     def add_lora(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -228,6 +237,15 @@ class EngineCoreClient(ABC):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         raise NotImplementedError
 
+    async def trap_requests_async(self, request_ids: list[str]) -> None:
+        raise NotImplementedError
+
+    async def update_critical_sections_async(self, updates: dict[str, bool]) -> None:
+        raise NotImplementedError
+
+    async def add_interrupt_async(self, request_id: str, token_ids: list[int]) -> None:
+        raise NotImplementedError
+
     async def add_lora_async(self, lora_request: LoRARequest) -> bool:
         raise NotImplementedError
 
@@ -281,8 +299,18 @@ class InprocClient(EngineCoreClient):
         self.engine_core.add_request(req, request_wave)
 
     def abort_requests(self, request_ids: list[str]) -> None:
-        if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def trap_requests(self, request_ids: list[str]) -> None:
+        if len(request_ids) > 0:
+            self.engine_core.trap_requests(request_ids)
+
+    def update_critical_sections(self, updates: dict[str, bool]) -> None:
+        if updates:
+             self.engine_core.update_critical_sections(updates)
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        self.engine_core.add_interrupt(request_id, token_ids)
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -757,6 +785,18 @@ class SyncMPClient(MPClient):
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
 
+    def trap_requests(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            self._send_input(EngineCoreRequestType.TRAP, request_ids)
+
+    def update_critical_sections(self, updates: dict[str, bool]) -> None:
+        if updates and not self.resources.engine_dead:
+            self._send_input(EngineCoreRequestType.UPDATE_CRIT, updates)
+
+    def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        if not self.resources.engine_dead:
+            self._send_input(EngineCoreRequestType.ADD_INTERRUPT, (request_id, token_ids))
+
     def profile(self, is_start: bool = True) -> None:
         self.call_utility("profile", is_start)
 
@@ -964,6 +1004,18 @@ class AsyncMPClient(MPClient):
     async def abort_requests_async(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             await self._send_input(EngineCoreRequestType.ABORT, request_ids)
+
+    async def trap_requests_async(self, request_ids: list[str]) -> None:
+        if request_ids and not self.resources.engine_dead:
+            await self._send_input(EngineCoreRequestType.TRAP, request_ids)
+
+    async def update_critical_sections_async(self, updates: dict[str, bool]) -> None:
+        if updates and not self.resources.engine_dead:
+            await self._send_input(EngineCoreRequestType.UPDATE_CRIT, updates)
+
+    async def add_interrupt_async(self, request_id: str, token_ids: list[int]) -> None:
+        if not self.resources.engine_dead:
+            await self._send_input(EngineCoreRequestType.ADD_INTERRUPT, (request_id, token_ids))
 
     async def profile_async(self, is_start: bool = True) -> None:
         await self.call_utility_async("profile", is_start)
@@ -1274,6 +1326,39 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
         self, request_ids: list[str], engine: EngineIdentity
     ) -> None:
         await self._send_input(EngineCoreRequestType.ABORT, request_ids, engine)
+
+    async def trap_requests_async(self, request_ids: list[str]) -> None:
+        if not request_ids or self.resources.engine_dead:
+            return
+
+        if len(request_ids) == 1:
+            if engine := self.reqs_in_flight.get(request_ids[0]):
+                await self._send_input(EngineCoreRequestType.TRAP, request_ids, engine)
+            return
+
+        by_engine = defaultdict[EngineIdentity, list[str]](list)
+        for req_id in request_ids:
+            if engine := self.reqs_in_flight.get(req_id):
+                by_engine[engine].append(req_id)
+        for engine, req_ids in by_engine.items():
+            await self._send_input(EngineCoreRequestType.TRAP, req_ids, engine)
+
+    async def update_critical_sections_async(self, updates: dict[str, bool]) -> None:
+        if not updates or self.resources.engine_dead:
+            return
+
+        by_engine = defaultdict[EngineIdentity, dict[str, bool]](dict)
+        for req_id, in_crit in updates.items():
+            if engine := self.reqs_in_flight.get(req_id):
+                by_engine[engine][req_id] = in_crit
+        
+        for engine, engine_updates in by_engine.items():
+             await self._send_input(EngineCoreRequestType.UPDATE_CRIT, engine_updates, engine)
+
+    async def add_interrupt_async(self, request_id: str, token_ids: list[int]) -> None:
+        if not self.resources.engine_dead:
+            if engine := self.reqs_in_flight.get(request_id):
+                await self._send_input(EngineCoreRequestType.ADD_INTERRUPT, (request_id, token_ids), engine)
 
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         """Scale elastic EP data parallel size"""

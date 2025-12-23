@@ -23,6 +23,8 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.core.cml_parser import CMLParser, CMLEvent
+from vllm.outputs import AsyncToolEvent
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -86,6 +88,8 @@ class RequestOutputCollector:
 class OutputProcessorOutput:
     request_outputs: list[RequestOutput | PoolingRequestOutput]
     reqs_to_abort: list[str]
+    reqs_to_trap: list[str]
+    critical_updates: dict[str, bool]  # req_id -> in_critical_section
 
 
 class RequestState:
@@ -137,6 +141,11 @@ class RequestState:
         # Stream Interval
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
+
+        # AsyncLM
+        self.cml_parser = CMLParser()
+        self.pending_trap: bool = False
+        self.pending_crit: bool | None = None
 
     @classmethod
     def from_new_request(
@@ -241,7 +250,22 @@ class RequestState:
                 request_id, [self._new_pooling_output(pooling_output)], finished
             )
 
-        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+        output, cml_event, in_crit = self._new_completion_output(
+            new_token_ids, finish_reason, stop_reason
+        )
+
+        self.pending_trap = cml_event.event_type if cml_event else None
+        self.pending_crit = in_crit
+
+        # Convert CMLEvent to AsyncToolEvent for API layer
+        async_tool_event = None
+        if cml_event:
+            async_tool_event = AsyncToolEvent(
+                event_type=cml_event.event_type,
+                tool_name=cml_event.tool_name,
+                tool_args=cml_event.tool_args,
+                tool_call_id=cml_event.call_id,
+            )
 
         if self.parent_req is None:
             outputs = [output]
@@ -253,7 +277,11 @@ class RequestState:
                 return None
 
         return self._new_request_output(
-            request_id, outputs, finished, kv_transfer_params
+            request_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            async_tool_event=async_tool_event,
         )
 
     def _new_request_output(
@@ -262,6 +290,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        async_tool_event: AsyncToolEvent | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
@@ -298,6 +327,7 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
+            async_tool_event=async_tool_event,
         )
 
     def _new_completion_output(
@@ -305,7 +335,8 @@ class RequestState:
         token_ids: list[int],
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
-    ) -> CompletionOutput:
+    ) -> tuple[CompletionOutput, CMLEvent | None, bool | None]:
+        # Returns: (output, cml_event, critical_section_state)
         assert self.detokenizer is not None
         assert self.logprobs_processor is not None
         finished = finish_reason is not None
@@ -321,14 +352,21 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
-        return CompletionOutput(
-            index=self.request_index,
-            text=text,
-            token_ids=token_ids,
-            logprobs=logprobs,
-            cumulative_logprob=self.logprobs_processor.cumulative_logprob,
-            finish_reason=str(finish_reason) if finished else None,
-            stop_reason=stop_reason if finished else None,
+        # AsyncLM Parser Step - now returns structured CMLEvent
+        in_crit, cml_event = self.cml_parser.step(text)
+
+        return (
+            CompletionOutput(
+                index=self.request_index,
+                text=text,
+                token_ids=token_ids,
+                logprobs=logprobs,
+                cumulative_logprob=self.logprobs_processor.cumulative_logprob,
+                finish_reason=str(finish_reason) if finished else None,
+                stop_reason=stop_reason if finished else None,
+            ),
+            trap,
+            in_crit,
         )
 
     def _new_pooling_output(
@@ -391,9 +429,11 @@ class OutputProcessor:
                         new_token_ids=[],
                         # Set pooling_output is not None to
                         # correctly enter the abort pooling branch
-                        pooling_output=torch.randn(0, device="cpu")
-                        if req_state.detokenizer is None
-                        else None,
+                        pooling_output=(
+                            torch.randn(0, device="cpu")
+                            if req_state.detokenizer is None
+                            else None
+                        ),
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
                         kv_transfer_params=None,
@@ -469,6 +509,8 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        reqs_to_trap: list[str] = []
+        critical_updates: dict[str, bool] = {}
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -517,7 +559,26 @@ class OutputProcessor:
                     req_state.queue.put(request_output)
                 else:
                     # LLMEngine: return list of RequestOutputs.
+                    # LLMEngine: return list of RequestOutputs.
                     request_outputs.append(request_output)
+
+            # Check AsyncLM events
+            if hasattr(req_state, "pending_trap") and req_state.pending_trap == "TRAP":
+                reqs_to_trap.append(req_id)
+                req_state.pending_trap = None
+
+            if hasattr(req_state, "pending_crit"):
+                # We should optimize to only send updates?
+                # For now send every step if we have it?
+                # Or verify change?
+                # CMLParser.step returns current state.
+                # Ideally we track prev state.
+                # Assuming OutputProcessor loop is stateless regarding prev critical section?
+                # No, RequestState persists.
+                # We can store prev_crit in RequestState.
+                pass
+                # Doing it simple: always update for now, or check change
+                critical_updates[req_id] = req_state.pending_crit
 
             # Free completed requests.
             if finish_reason is not None:
@@ -543,6 +604,8 @@ class OutputProcessor:
         return OutputProcessorOutput(
             request_outputs=request_outputs,
             reqs_to_abort=reqs_to_abort,
+            reqs_to_trap=reqs_to_trap,
+            critical_updates=critical_updates,
         )
 
     def update_scheduler_stats(self, scheduler_stats: SchedulerStats | None):

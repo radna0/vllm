@@ -836,9 +836,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ),
             include_stop_str_in_output=self.include_stop_str_in_output,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
@@ -1264,9 +1264,9 @@ class CompletionRequest(OpenAIBaseModel):
                 self.logits_processors, logits_processor_pattern
             ),
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
@@ -2120,9 +2120,9 @@ class TranscriptionRequest(OpenAIBaseModel):
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=repetition_penalty,
             presence_penalty=self.presence_penalty,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             extra_args=self.vllm_xargs,
         )
 
@@ -2340,9 +2340,9 @@ class TranslationRequest(OpenAIBaseModel):
             temperature=temperature,
             max_tokens=max_tokens,
             seed=self.seed,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
         )
 
     @model_validator(mode="before")
@@ -2509,4 +2509,27 @@ class GenerateResponse(BaseModel):
     kv_transfer_params: dict[str, Any] | None = Field(
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
+    )
+
+
+class AsyncToolResultRequest(OpenAIBaseModel):
+    """Raw token-based interrupt injection (advanced use)."""
+
+    request_id: str
+    token_ids: list[int]
+
+
+class AsyncToolResultTextRequest(OpenAIBaseModel):
+    """
+    Text-based interrupt injection (recommended for clients).
+    Server tokenizes and wraps into CML [INTR] block automatically.
+    """
+
+    request_id: str
+    call_id: str = Field(description="The tool call ID to associate with this result")
+    content: str = Field(description="The tool output text")
+    is_error: bool = Field(default=False, description="Whether this is an error result")
+    wrap_cml: bool = Field(
+        default=True,
+        description="If True, wrap content in [INTR] call_id [HEAD] content [END] format",
     )

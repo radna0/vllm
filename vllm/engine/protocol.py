@@ -84,6 +84,10 @@ class EngineClient(ABC):
         """
         ...
 
+    async def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        """Add interrupt tokens to a request."""
+        raise NotImplementedError
+
     @abstractmethod
     async def get_tokenizer(self) -> TokenizerLike:
         """Get the tokenizer"""

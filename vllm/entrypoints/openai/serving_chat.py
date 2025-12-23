@@ -694,6 +694,20 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                if res.async_tool_event:
+                     event_data = {
+                         "type": res.async_tool_event.event_type,
+                         "tool_name": res.async_tool_event.tool_name,
+                         "tool_args": res.async_tool_event.tool_args,
+                         "tool_call_id": res.async_tool_event.tool_call_id,
+                         "request_id": request_id, 
+                     }
+                     # Remove None values
+                     event_data = {k: v for k, v in event_data.items() if v is not None}
+                     yield f"event: async_tool_event\ndata: {json.dumps(event_data)}\n\n"
+                     # Prevent sending multiple times if res is reused
+                     res.async_tool_event = None
+
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:

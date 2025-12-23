@@ -323,7 +323,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &eagle_kv_cache_compact_packed);
 
   ops.def(
-      "eagle_topk_small(Tensor scores, int top_k) -> (Tensor, Tensor)");
+      "eagle_topk_small(Tensor scores, int top_k) -> Tensor[]");
   ops.impl("eagle_topk_small", torch::kCUDA, &eagle_topk_small);
 
   ops.def(
@@ -333,11 +333,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
            &eagle_build_packed_tree_mask);
 
   ops.def(
-      "eagle_topk_logits(Tensor logits, int top_k) -> (Tensor, Tensor)");
+      "eagle_topk_logits(Tensor logits, int top_k) -> Tensor[]");;
   ops.impl("eagle_topk_logits", torch::kCUDA, &eagle_topk_logits);
 
   ops.def(
-      "eagle_topk_logits_custom(Tensor logits, int top_k) -> (Tensor, Tensor)");
+      "eagle_topk_logits_custom(Tensor logits, int top_k) -> Tensor[]");;
   ops.impl("eagle_topk_logits_custom", torch::kCUDA,
            &eagle_topk_logits_custom);
 

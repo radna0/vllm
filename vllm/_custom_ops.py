@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     def register_fake(fn):
         return lambda name: fn
+
 else:
     try:
         from torch.library import register_fake
@@ -1573,9 +1574,10 @@ def scaled_fp4_quant(
     device = input.device
 
     assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
-    assert input.dtype in (torch.float16, torch.bfloat16), (
-        f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
-    )
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
 
     # Two fp4 values will be packed into an uint8.
     output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
@@ -1618,9 +1620,9 @@ def scaled_fp4_experts_quant(
         output_scales: The blockscale tensor in FP8-E4M3
     """
     assert not current_platform.is_rocm()
-    assert input_tensor.ndim == 2, (
-        f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
-    )
+    assert (
+        input_tensor.ndim == 2
+    ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
 
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization. This is used to prevent the kernel
@@ -1754,9 +1756,9 @@ def allspark_repack_weight(
     scale_reorder = torch.empty((1, N_32align), device=scale.device, dtype=scale.dtype)
     zero_point_reorder = None
     if has_zp:
-        assert zero_point is not None, (
-            "zero_point must be provided for asymmetric quantization."
-        )
+        assert (
+            zero_point is not None
+        ), "zero_point must be provided for asymmetric quantization."
         zero_point_reorder = torch.empty(
             (1, N_32align), device=zero_point.device, dtype=zero_point.dtype
         )
@@ -1829,9 +1831,9 @@ def scaled_int8_quant(
     output = torch.empty_like(input, dtype=torch.int8)
     if scale is not None:
         # static-per-tensor quantization.
-        assert symmetric == (azp is None), (
-            "azp must only be provided for asymmetric quantization."
-        )
+        assert symmetric == (
+            azp is None
+        ), "azp must only be provided for asymmetric quantization."
         torch.ops._C.static_scaled_int8_quant(output, input, scale, azp)
         return output, scale, azp
 
@@ -2805,9 +2807,9 @@ def onednn_scaled_int8_quant(
     input = input.view((token_num, input.shape[-1]))
     if scale is not None:
         # static-per-tensor quantization.
-        assert symmetric == (azp is None), (
-            "azp must only be provided for asymmetric quantization."
-        )
+        assert symmetric == (
+            azp is None
+        ), "azp must only be provided for asymmetric quantization."
         torch.ops._C.static_scaled_int8_quant(output, input, scale, azp)
         return output, scale, azp
 
@@ -3136,3 +3138,388 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
+
+
+# EAGLE speculative decoding ops
+def eagle_sample_argmax(logits: torch.Tensor) -> torch.Tensor:
+    return torch.ops._C.eagle_sample_argmax(logits)
+
+
+def eagle_sample_topk_topp_gumbel(
+    logits: torch.Tensor,
+    top_k: torch.Tensor | None,
+    top_p: torch.Tensor | None,
+    temperature: torch.Tensor | None,
+    sampling_eps: float,
+) -> torch.Tensor:
+    return torch.ops._C.eagle_sample_topk_topp_gumbel(
+        logits, top_k, top_p, temperature, sampling_eps
+    )
+
+
+def eagle_expand_draft_tokens(
+    draft_token_ids: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    max_draft_len: int,
+    pad_id: int,
+) -> torch.Tensor:
+    return torch.ops._C.eagle_expand_draft_tokens(
+        draft_token_ids, cu_num_draft_tokens, max_draft_len, pad_id
+    )
+
+
+def eagle_prepare_ctx_eagle_inputs(
+    eagle_seq_lens: torch.Tensor,
+    eagle_ctx_lens: torch.Tensor,
+    output_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    hidden_states_indices: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_last_token_indices: torch.Tensor,
+    hidden_size_batch_level_starts: torch.Tensor,
+    input_ids: torch.Tensor,
+    chunked_context_next_tokens: torch.Tensor,
+    base_seq_lens: torch.Tensor,
+    base_ctx_lens: torch.Tensor,
+    accepted_tokens: torch.Tensor,
+    accepted_lens: torch.Tensor,
+    prev_draft_lens: torch.Tensor,
+    prev_paths: torch.Tensor,
+    best_path_ids: torch.Tensor,
+    max_path_len: int,
+    max_decoding_tokens: int,
+    max_non_leaves_per_layer: int,
+) -> None:
+    torch.ops._C.eagle_prepare_ctx_eagle_inputs(
+        eagle_seq_lens,
+        eagle_ctx_lens,
+        output_ids,
+        position_ids,
+        hidden_states_indices,
+        last_token_indices,
+        num_last_token_indices,
+        hidden_size_batch_level_starts,
+        input_ids,
+        chunked_context_next_tokens,
+        base_seq_lens,
+        base_ctx_lens,
+        accepted_tokens,
+        accepted_lens,
+        prev_draft_lens,
+        prev_paths,
+        best_path_ids,
+        max_path_len,
+        max_decoding_tokens,
+        max_non_leaves_per_layer,
+    )
+
+
+def eagle_prepare_gen_eagle_inputs(
+    next_sequence_lengths: torch.Tensor,
+    next_context_lengths: torch.Tensor,
+    output_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    spec_decoding_gen_lengths: torch.Tensor,
+    spec_decoding_position_offsets: torch.Tensor,
+    spec_decoding_packed_masks: torch.Tensor,
+    hidden_states_indices: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_last_token_indices: torch.Tensor,
+    output_hidden_size_batch_starts_per_level: torch.Tensor,
+    is_leaf_mask: torch.Tensor,
+    selected_draft_indices: torch.Tensor,
+    selected_draft_pos_offsets: torch.Tensor,
+    num_selected_draft_indices: torch.Tensor,
+    selected_masks: torch.Tensor,
+    cum_sum_generation_lengths: torch.Tensor,
+    max_generation_length: torch.Tensor,
+    non_leaves_in_level_offsets: torch.Tensor,
+    parent_non_leaf_in_level_offset: torch.Tensor,
+    next_draft_ids: torch.Tensor,
+    eagle_net0_sequence_lengths: torch.Tensor,
+    prev_context_lengths: torch.Tensor,
+    input_hidden_size_batch_starts_per_level: torch.Tensor,
+    next_paths: torch.Tensor,
+    level_idx: int,
+    max_path_len: int,
+    max_decoding_tokens: int,
+    max_non_leaves_per_layer: int,
+) -> None:
+    torch.ops._C.eagle_prepare_gen_eagle_inputs(
+        next_sequence_lengths,
+        next_context_lengths,
+        output_ids,
+        position_ids,
+        spec_decoding_gen_lengths,
+        spec_decoding_position_offsets,
+        spec_decoding_packed_masks,
+        hidden_states_indices,
+        last_token_indices,
+        num_last_token_indices,
+        output_hidden_size_batch_starts_per_level,
+        is_leaf_mask,
+        selected_draft_indices,
+        selected_draft_pos_offsets,
+        num_selected_draft_indices,
+        selected_masks,
+        cum_sum_generation_lengths,
+        max_generation_length,
+        non_leaves_in_level_offsets,
+        parent_non_leaf_in_level_offset,
+        next_draft_ids,
+        eagle_net0_sequence_lengths,
+        prev_context_lengths,
+        input_hidden_size_batch_starts_per_level,
+        next_paths,
+        level_idx,
+        max_path_len,
+        max_decoding_tokens,
+        max_non_leaves_per_layer,
+    )
+
+
+def eagle_update_scores(
+    cur_log_probs: torch.Tensor,
+    prev_layer_scores: torch.Tensor,
+    dynamic_tree_max_topk: int,
+) -> None:
+    torch.ops._C.eagle_update_scores(
+        cur_log_probs, prev_layer_scores, dynamic_tree_max_topk
+    )
+
+
+def eagle_update_path(
+    layer_idx: int,
+    dynamic_tree_max_topk: int,
+    prev_paths: torch.Tensor,
+    second_topk_output_ids: torch.Tensor,
+    new_paths: torch.Tensor,
+    next_expand_indices: torch.Tensor,
+) -> None:
+    torch.ops._C.eagle_update_path(
+        layer_idx,
+        dynamic_tree_max_topk,
+        prev_paths,
+        second_topk_output_ids,
+        new_paths,
+        next_expand_indices,
+    )
+
+
+def eagle_topk_small(scores: torch.Tensor, top_k: int) -> list[torch.Tensor]:
+    return torch.ops._C.eagle_topk_small(scores, top_k)
+
+
+def eagle_topk_logits(logits: torch.Tensor, top_k: int) -> list[torch.Tensor]:
+    return torch.ops._C.eagle_topk_logits(logits, top_k)
+
+
+def eagle_topk_logits_custom(logits: torch.Tensor, top_k: int) -> list[torch.Tensor]:
+    return torch.ops._C.eagle_topk_logits_custom(logits, top_k)
+
+
+def eagle_build_packed_tree_mask(
+    paths: torch.Tensor, tree_len: int, exclude_root: bool
+) -> torch.Tensor:
+    return torch.ops._C.eagle_build_packed_tree_mask(paths, tree_len, exclude_root)
+
+
+def eagle_extract_real_draft_tokens(
+    cur_draft_idx: int,
+    max_draft_len: int,
+    max_total_draft_tokens: int,
+    max_top_k: int,
+    num_tokens_expand_this_layer: int,
+    tokens_gather_idx: torch.Tensor,
+    top_k_list: torch.Tensor,
+    draft_tokens_indices_cumsum: torch.Tensor,
+    new_draft_tokens: torch.Tensor,
+    draft_tokens_buffer: torch.Tensor,
+) -> None:
+    torch.ops._C.eagle_extract_real_draft_tokens(
+        cur_draft_idx,
+        max_draft_len,
+        max_total_draft_tokens,
+        max_top_k,
+        num_tokens_expand_this_layer,
+        tokens_gather_idx,
+        top_k_list,
+        draft_tokens_indices_cumsum,
+        new_draft_tokens,
+        draft_tokens_buffer,
+    )
+
+
+def eagle_tree_gather_hidden_states(
+    hidden_states: torch.Tensor,
+    parent_indices: torch.Tensor,
+    output_hidden_states: torch.Tensor,
+) -> None:
+    torch.ops._C.eagle_tree_gather_hidden_states(
+        hidden_states, parent_indices, output_hidden_states
+    )
+
+
+def eagle_kv_cache_compact(
+    kv_cache: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    accepted_offsets: torch.Tensor,
+    packed_indices: torch.Tensor,
+    block_size: int,
+    pad_id: int,
+) -> None:
+    torch.ops._C.eagle_kv_cache_compact(
+        kv_cache,
+        cu_num_draft_tokens,
+        query_start_loc,
+        slot_mapping,
+        accepted_offsets,
+        packed_indices,
+        block_size,
+        pad_id,
+    )
+
+
+def eagle_prepare_gen_eagle_inputs_padded(
+    next_sequence_lengths: torch.Tensor,
+    next_context_lengths: torch.Tensor,
+    output_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    spec_decoding_gen_lengths: torch.Tensor,
+    spec_decoding_position_offsets: torch.Tensor,
+    spec_decoding_packed_masks: torch.Tensor,
+    hidden_states_indices: torch.Tensor,
+    last_token_indices: torch.Tensor,
+    num_last_token_indices: torch.Tensor,
+    output_hidden_size_batch_starts_per_level: torch.Tensor,
+    is_leaf_mask: torch.Tensor,
+    selected_draft_indices: torch.Tensor,
+    selected_draft_pos_offsets: torch.Tensor,
+    num_selected_draft_indices: torch.Tensor,
+    selected_masks: torch.Tensor,
+    cum_sum_generation_lengths: torch.Tensor,
+    max_generation_length: torch.Tensor,
+    non_leaves_in_level_offsets: torch.Tensor,
+    parent_non_leaf_in_level_offset: torch.Tensor,
+    next_draft_ids: torch.Tensor,
+    eagle_net0_sequence_lengths: torch.Tensor,
+    prev_context_lengths: torch.Tensor,
+    input_hidden_size_batch_starts_per_level: torch.Tensor,
+    next_paths: torch.Tensor,
+    level_idx: int,
+    max_path_len: int,
+    max_decoding_tokens: int,
+    max_non_leaves_per_layer: int,
+) -> None:
+    torch.ops._C.eagle_prepare_gen_eagle_inputs_padded(
+        next_sequence_lengths,
+        next_context_lengths,
+        output_ids,
+        position_ids,
+        spec_decoding_gen_lengths,
+        spec_decoding_position_offsets,
+        spec_decoding_packed_masks,
+        hidden_states_indices,
+        last_token_indices,
+        num_last_token_indices,
+        output_hidden_size_batch_starts_per_level,
+        is_leaf_mask,
+        selected_draft_indices,
+        selected_draft_pos_offsets,
+        num_selected_draft_indices,
+        selected_masks,
+        cum_sum_generation_lengths,
+        max_generation_length,
+        non_leaves_in_level_offsets,
+        parent_non_leaf_in_level_offset,
+        next_draft_ids,
+        eagle_net0_sequence_lengths,
+        prev_context_lengths,
+        input_hidden_size_batch_starts_per_level,
+        next_paths,
+        level_idx,
+        max_path_len,
+        max_decoding_tokens,
+        max_non_leaves_per_layer,
+    )
+
+
+def eagle_update_draft_state_and_tokens(
+    draft_tokens: torch.Tensor,
+    output_hidden_states: torch.Tensor,
+    output_hidden_states_stride: int,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    positions_stride0: int,
+    input_hidden_states: torch.Tensor,
+    input_hidden_states_stride: int,
+    seq_lens: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    block_table_stride: int,
+    output_draft_tokens: torch.Tensor,
+    output_draft_stride: int,
+    step: int,
+    hidden_size: int,
+    block_size: int,
+    max_model_len: int,
+    pad_id: int,
+    use_mrope: bool,
+) -> None:
+    torch.ops._C.eagle_update_draft_state_and_tokens(
+        draft_tokens,
+        output_hidden_states,
+        output_hidden_states_stride,
+        input_ids,
+        positions,
+        positions_stride0,
+        input_hidden_states,
+        input_hidden_states_stride,
+        seq_lens,
+        slot_mapping,
+        block_table,
+        block_table_stride,
+        output_draft_tokens,
+        output_draft_stride,
+        step,
+        hidden_size,
+        block_size,
+        max_model_len,
+        pad_id,
+        use_mrope,
+    )
+
+
+def eagle_tree_copy_level(
+    draft_token_ids: torch.Tensor,
+    draft_positions: torch.Tensor,
+    draft_hidden_states: torch.Tensor,
+    tree_input_ids: torch.Tensor,
+    tree_positions: torch.Tensor,
+    tree_hidden_states: torch.Tensor,
+    level_offset: int,
+    hidden_size: int,
+) -> None:
+    torch.ops._C.eagle_tree_copy_level(
+        draft_token_ids,
+        draft_positions,
+        draft_hidden_states,
+        tree_input_ids,
+        tree_positions,
+        tree_hidden_states,
+        level_offset,
+        hidden_size,
+    )
+
+
+def eagle_tree_select_next_tokens(
+    topk_ids: torch.Tensor,
+    parent_indices: torch.Tensor,
+    child_indices: torch.Tensor,
+    output_tokens: torch.Tensor,
+) -> None:
+    torch.ops._C.eagle_tree_select_next_tokens(
+        topk_ids, parent_indices, child_indices, output_tokens
+    )

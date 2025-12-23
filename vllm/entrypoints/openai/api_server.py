@@ -48,6 +48,8 @@ from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionRequest,
+    AsyncToolResultRequest,
+    AsyncToolResultTextRequest,
     CompletionResponse,
     ErrorInfo,
     ErrorResponse,
@@ -636,6 +638,61 @@ async def create_translations(
         return JSONResponse(content=generator.model_dump())
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/async_tool_results")
+async def async_tool_results(raw_request: Request, request: AsyncToolResultRequest):
+    client = engine_client(raw_request)
+    try:
+        await client.add_interrupt(request.request_id, request.token_ids)
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            detail="AsyncLM is not supported by this engine backend",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail=str(e))
+    return JSONResponse(content={"status": "ok"})
+
+
+@router.post("/v1/async_tool_results_text")
+async def async_tool_results_text(
+    raw_request: Request, request: AsyncToolResultTextRequest
+):
+    """
+    Text-based interrupt injection (P0.1 - recommended for clients).
+    Server tokenizes and wraps into CML [INTR] block automatically.
+    """
+    client = engine_client(raw_request)
+    try:
+        # Get tokenizer
+        tokenizer = await client.get_tokenizer()
+
+        # Build CML interrupt block
+        if request.wrap_cml:
+            if request.is_error:
+                intr_text = (
+                    f"[INTR] {request.call_id} [HEAD] Error: {request.content} [END]"
+                )
+            else:
+                intr_text = f"[INTR] {request.call_id} [HEAD] {request.content} [END]"
+        else:
+            intr_text = request.content
+
+        # Tokenize using server tokenizer
+        token_ids = tokenizer.encode(intr_text, add_special_tokens=False)
+
+        # Inject interrupt
+        await client.add_interrupt(request.request_id, token_ids)
+
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=HTTPStatus.NOT_IMPLEMENTED,
+            detail="AsyncLM is not supported by this engine backend",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR, detail=str(e))
+    return JSONResponse(content={"status": "ok", "tokens_injected": len(token_ids)})
 
 
 def load_log_config(log_config_file: str | None) -> dict | None:

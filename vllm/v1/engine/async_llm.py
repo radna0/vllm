@@ -521,6 +521,23 @@ class AsyncLLM(EngineClient):
                         await engine_core.abort_requests_async(
                             processed_outputs.reqs_to_abort
                         )
+                        
+                        # 4) Trap requests (AsyncLM)
+                        if processed_outputs.reqs_to_trap:
+                            await engine_core.trap_requests_async(
+                                processed_outputs.reqs_to_trap
+                            )
+                        
+                        # 5) Critical section updates
+                        # TODO: Propagate critical section updates to EngineCore if needed?
+                        # Currently we just track them. If we need to block scheduling, 
+                        # we might need an API. For now, we assume implicit handling or 
+                        # just parsing. The scheduler needs to know 'is_critical_section'.
+                        # We should send these updates to EngineCore!
+                        if processed_outputs.critical_updates:
+                             await engine_core.update_critical_sections_async(
+                                 processed_outputs.critical_updates
+                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
@@ -551,6 +568,12 @@ class AsyncLLM(EngineClient):
 
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
+
+    async def add_interrupt(self, request_id: str, token_ids: list[int]) -> None:
+        """Add interrupt tokens to a request."""
+        await self.engine_core.add_interrupt_async(request_id, token_ids)
+        if self.log_requests:
+            logger.info("Added interrupt to request %s with %d tokens.", request_id, len(token_ids))
 
     async def pause_generation(
         self,

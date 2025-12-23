@@ -20,6 +20,13 @@ logger = init_logger(__name__)
 
 
 @dataclass
+class AsyncToolEvent:
+    event_type: str  # "trap" or "tool_call"
+    tool_name: str | None = None
+    tool_args: str | None = None
+    tool_call_id: str | None = None
+
+@dataclass
 class CompletionOutput:
     """The output data of one completion output of a request.
 
@@ -141,13 +148,17 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        self.async_tool_event: AsyncToolEvent | None = kwargs.get("async_tool_event")
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        if next_output.async_tool_event:
+            self.async_tool_event = next_output.async_tool_event
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
