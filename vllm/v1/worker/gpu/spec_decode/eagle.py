@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any
+from typing import Any, List, Tuple
 
 import numpy as np
 import torch
@@ -23,6 +23,142 @@ from vllm.v1.worker.gpu.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu.spec_decode.eagle_cudagraph import EagleCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+# ============================================================================
+# Helper functions ported from SGLang for dynamic tree construction
+# ============================================================================
+
+
+def fast_topk(
+    x: torch.Tensor, k: int, dim: int = -1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fast top-k selection. Falls back to torch.topk."""
+    return torch.topk(x, k, dim=dim)
+
+
+@torch.compile(dynamic=True)
+def select_top_k_tokens(
+    step: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Tuple]:
+    """Select top-k tokens at each step of tree construction.
+
+    Ported from SGLang's spec_utils.py.
+    """
+    if step == 0:
+        # The first step after extend
+        input_ids = topk_index.flatten()
+        if hidden_states is not None:
+            hidden_states = hidden_states.repeat_interleave(topk, dim=0)
+        scores = topk_p  # shape: (b, topk)
+
+        tree_info = (
+            topk_p.unsqueeze(1),  # shape: (b, 1, topk)
+            topk_index,  # shape: (b, topk)
+            torch.arange(-1, topk, dtype=torch.long, device=input_ids.device)
+            .unsqueeze(0)
+            .repeat(topk_p.shape[0], 1),  # shape: (b, topk + 1)
+        )
+    else:
+        # The later decode steps
+        expand_scores = torch.mul(
+            scores.unsqueeze(2), topk_p.reshape(-1, topk, topk)
+        )  # (b, topk, 1) x (b, topk, topk) -> (b, topk, topk)
+        topk_cs_p, topk_cs_index = fast_topk(
+            expand_scores.flatten(start_dim=1), topk, dim=-1
+        )  # (b, topk)
+        scores = topk_cs_p  # shape: (b, topk)
+
+        topk_index = topk_index.reshape(-1, topk**2)
+        input_ids = torch.gather(topk_index, index=topk_cs_index, dim=1).flatten()
+
+        if hidden_states.shape[0] > 0:
+            selected_input_index = topk_cs_index.flatten() // topk + torch.arange(
+                0, hidden_states.shape[0], step=topk, device=topk_index.device
+            ).repeat_interleave(topk)
+            hidden_states = hidden_states[selected_input_index, :]
+
+        tree_info = (
+            expand_scores,  # shape: (b, topk, topk)
+            topk_index,  # shape: (b, topk * topk)
+            topk_cs_index + (topk**2 * (step - 1) + topk),  # shape: (b, topk)
+        )
+
+    return input_ids, hidden_states, scores, tree_info
+
+
+def organize_draft_results(
+    score_list: List[torch.Tensor],
+    token_list: List[torch.Tensor],
+    parents_list: List[torch.Tensor],
+    num_draft_token: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Organize draft results with top-k selection across all levels.
+
+    Ported from SGLang's eagle_utils.py.
+    """
+    score_list_cat = torch.cat(score_list, dim=1).flatten(1)
+    ss_token_list = torch.cat(token_list, dim=1)
+    top_scores = torch.topk(score_list_cat, num_draft_token - 1, dim=-1)
+    top_scores_index = top_scores.indices
+    top_scores_index = torch.sort(top_scores_index).values
+    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
+
+    if len(parents_list) > 1:
+        parent_list = torch.cat(parents_list[:-1], dim=1)
+    else:
+        batch_size = parents_list[0].shape[0]
+        parent_list = torch.empty(
+            batch_size, 0, device=parents_list[0].device, dtype=torch.long
+        )
+
+    return parent_list, top_scores_index, draft_tokens
+
+
+def organize_draft_results_tensor(
+    score_buffer: torch.Tensor,
+    token_buffer: torch.Tensor,
+    parent_buffer: torch.Tensor,
+    num_draft_token: int,
+    topk: int,
+    num_steps: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Organize draft results from pre-allocated tensors (graph-friendly)."""
+
+    # Select top-k across all candidates
+    # score_buffer has shape [BS, num_steps * topk]
+    top_scores = torch.topk(score_buffer, num_draft_token - 1, dim=-1)
+    top_scores_index = top_scores.indices
+
+    # Sort indices for consistent ordering
+    top_scores_index = torch.sort(top_scores_index).values
+
+    # Gather selected tokens
+    draft_tokens = torch.gather(token_buffer, index=top_scores_index, dim=1)
+
+    # Parent list: use all but the last step's parents
+    # SGLang logic: torch.cat(parents_list[:-1], dim=1)
+    # parent_buffer has shape [BS, num_steps * topk]
+    if num_steps > 1:
+        cutoff = (num_steps - 1) * topk
+        parent_list = parent_buffer[:, :cutoff]
+    else:
+        batch_size = parent_buffer.shape[0]
+        parent_list = torch.empty(
+            batch_size, 0, device=parent_buffer.device, dtype=torch.long
+        )
+
+    return parent_list, top_scores_index, draft_tokens
+
+
+# ============================================================================
+# End of ported helper functions
+# ============================================================================
 
 
 class EagleSpeculator:
@@ -81,6 +217,100 @@ class EagleSpeculator:
             device=device,
         )
 
+        if self.method == "dynamic_eagle":
+            self.topk = self.speculative_config.speculative_eagle_topk
+            self.num_draft_tokens = self.speculative_config.speculative_num_draft_tokens
+            # SGLang: num_verify_tokens = num_draft_tokens + 1
+            self.num_verify_tokens = self.num_draft_tokens + 1
+
+            self.dyn_tree_mask = torch.ones(
+                (self.max_num_reqs, self.num_verify_tokens, self.num_verify_tokens),
+                dtype=torch.bool,
+                device=device,
+            )
+            self.dyn_positions = torch.zeros(
+                (self.max_num_reqs * self.num_verify_tokens),
+                dtype=torch.long,
+                device=device,
+            )
+            self.retrive_index = torch.full(
+                (self.max_num_reqs, self.num_verify_tokens),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            self.retrive_next_token = torch.full(
+                (self.max_num_reqs, self.num_verify_tokens),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            self.retrive_next_sibling = torch.full(
+                (self.max_num_reqs, self.num_verify_tokens),
+                -1,
+                dtype=torch.long,
+                device=device,
+            )
+            # draft_tokens_tree: total draft tokens to be verified
+            self.draft_tokens_tree = torch.zeros(
+                (self.max_num_reqs, self.num_verify_tokens),
+                dtype=torch.int64,
+                device=device,
+            )
+
+            self.parent_list_tree = torch.zeros(
+                (self.max_num_reqs, self.topk * (self.num_speculative_steps - 1) + 1),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.selected_index_tree = torch.zeros(
+                (self.max_num_reqs, self.num_verify_tokens - 1),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.verified_seq_len_tree = torch.zeros(
+                self.max_num_reqs, dtype=torch.int64, device=device
+            )
+
+            # Buffers for CUDA graph loop capture
+            total_candidates = self.num_speculative_steps * self.topk
+            self.score_buffer = torch.zeros(
+                (self.max_num_reqs, total_candidates),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.token_buffer = torch.zeros(
+                (self.max_num_reqs, total_candidates),
+                dtype=torch.int64,
+                device=device,
+            )
+            self.parent_buffer = torch.zeros(
+                (self.max_num_reqs, total_candidates),
+                dtype=torch.int64,
+                device=device,
+            )
+
+            # Input buffers for the loop
+            self.draft_input_logits = torch.zeros(
+                (self.max_num_reqs, self.vocab_size),
+                dtype=self.dtype,  # Logits are usually float32? Model output dtype.
+                device=device,
+            )
+            # Hidden states buffer - initial state for loop
+            self.draft_input_hidden_states = torch.zeros(
+                (self.max_num_reqs, self.hidden_size),
+                dtype=self.dtype,
+                device=device,
+            )
+
+            # Intermediate loop states
+            self.loop_scores = torch.zeros(
+                (self.max_num_reqs, self.topk),
+                dtype=torch.float32,
+                device=device,
+            )
+            self.is_dynamic_graph_captured = False
+
         self.cudagraph_manager = EagleCudaGraphManager(vllm_config, device)
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -125,6 +355,7 @@ class EagleSpeculator:
                 input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
                 hidden_states=self.hidden_states[:num_tokens],
+                inputs_embeds=None,
             )
         if self.method == "mtp":
             last_hidden_states = ret_hidden_states
@@ -182,6 +413,233 @@ class EagleSpeculator:
             self.kv_cache_config,
         )
 
+    @torch.no_grad()
+    def _run_dynamic_draft_loop_captured(self):
+        """Internal method designed to be captured into a CUDA graph."""
+        # Use captured input/output buffers directly
+        # self.input_buffers contains: input_ids, positions, hidden_states
+        # self.vllm_config, etc. are static
+
+        print(f"[Dynamic Eagle Graph] Entering captured loop...")
+        num_reqs = self.input_buffers.num_reqs
+        topk = self.topk
+        num_tokens_total = num_reqs * topk
+        # ... rest of the code
+        batch_size = num_tokens_total // topk
+        num_steps = self.num_speculative_steps
+
+        # Initial inputs from buffers
+        logits = self.draft_input_logits[:batch_size]
+        hidden_states = self.draft_input_hidden_states[:batch_size]
+        scores = self.loop_scores[:batch_size]
+
+        # We need the loop state across steps
+        # Initial Step 0 setup
+        probs = torch.softmax(logits, dim=-1)
+        topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+
+        # Loop for num_steps
+        for step in range(num_steps):
+            # Select top-k and prepare next inputs
+            # select_top_k_tokens returns (input_ids, hidden_states, scores, tree_info)
+            # tree_info = (scores, input_ids, parents)
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                step, topk_p, topk_index, hidden_states, scores, topk
+            )
+
+            # Write to buffers
+            start_idx = step * topk
+            end_idx = (step + 1) * topk
+
+            # tree_info[0] is scores [BS, topk]
+            self.score_buffer[:batch_size, start_idx:end_idx] = tree_info[0]
+            # tree_info[1] is input_ids (tokens) [BS, topk]
+            self.token_buffer[:batch_size, start_idx:end_idx] = tree_info[1]
+            # tree_info[2] is parents [BS, topk]
+            self.parent_buffer[:batch_size, start_idx:end_idx] = tree_info[2]
+
+            # Break if last step (we don't need to run model for output of last step)
+            if step == num_steps - 1:
+                break
+
+            # Prepare inputs for next step draft model forward
+            # input_ids from select_top_k_tokens are flattened [BS*topk]?
+            # select_top_k_tokens returns input_ids shape [BS*topk]
+
+            # Update input buffers
+            num_input_tokens = batch_size * topk
+            self.input_buffers.input_ids[:num_input_tokens] = input_ids
+            # Update positions (in-place add works in graph)
+            self.input_buffers.positions[:num_input_tokens].add_(1)
+
+            # Run draft model
+            # Note: We must use set_forward_context logic if not implicit
+            # run_model handles context.
+            last_hidden, hidden_states = self.run_model(
+                num_input_tokens,
+                attn_metadata,
+                num_tokens_across_dp,
+            )
+
+            # Compute logits -> probs -> topk for next step
+            draft_logits = self.model.compute_logits(last_hidden)
+            probs = torch.softmax(draft_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+
+    @torch.inference_mode()
+    def generate_dynamic_tree_draft(
+        self,
+        batch_size: int,
+        logits: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        hidden_states: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: dict[str, Any],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Perform dynamic tree-based draft token generation."""
+        topk = self.topk
+        num_draft_tokens = self.num_draft_tokens
+        num_steps = self.num_speculative_steps
+
+        # Set verified sequence lengths
+        self.verified_seq_len_tree[:batch_size] = seq_lens[:batch_size].to(torch.int64)
+
+        # Check if we can use CUDA graph
+        # Graph key is num_tokens = batch_size * topk
+        graph_key = batch_size * topk
+
+        if (
+            self.cudagraph_manager.cudagraph_mode != CUDAGraphMode.NONE
+            and graph_key in self.cudagraph_manager.graphs
+        ):
+            # USE CUDA GRAPH REPLAY
+            print(f"[Dynamic Eagle] Running captured graph for BS={batch_size}")
+            # 1. Copy inputs to static buffers
+            self.draft_input_logits[:batch_size] = logits
+            self.draft_input_hidden_states[:batch_size] = hidden_states
+
+            # 2. Replay graph
+            self.cudagraph_manager.run(graph_key)
+
+            # 3. Read outputs from buffers and organize
+            # We pass the full buffers; the helper handles slicing based on batch_size
+            parent_list, top_scores_index, organized_draft_tokens = (
+                organize_draft_results_tensor(
+                    self.score_buffer,
+                    self.token_buffer,
+                    self.parent_buffer,
+                    num_draft_tokens,
+                    topk,
+                    num_steps,
+                )
+            )
+
+            # Slice the results for return (organize helper returns full batch slice)
+            parent_list = parent_list[:batch_size]
+            top_scores_index = top_scores_index[:batch_size]
+            organized_draft_tokens = organized_draft_tokens[:batch_size]
+            print(f"[Dynamic Eagle] Captured graph run complete for BS={batch_size}")
+
+        else:
+            # FALLBACK TO PYTHON LOOP (Original implementation)
+            print(f"[Dynamic Eagle] Falling back to Python loop for BS={batch_size}")
+            # Return values - accumulate tree info across steps
+            score_list: List[torch.Tensor] = []
+            token_list: List[torch.Tensor] = []
+            parents_list: List[torch.Tensor] = []
+
+            # Get initial top-k from logits
+            probs = torch.softmax(logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+
+            # For tracking cumulative scores across steps
+            scores = None
+
+            # Forward multiple steps
+            for step in range(num_steps):
+                # Select top-k tokens and update hidden states
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    step, topk_p, topk_index, hidden_states, scores, topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
+
+                # Skip last forward - we only need (num_steps - 1) draft model runs
+                if step == num_steps - 1:
+                    break
+
+                # Prepare inputs for draft model forward
+                num_tokens = input_ids.shape[0]
+                self.input_buffers.input_ids[:num_tokens] = input_ids
+
+                # Update positions for this step
+                self.input_buffers.positions[:num_tokens].add_(1)
+
+                # Run draft model forward
+                last_hidden, hidden_states = self.run_model(
+                    num_tokens,
+                    attn_metadata,
+                    num_tokens_across_dp=None,
+                )
+
+                # Compute logits and get top-k for next step
+                draft_logits = self.model.compute_logits(last_hidden)
+                probs = torch.softmax(draft_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, topk, dim=-1)
+
+            # Organize results with top-k selection across all levels
+            parent_list, top_scores_index, organized_draft_tokens = (
+                organize_draft_results(
+                    score_list, token_list, parents_list, num_draft_tokens
+                )
+            )
+            print(f"[Dynamic Eagle] Python loop run complete for BS={batch_size}")
+
+        # Common output storage
+        self.parent_list_tree[:batch_size, : parent_list.shape[1]] = parent_list
+        self.selected_index_tree[:batch_size, : top_scores_index.shape[1]] = (
+            top_scores_index.to(torch.int64)
+        )
+
+        # Store draft tokens - add root token first
+        self.draft_tokens_tree[:batch_size, 0] = draft_tokens
+        # organized_draft_tokens has shape [batch, num_draft_tokens - 1]
+        self.draft_tokens_tree[:batch_size, 1:num_draft_tokens] = organized_draft_tokens
+
+        return parent_list, top_scores_index, organized_draft_tokens
+
+    def capture_dynamic_draft_graphs(self):
+        """Capture CUDA graphs for the dynamic draft loop."""
+        if self.cudagraph_manager.cudagraph_mode == CUDAGraphMode.NONE:
+            return
+
+        # Iterate over supported batch sizes for decode
+        for batch_size in self.cudagraph_manager.cudagraph_sizes:
+            # We capture for input size = batch_size * topk
+            num_tokens = batch_size * self.topk
+
+            # Avoid re-capturing if already exists (though unlikely)
+            if num_tokens in self.cudagraph_manager.graphs:
+                continue
+
+            try:
+                print(f"[Dynamic Eagle] Capturing graph for BS={batch_size}...")
+                self.cudagraph_manager.capture_graph(
+                    num_tokens,
+                    self._run_dynamic_draft_loop_captured,
+                    self.input_buffers,
+                    self.block_tables,
+                    self.attn_metadata_builders,
+                    self.kv_cache_config,
+                )
+                print(f"[Dynamic Eagle] Graph captured for BS={batch_size}.")
+            except Exception as e:
+                # Fallback safely if capture fails (e.g. memory)
+                print(
+                    f"Warning: Failed to capture dynamic eagle graph for BS={batch_size}: {e}"
+                )
+
     @torch.inference_mode()
     def propose(
         self,
@@ -200,6 +658,16 @@ class EagleSpeculator:
         # [num_reqs]
         next_prefill_tokens: torch.Tensor,
     ) -> torch.Tensor:
+        # Lazy CUDA graph capture for Dynamic Eagle.
+        # Triggered on first propose call, AFTER torch.compile warmup is complete.
+        if self.method == "dynamic_eagle" and not getattr(
+            self, "is_dynamic_graph_captured", False
+        ):
+            print("[Dynamic Eagle] Capturing CUDA Graphs for Draft Loop...")
+            self.capture_dynamic_draft_graphs()
+            self.is_dynamic_graph_captured = True
+            print("[Dynamic Eagle] CUDA Graph Capture Complete.")
+
         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
         # number of rejected tokens, we maintain the size of eagle's input_ids and
         # hidden_states the same as the target model's. This means, we pad each
@@ -246,11 +714,63 @@ class EagleSpeculator:
         temperature = self.temperature[:num_reqs]
         seeds = self.seeds[:num_reqs]
         pos = self.input_buffers.positions[:num_reqs]
-        # Gather the values and copy them to the pre-allocated buffers.
-        torch.gather(sampling_metadata.temperature, 0, cu_num_logits, out=temperature)
-        torch.gather(sampling_metadata.seeds, 0, cu_num_logits, out=seeds)
-        torch.gather(input_batch.positions, 0, last_token_indices, out=pos)
+        if self.method == "dynamic_eagle":
+            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+            # used for draft and target sampling.
+            draft_tokens = gumbel_sample(
+                logits, temperature, seeds, pos + 1, apply_temperature=True
+            )
+            self.draft_tokens[:num_reqs, 0] = draft_tokens
+
+            if self.num_speculative_steps > 1:
+                # Lazy capture if not done yet
+                if (
+                    self.cudagraph_manager.cudagraph_mode != CUDAGraphMode.NONE
+                    and not self.cudagraph_manager.graphs
+                ):
+                    print(
+                        f"[Dynamic Eagle] STARTING capture_dynamic_draft_graphs for method={self.method}"
+                    )
+                    self.capture_dynamic_draft_graphs()
+                    print(f"[Dynamic Eagle] FINISHED capture_dynamic_draft_graphs")
+
+            print(
+                f"[Dynamic Eagle] Calling generate_dynamic_tree_draft for num_reqs={num_reqs}"
+            )
+            # Dynamic tree generation
+            self.generate_dynamic_tree_draft(
+                num_reqs,
+                logits,
+                draft_tokens,
+                sample_hidden_states,
+                input_batch.seq_lens,
+                input_batch.attn_metadata,
+            )
+            print(f"[Dynamic Eagle] generate_dynamic_tree_draft complete")
+
+            # Build tree structure for verification using the ported kernel
+            from vllm._custom_ops import ops
+
+            ops.build_tree_kernel_efficient(
+                self.parent_list_tree,
+                self.selected_index_tree,
+                self.verified_seq_len_tree,
+                self.dyn_tree_mask,
+                self.dyn_positions,
+                self.retrive_index,
+                self.retrive_next_token,
+                self.retrive_next_sibling,
+                self.topk,
+                self.num_speculative_steps,
+                self.num_verify_tokens,
+                0,  # FULL_MASK
+            )
+
+            # Return the draft tokens organized in a tree (flat for now, as expected by v1 worker)
+            return self.draft_tokens_tree[:num_reqs]
+
         # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+
         # used for draft and target sampling.
         draft_tokens = gumbel_sample(
             logits, temperature, seeds, pos + 1, apply_temperature=True

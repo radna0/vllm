@@ -301,7 +301,10 @@ set(VLLM_EXT_SRC
   "csrc/quantization/activation_kernels.cu"
   "csrc/cuda_utils_kernels.cu"
   "csrc/custom_all_reduce.cu"
+  "csrc/speculative/tree_utils.cu"
+  "csrc/speculative/speculative_sampling.cu"
   "csrc/torch_bindings.cpp")
+
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
@@ -921,7 +924,22 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
 # if ROCM endif
 endif()
 
+# Find flashinfer include directory
+execute_process(
+  COMMAND ${Python_EXECUTABLE} -c "import flashinfer; import os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data/include'))"
+  OUTPUT_VARIABLE FLASHINFER_INCLUDE_DIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE FLASHINFER_FOUND_RESULT
+)
+
+if (NOT FLASHINFER_FOUND_RESULT EQUAL 0)
+  message(FATAL_ERROR "flashinfer not found. Please install it with 'pip install flashinfer'.")
+endif()
+
+message(STATUS "flashinfer include directory: ${FLASHINFER_INCLUDE_DIR}")
+
 message(STATUS "Enabling C extension.")
+
 define_extension_target(
   _C
   DESTINATION vllm
@@ -931,6 +949,8 @@ define_extension_target(
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES ${FLASHINFER_INCLUDE_DIR}
+
   USE_SABI 3
   WITH_SOABI)
 

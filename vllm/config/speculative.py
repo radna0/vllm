@@ -38,7 +38,8 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
 ]
-EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
+EagleModelTypes = Literal["eagle", "eagle3", "dynamic_eagle", MTPModelTypes]
+
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -145,6 +146,12 @@ class SpeculativeConfig:
     """The minimum token probability for suffix decoding. Will only speculate
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
+
+    # Dynamic Eagle configuration
+    speculative_eagle_topk: int = 8
+    """The branching factor for dynamic tree search in EAGLE."""
+    speculative_num_draft_tokens: int = 64
+    """The total number of draft tokens in the dynamic tree."""
 
     def compute_hash(self) -> str:
         """
@@ -341,7 +348,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "dynamic_eagle"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -349,6 +356,8 @@ class SpeculativeConfig:
                 # AngelSlim/Qwen3-8B_eagle3
                 elif "eagle-" in self.draft_model_config.model.lower():
                     self.method = "eagle"
+                elif "dynamic-eagle" in self.draft_model_config.model.lower():
+                    self.method = "dynamic_eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
@@ -385,7 +394,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "dynamic_eagle"):
                     from vllm.transformers_utils.configs import SpeculatorsConfig
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
@@ -635,7 +644,7 @@ class SpeculativeConfig:
         return self
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        return self.method in ("eagle", "eagle3", "dynamic_eagle", "mtp")
 
     def __repr__(self) -> str:
         method = self.method

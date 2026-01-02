@@ -22,9 +22,13 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
-    # [num_tokens, vocab_size] - draft probability distributions for rejection sampling
     # If None, rejection sampler uses draft_prob=1 (argmax/greedy behavior)
     draft_probs: torch.Tensor | None = None
+
+    # Dynamic Tree fields
+    retrive_index: torch.Tensor | None = None
+    retrive_next_token: torch.Tensor | None = None
+    retrive_next_sibling: torch.Tensor | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

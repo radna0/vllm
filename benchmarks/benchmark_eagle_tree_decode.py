@@ -93,6 +93,7 @@ def _build_llm(args: argparse.Namespace, speculative_config: dict | None) -> LLM
         attention_config=attention_config,
         gpu_memory_utilization=args.gpu_memory_utilization,
         speculative_config=speculative_config,
+        disable_log_stats=False,
     )
 
 
@@ -267,6 +268,10 @@ def _benchmark(
             total_tokens,
             is_baseline,
         )
+
+    # Print final stats
+    if not is_baseline:
+        llm.llm_engine.do_log_stats()
 
     return tokens_per_s, total_tokens, all_results
 

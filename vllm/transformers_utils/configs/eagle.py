@@ -42,27 +42,29 @@ class EAGLEConfig(PretrainedConfig):
         # LlamaForCausalLM -> Eagle3LlamaForCausalLM
         # LlamaForCausalLMEagle3 -> LlamaForCausalLMEagle3
         if method == "eagle":
-            assert self.model is not None, (
-                "model should not be None when method is eagle"
-            )
+            assert (
+                self.model is not None
+            ), "model should not be None when method is eagle"
             kwargs["architectures"] = [
                 f"Eagle{arch}" if not arch.startswith("Eagle") else arch
                 for arch in self.model.architectures
             ]
 
-        elif method == "eagle3":
-            assert self.model is not None, (
-                "model should not be None when method is eagle3"
-            )
+        elif method in ("eagle3", "dynamic_eagle"):
+            assert (
+                self.model is not None
+            ), f"model should not be None when method is {method}"
             kwargs["architectures"] = [
-                arch
-                if arch.startswith("Eagle3") or arch.endswith("Eagle3")
-                else f"Eagle3{arch}"
+                (
+                    arch
+                    if arch.startswith("Eagle3") or arch.endswith("Eagle3")
+                    else f"Eagle3{arch}"
+                )
                 for arch in self.model.architectures
             ]
         else:
             raise ValueError(
-                f"Invalid method {method}. Supported methods are eagle and eagle3."
+                f"Invalid method {method}. Supported methods are eagle, eagle3 and dynamic_eagle."
             )
 
         super().__init__(**kwargs)

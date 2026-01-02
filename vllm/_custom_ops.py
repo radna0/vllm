@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 
     def register_fake(fn):
         return lambda name: fn
+
 else:
     try:
         from torch.library import register_fake
@@ -1573,9 +1574,10 @@ def scaled_fp4_quant(
     device = input.device
 
     assert n % block_size == 0, f"last dim has to be multiple of 16, but got {n}."
-    assert input.dtype in (torch.float16, torch.bfloat16), (
-        f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
-    )
+    assert input.dtype in (
+        torch.float16,
+        torch.bfloat16,
+    ), f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
 
     # Two fp4 values will be packed into an uint8.
     output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
@@ -1618,9 +1620,9 @@ def scaled_fp4_experts_quant(
         output_scales: The blockscale tensor in FP8-E4M3
     """
     assert not current_platform.is_rocm()
-    assert input_tensor.ndim == 2, (
-        f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
-    )
+    assert (
+        input_tensor.ndim == 2
+    ), f"input.ndim needs to be == 2, but got {input_tensor.ndim}."
 
     # Control the maximum number of tokens per expert supported by the
     # NVFP4 MoE Expert Quantization. This is used to prevent the kernel
@@ -1754,9 +1756,9 @@ def allspark_repack_weight(
     scale_reorder = torch.empty((1, N_32align), device=scale.device, dtype=scale.dtype)
     zero_point_reorder = None
     if has_zp:
-        assert zero_point is not None, (
-            "zero_point must be provided for asymmetric quantization."
-        )
+        assert (
+            zero_point is not None
+        ), "zero_point must be provided for asymmetric quantization."
         zero_point_reorder = torch.empty(
             (1, N_32align), device=zero_point.device, dtype=zero_point.dtype
         )
@@ -1829,9 +1831,9 @@ def scaled_int8_quant(
     output = torch.empty_like(input, dtype=torch.int8)
     if scale is not None:
         # static-per-tensor quantization.
-        assert symmetric == (azp is None), (
-            "azp must only be provided for asymmetric quantization."
-        )
+        assert symmetric == (
+            azp is None
+        ), "azp must only be provided for asymmetric quantization."
         torch.ops._C.static_scaled_int8_quant(output, input, scale, azp)
         return output, scale, azp
 
@@ -2757,9 +2759,9 @@ def onednn_scaled_int8_quant(
     input = input.view((token_num, input.shape[-1]))
     if scale is not None:
         # static-per-tensor quantization.
-        assert symmetric == (azp is None), (
-            "azp must only be provided for asymmetric quantization."
-        )
+        assert symmetric == (
+            azp is None
+        ), "azp must only be provided for asymmetric quantization."
         torch.ops._C.static_scaled_int8_quant(output, input, scale, azp)
         return output, scale, azp
 
@@ -3088,3 +3090,422 @@ if hasattr(torch.ops._C, "hadacore_transform"):
     @register_fake("_C::hadacore_transform")
     def _hadacore_transform_fake(x: torch.Tensor, inplace: bool) -> torch.Tensor:
         return torch.empty_like(x) if not inplace else x
+
+
+# speculative decoding ops
+def _build_tree_kernel_efficient_python(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    max_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode: int,
+) -> None:
+    """Pure Python fallback for build_tree_kernel_efficient CUDA kernel.
+
+    This implements the same logic as the CUDA kernel for environments
+    where the C++ extension cannot be compiled (e.g., Modal patching).
+    """
+    batch_size = verified_seq_len.shape[0]
+    draft_token_num = num_verify_tokens
+    depth = max_steps
+
+    FULL_MASK = 0
+
+    for bid in range(batch_size):
+        seq_len = int(verified_seq_len[bid].item())
+
+        # Calculate tree mask offset
+        if tree_mask_mode == FULL_MASK:
+            seq_tree_idx = draft_token_num * draft_token_num * bid
+            for i in range(bid):
+                seq_tree_idx += int(verified_seq_len[i].item()) * draft_token_num
+        else:
+            seq_tree_idx = draft_token_num * draft_token_num * bid
+
+        for tid in range(draft_token_num):
+            # Calculate token tree index
+            if tree_mask_mode == FULL_MASK:
+                token_tree_idx = (
+                    seq_tree_idx + (seq_len + draft_token_num) * tid + seq_len + 1
+                )
+            else:
+                token_tree_idx = (
+                    draft_token_num * draft_token_num * bid + draft_token_num * tid + 1
+                )
+
+            # Set self-attention mask
+            tree_mask.view(-1)[token_tree_idx - 1] = True
+            for i in range(draft_token_num - 1):
+                if token_tree_idx + i < tree_mask.numel():
+                    tree_mask.view(-1)[token_tree_idx + i] = False
+
+            if tid == 0:
+                # Root token handling
+                positions[bid * draft_token_num] = seq_len
+
+                retrive_index_offset = bid * draft_token_num
+                for i in range(draft_token_num - 1, 0, -1):
+                    current_token_idx = retrive_index_offset + i
+                    retrive_index[bid * draft_token_num + i] = current_token_idx
+
+                    if i - 1 < selected_index.shape[1]:
+                        parent_tb_idx = int(selected_index[bid, i - 1].item()) // topk
+                    else:
+                        parent_tb_idx = 0
+
+                    parent_position = 0
+                    if parent_tb_idx > 0:
+                        if parent_tb_idx < parent_list.shape[1]:
+                            parent_token_idx = int(
+                                parent_list[bid, parent_tb_idx].item()
+                            )
+                        else:
+                            parent_token_idx = 0
+                        for pp in range(draft_token_num):
+                            if pp < selected_index.shape[1]:
+                                if (
+                                    int(selected_index[bid, pp].item())
+                                    == parent_token_idx
+                                ):
+                                    parent_position = pp + 1
+                                    break
+
+                    if parent_position < draft_token_num:
+                        if (
+                            retrive_next_token[bid * draft_token_num + parent_position]
+                            == -1
+                        ):
+                            retrive_next_token[
+                                bid * draft_token_num + parent_position
+                            ] = i
+                        else:
+                            origin_next = int(
+                                retrive_next_token[
+                                    bid * draft_token_num + parent_position
+                                ].item()
+                            )
+                            retrive_next_token[
+                                bid * draft_token_num + parent_position
+                            ] = i
+                            retrive_next_sibling[bid * draft_token_num + i] = (
+                                origin_next
+                            )
+            else:
+                # Non-root token handling
+                if tid - 1 < selected_index.shape[1]:
+                    parent_tb_idx = int(selected_index[bid, tid - 1].item()) // topk
+                else:
+                    parent_tb_idx = 0
+
+                position = 0
+                if parent_tb_idx == 0:
+                    position = 1
+                    if tree_mask_mode == FULL_MASK:
+                        for i in range(seq_len):
+                            idx = seq_tree_idx + (seq_len + draft_token_num) * tid + i
+                            if idx < tree_mask.numel():
+                                tree_mask.view(-1)[idx] = True
+                else:
+                    if parent_tb_idx < parent_list.shape[1]:
+                        parent_token_idx = int(parent_list[bid, parent_tb_idx].item())
+                    else:
+                        parent_token_idx = 0
+
+                    parent_tid = -1
+                    for i in range(draft_token_num - 1):
+                        if i < selected_index.shape[1]:
+                            if int(selected_index[bid, i].item()) == parent_token_idx:
+                                parent_tid = i + 1
+                                break
+
+                    if parent_tid != -1:
+                        position = (
+                            int(positions[bid * draft_token_num + parent_tid].item())
+                            - seq_len
+                            + 1
+                        )
+
+                        if tree_mask_mode == FULL_MASK:
+                            parent_token_tree_idx = (
+                                seq_tree_idx + (seq_len + draft_token_num) * parent_tid
+                            )
+                            for i in range(seq_len + parent_tid + 1):
+                                src_idx = parent_token_tree_idx + i
+                                dst_idx = token_tree_idx + i - 1
+                                if (
+                                    src_idx < tree_mask.numel()
+                                    and dst_idx < tree_mask.numel()
+                                ):
+                                    if tree_mask.view(-1)[src_idx]:
+                                        tree_mask.view(-1)[dst_idx] = True
+                        else:
+                            parent_token_tree_idx = (
+                                draft_token_num * draft_token_num * bid
+                                + draft_token_num * parent_tid
+                            )
+                            for i in range(parent_tid + 1):
+                                src_idx = parent_token_tree_idx + i
+                                dst_idx = token_tree_idx + i - 1
+                                if (
+                                    src_idx < tree_mask.numel()
+                                    and dst_idx < tree_mask.numel()
+                                ):
+                                    if tree_mask.view(-1)[src_idx]:
+                                        tree_mask.view(-1)[dst_idx] = True
+
+                positions[bid * draft_token_num + tid] = position + seq_len
+
+
+def build_tree_kernel_efficient(
+    parent_list: torch.Tensor,
+    selected_index: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    tree_mask: torch.Tensor,
+    positions: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    topk: int,
+    max_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode: int,
+) -> None:
+    # 1. Try vllm_eagle (Standalone Package)
+    try:
+        from vllm_eagle import ops as eagle_ops
+
+        eagle_ops.build_tree_kernel_efficient(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            max_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+        return
+    except (ImportError, AttributeError):
+        pass
+
+    # 2. Try builtin extension (Original vLLM)
+    if hasattr(torch.ops, "_C") and hasattr(
+        torch.ops._C, "build_tree_kernel_efficient"
+    ):
+        torch.ops._C.build_tree_kernel_efficient(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            max_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+    else:
+        # 3. Fallback to Python implementation
+        _build_tree_kernel_efficient_python(
+            parent_list,
+            selected_index,
+            verified_seq_len,
+            tree_mask,
+            positions,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            topk,
+            max_steps,
+            num_verify_tokens,
+            tree_mask_mode,
+        )
+
+
+def reconstruct_indices_from_tree_mask(
+    tree_mask: torch.Tensor,
+    tree_indices: torch.Tensor,
+    tree_len: int,
+) -> None:
+    torch.ops._C.reconstruct_indices_from_tree_mask(
+        tree_mask,
+        tree_indices,
+        tree_len,
+    )
+
+
+def _tree_speculative_sampling_target_only_python(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    deterministic: bool,
+    bonus_token_sampling: bool,
+) -> None:
+    """Pure Python fallback for tree_speculative_sampling_target_only.
+
+    Implements greedy tree verification when C++ kernel is unavailable.
+    """
+    batch_size = candidates.shape[0]
+    num_draft_tokens = candidates.shape[1]
+    vocab_size = target_probs.shape[-1]
+
+    for bid in range(batch_size):
+        accepted_count = 0
+        current_pos = 0  # Start at root
+
+        while current_pos < num_draft_tokens and current_pos >= 0:
+            candidate_token = int(candidates[bid, current_pos].item())
+
+            # Get target probability for this token
+            if current_pos < target_probs.shape[1]:
+                target_prob = target_probs[bid, current_pos, candidate_token].item()
+            else:
+                target_prob = 0.0
+
+            # Acceptance check (greedy/deterministic)
+            if deterministic:
+                # Accept if it's the argmax of target probs
+                if current_pos < target_probs.shape[1]:
+                    argmax_token = target_probs[bid, current_pos].argmax().item()
+                    accept = candidate_token == argmax_token
+                else:
+                    accept = False
+            else:
+                # Probabilistic acceptance
+                if current_pos < draft_probs.shape[1]:
+                    draft_prob = draft_probs[bid, current_pos, candidate_token].item()
+                else:
+                    draft_prob = 1.0 / vocab_size
+
+                if draft_prob > 0:
+                    ratio = target_prob / draft_prob
+                    r = torch.rand(1, device=candidates.device).item()
+                    accept = r < ratio
+                else:
+                    accept = target_prob > 0
+
+            if accept:
+                # Token accepted
+                predicts[bid, accepted_count] = candidate_token
+                accept_index[bid, accepted_count] = int(
+                    retrive_index[bid, current_pos].item()
+                )
+                accepted_count += 1
+
+                # Move to next child
+                if current_pos < num_draft_tokens:
+                    next_token = int(retrive_next_token[bid, current_pos].item())
+                    if next_token >= 0 and next_token < num_draft_tokens:
+                        current_pos = next_token
+                    else:
+                        break
+                else:
+                    break
+            else:
+                # Token rejected - try sibling
+                if current_pos < num_draft_tokens:
+                    sibling = int(retrive_next_sibling[bid, current_pos].item())
+                    if sibling >= 0 and sibling < num_draft_tokens:
+                        current_pos = sibling
+                    else:
+                        break
+                else:
+                    break
+
+        accept_token_num[bid] = accepted_count
+
+        # Sample bonus token if requested and at least one token was accepted
+        if bonus_token_sampling and accepted_count > 0:
+            # Sample from target distribution at the last accepted position
+            last_pos = min(accepted_count - 1, target_probs.shape[1] - 1)
+            if last_pos >= 0:
+                bonus_token = target_probs[bid, last_pos].argmax().item()
+                if accepted_count < num_draft_tokens:
+                    predicts[bid, accepted_count] = bonus_token
+
+
+def tree_speculative_sampling_target_only(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    retrive_next_token: torch.Tensor,
+    retrive_next_sibling: torch.Tensor,
+    target_probs: torch.Tensor,
+    draft_probs: torch.Tensor,
+    deterministic: bool,
+    bonus_token_sampling: bool,
+) -> None:
+    # 1. Try vllm_eagle (Standalone Package)
+    try:
+        from vllm_eagle import ops as eagle_ops
+
+        eagle_ops.tree_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_probs,
+            draft_probs,
+            deterministic,
+            bonus_token_sampling,
+        )
+        return
+    except (ImportError, AttributeError):
+        pass
+
+    # 2. Try builtin extension
+    if hasattr(torch.ops, "_C") and hasattr(
+        torch.ops._C, "tree_speculative_sampling_target_only"
+    ):
+        torch.ops._C.tree_speculative_sampling_target_only(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_probs,
+            draft_probs,
+            deterministic,
+            bonus_token_sampling,
+        )
+    else:
+        # 3. Fallback to Python
+        _tree_speculative_sampling_target_only_python(
+            predicts,
+            accept_index,
+            accept_token_num,
+            candidates,
+            retrive_index,
+            retrive_next_token,
+            retrive_next_sibling,
+            target_probs,
+            draft_probs,
+            deterministic,
+            bonus_token_sampling,
+        )

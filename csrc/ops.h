@@ -396,3 +396,25 @@ void qr_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                    int64_t quant_level, bool cast_bf2half = false);
 int64_t qr_max_size();
 #endif
+void build_tree_kernel_efficient(
+    torch::Tensor parent_list, torch::Tensor selected_index,
+    torch::Tensor verified_seq_len, torch::Tensor tree_mask,
+    torch::Tensor positions, torch::Tensor retrive_index,
+    torch::Tensor retrive_next_token, torch::Tensor retrive_next_sibling,
+    int64_t topk, int64_t depth, int64_t draft_token_num,
+    int64_t tree_mask_mode);
+
+void reconstruct_indices_from_tree_mask(
+    torch::Tensor tree_mask, torch::Tensor verified_seq_len,
+    torch::Tensor positions, torch::Tensor retrive_index,
+    torch::Tensor retrive_next_token, torch::Tensor retrive_next_sibling,
+    int64_t batch_size, int64_t draft_token_num);
+
+void tree_speculative_sampling_target_only(
+    torch::Tensor predicts, torch::Tensor accept_index,
+    torch::Tensor accept_token_num, torch::Tensor candidates,
+    torch::Tensor retrive_index, torch::Tensor retrive_next_token,
+    torch::Tensor retrive_next_sibling, torch::Tensor uniform_samples,
+    torch::Tensor uniform_samples_for_final_sampling,
+    torch::Tensor target_probs, torch::Tensor draft_probs,
+    double threshold_single, double threshold_acc, bool deterministic);

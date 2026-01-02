@@ -676,7 +676,36 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "CUBLAS_M_THRESHOLD, bool has_zp, bool n32k16_reorder) -> Tensor");
   //  conditionally compiled so impl in source file
 #endif
+  // Speculative decoding ops
+  ops.def(
+      "build_tree_kernel_efficient(Tensor parent_list, Tensor selected_index, "
+      "Tensor verified_seq_len, Tensor! tree_mask, Tensor! positions, "
+      "Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int topk, int depth, "
+      "int draft_token_num, int tree_mask_mode) -> ()");
+  ops.impl("build_tree_kernel_efficient", torch::kCUDA,
+           &build_tree_kernel_efficient);
+
+  ops.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, "
+      "Tensor verified_seq_len, Tensor! positions, Tensor! retrive_index, "
+      "Tensor! retrive_next_token, Tensor! retrive_next_sibling, "
+      "int batch_size, int draft_token_num) -> ()");
+  ops.impl("reconstruct_indices_from_tree_mask", torch::kCUDA,
+           &reconstruct_indices_from_tree_mask);
+
+  ops.def(
+      "tree_speculative_sampling_target_only(Tensor! predicts, "
+      "Tensor! accept_index, Tensor! accept_token_num, Tensor candidates, "
+      "Tensor retrive_index, Tensor retrive_next_token, "
+      "Tensor retrive_next_sibling, Tensor uniform_samples, "
+      "Tensor uniform_samples_for_final_sampling, Tensor target_probs, "
+      "Tensor! draft_probs, float threshold_single, float threshold_acc, "
+      "bool deterministic) -> ()");
+  ops.impl("tree_speculative_sampling_target_only", torch::kCUDA,
+           &tree_speculative_sampling_target_only);
 }
+
 
 TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   // Cache ops
