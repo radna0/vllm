@@ -6,8 +6,8 @@ This guide provides complete instructions for benchmarking EAGLE Phase 2 optimiz
 
 The EAGLE Phase 2 code is split across two repositories:
 
-1. **vllm-drift**: Modified vLLM with EAGLE Phase 2 integration
-   - Repository: `https://github.com/radna0/vllm-drift`
+1. **vllm (drift branch)**: Modified vLLM with EAGLE Phase 2 integration
+   - Repository: `https://github.com/radna0/vllm` (branch: `drift`)
    - Contains: Phase 2 kernel integration in `vllm/v1/spec_decode/eagle.py`
 
 2. **vllm_eagle**: Custom CUDA kernels for H100
@@ -38,7 +38,7 @@ The EAGLE Phase 2 code is split across two repositories:
 
 ```python
 # Clone EAGLE Phase 2 repositories
-! git clone https://github.com/radna0/vllm-drift.git /kaggle/working/vllm-drift
+! git clone -b drift https://github.com/radna0/vllm.git /kaggle/working/vllm-drift
 ! git clone https://github.com/radna0/vllm_eagle.git /kaggle/working/vllm_eagle
 
 # Verify cloning
@@ -107,13 +107,13 @@ export TOKENIZERS_PARALLELISM=false
 ```python
 # Download the benchmark script and reference data
 ! wget -O /kaggle/working/kaggle_benchmark_86e8e5.py \
-    https://raw.githubusercontent.com/radna0/vllm-drift/main/kaggle_benchmark_86e8e5.py
+    https://raw.githubusercontent.com/radna0/vllm/drift/kaggle_benchmark_86e8e5.py
 
 ! wget -O /kaggle/working/local_python_tool.py \
-    https://raw.githubusercontent.com/radna0/vllm-drift/main/local_python_tool.py
+    https://raw.githubusercontent.com/radna0/vllm/drift/local_python_tool.py
 
 ! wget -O /kaggle/working/reference.csv \
-    https://raw.githubusercontent.com/radna0/vllm-drift/main/reference.csv
+    https://raw.githubusercontent.com/radna0/vllm/drift/reference.csv
 
 print("✓ Benchmark files downloaded")
 ```
