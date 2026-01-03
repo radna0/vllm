@@ -34,53 +34,66 @@ The EAGLE Phase 2 code is split across two repositories:
     --extra-index-url https://flashinfer.ai/whl/cu128
 ```
 
-### Cell 2: Clone Repositories
+### Cell 2: Clone Repository
 
 ```python
-# Clone EAGLE Phase 2 repositories
+# Clone EAGLE Phase 2 repository (everything is now in vllm-drift)
 ! git clone -b drift https://github.com/radna0/vllm.git /kaggle/working/vllm-drift
-! git clone https://github.com/radna0/vllm_eagle.git /kaggle/working/vllm_eagle
 
 # Verify cloning
 import os
 print("✓ vllm-drift cloned" if os.path.exists("/kaggle/working/vllm-drift") else "✗ vllm-drift missing")
-print("✓ vllm_eagle cloned" if os.path.exists("/kaggle/working/vllm_eagle") else "✗ vllm_eagle missing")
 ```
 
 ### Cell 3: Patch vLLM and Build Custom Kernels
 
 ```python
 import os
-import subprocess
+import sys
 
-# Inject Phase 2 logic from vllm-drift into installed vLLM
-VLLM_PATH = "/kaggle/working/vllm"
-DRIFT_SRC = "/kaggle/working/vllm-drift/vllm"
+# 1. Add working directory to Python path FIRST
+sys.path.insert(0, "/kaggle/working")
 
-if os.path.exists(DRIFT_SRC):
-    ! cp -rv {DRIFT_SRC}/* {VLLM_PATH}/
-    ! find {VLLM_PATH} -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
-    print("✓ vLLM successfully patched with Phase 2 logic")
-else:
-    print("✗ Error: vllm-drift source not found")
+# 2. Hot-patch vLLM with Phase 2 logic
+%cd /kaggle/working/vllm-drift
+! bash PLUGINS/inject.sh /kaggle/working/vllm
 
-# Build vllm_eagle custom kernels for H100
-%cd /kaggle/working/vllm_eagle
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"  # H100 architecture
-os.environ["MAX_JOBS"] = "1"
+# 3. Build and Install Phase 2 Custom Kernels (Kaggle Optimized)
+! bash PLUGINS/install_kaggle.sh
 
-! pip install . --no-build-isolation --target=/kaggle/working
+# 4. CRITICAL: Force-load PyTorch libraries (The "Nuclear Option")
+# This ensures the newly built .so files can find their dependencies
+import torch
+import ctypes
+torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
+try:
+    ctypes.CDLL(os.path.join(torch_lib_path, "libc10.so"), mode=ctypes.RTLD_GLOBAL)
+    ctypes.CDLL(os.path.join(torch_lib_path, "libtorch_cpu.so"), mode=ctypes.RTLD_GLOBAL)
+    ctypes.CDLL(os.path.join(torch_lib_path, "libtorch_cuda.so"), mode=ctypes.RTLD_GLOBAL)
+    ctypes.CDLL(os.path.join(torch_lib_path, "libtorch_python.so"), mode=ctypes.RTLD_GLOBAL)
+    print("✓ PyTorch libraries force-loaded")
+except Exception as e:
+    print(f"⚠️  PyTorch library pre-load warning: {e}")
+
 %cd /kaggle/working
 
-# CRITICAL: Verify vllm_eagle built successfully
+# 5. FINAL VERIFICATION
+print("\n" + "="*80)
+print("VERIFYING PHASE 2 KERNEL AVAILABILITY")
+print("="*80)
+
 try:
-    import vllm_eagle
-    from vllm_eagle import ops as eagle_ops
-    print("✓ vllm_eagle kernels built for H100")
-    print(f"✓ vllm_eagle ops available: {dir(eagle_ops)}")
-except ImportError as e:
-    print(f"✗ ERROR: vllm_eagle import failed: {e}")
-    print("⚠️  Phase 2 will fall back to slower PyTorch implementation")
+    import vllm_eagle._C as C
+    print("✓ vllm_eagle._C imported successfully!")
+    funcs = [f for f in dir(C) if not f.startswith('_')]
+    print(f"✓ Available ops: {funcs}")
+    
+    if 'fused_gumbel_sample_warp_optimized' in funcs:
+        print("🚀 SUCCESS: Phase 2 Kernels are LIVE!")
+    else:
+        print("⚠️  Warning: Package imported but Phase 2 symbols missing.")
+except Exception as e:
+    print(f"✗ ERROR: Import failed: {e}")
 ```
 
 ### Cell 4: Tokenizer Setup
