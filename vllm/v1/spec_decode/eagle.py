@@ -198,11 +198,42 @@ def _apply_sampling_filters_logits(
     if eagle_ops is not None:
         eagle_ops.apply_logit_filters(logits, top_k, top_p, min_p)
     else:
-        # Fallback to PyTorch vectorized (less efficient but works)
-        # This fallback is only for robustness if vllm_eagle isn't built
-        max_logit = logits.max(dim=-1, keepdim=True).values
-        threshold = max_logit + torch.log(min_p.unsqueeze(-1) + 1e-10)
-        logits.masked_fill_(logits < threshold, -10000.0)
+        # Complete PyTorch fallback: Apply all filters (top_k, min_p, top_p)
+        # This is slower than the CUDA kernel but ensures correctness
+        batch_size, vocab_size = logits.shape
+
+        # Apply top-k filtering
+        if (top_k > 0).any():
+            for i in range(batch_size):
+                k = top_k[i].item()
+                if 0 < k < vocab_size:
+                    topk_vals, _ = torch.topk(logits[i], k)
+                    threshold = topk_vals[-1]
+                    logits[i].masked_fill_(logits[i] < threshold, -10000.0)
+
+        # Apply min-p filtering
+        if (min_p > 0).any():
+            max_logit = logits.max(dim=-1, keepdim=True).values
+            threshold = max_logit + torch.log(min_p.unsqueeze(-1) + 1e-10)
+            logits.masked_fill_(logits < threshold, -10000.0)
+
+        # Apply top-p filtering (nucleus sampling)
+        if (top_p < 1.0).any():
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+            probs = torch.softmax(sorted_logits, dim=-1)
+            cumsum_probs = torch.cumsum(probs, dim=-1)
+
+            for i in range(batch_size):
+                p = top_p[i].item()
+                if p < 1.0:
+                    # Find cutoff index where cumulative prob exceeds top_p
+                    cutoff_mask = cumsum_probs[i] > p
+                    cutoff_idx = cutoff_mask.nonzero(as_tuple=True)[0]
+                    if len(cutoff_idx) > 0:
+                        cutoff = cutoff_idx[0].item() + 1
+                        # Mask out tokens beyond cutoff
+                        mask_indices = sorted_indices[i, cutoff:]
+                        logits[i, mask_indices] = -10000.0
 
     return logits
 
