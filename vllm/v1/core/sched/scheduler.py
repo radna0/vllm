@@ -2101,6 +2101,8 @@ class Scheduler(SchedulerInterface):
             "__builtins__": __builtins__,
             "math": __import__("math"),
             "sympy": __import__("sympy"),
+            "np": __import__("numpy"),
+            "numpy": __import__("numpy"),
             "itertools": __import__("itertools"),
             "functools": __import__("functools"),
             "collections": __import__("collections"),
