@@ -201,7 +201,7 @@ def _apply_sampling_filters_logits(
         # Fallback to PyTorch vectorized (less efficient but works)
         # This fallback is only for robustness if vllm_eagle isn't built
         max_logit = logits.max(dim=-1, keepdim=True).values
-        threshold = max_logit + torch.log(min_p + 1e-10)
+        threshold = max_logit + torch.log(min_p.unsqueeze(-1) + 1e-10)
         logits.masked_fill_(logits < threshold, -10000.0)
 
     return logits
