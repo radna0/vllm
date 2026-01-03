@@ -11,23 +11,37 @@ import subprocess
 import threading
 import queue
 import pandas as pd
+import json
+
+
+# ==============================================================================
+# LOGGING SETUP
+# ==============================================================================
+class TeeLogger:
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+
+# Redirect stdout and stderr to benchmark_log.txt
+LOG_FILE = "/kaggle/working/benchmark_log.txt"
+sys.stdout = TeeLogger(LOG_FILE)
+sys.stderr = sys.stdout
 
 # Add working directory to path
 sys.path.append("/kaggle/working")
-
-# Environment Configuration
-os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["TRANSFORMERS_NO_FLAX"] = "1"
-os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda/bin/ptxas"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["TIKTOKEN_ENCODINGS_BASE"] = "/kaggle/working/tiktoken_encodings"
-
-# ---------------------------------------------------------
-# BENCHMARK TOGGLE: Set to "1" for Phase 2 Optimizations
-# ---------------------------------------------------------
-os.environ["VLLM_EAGLE_PHASE2_FUSED"] = "1"  # Change to "0" for baseline
-os.environ["VLLM_EAGLE_DRAFT_SAMPLING"] = "1"
 
 # Benchmark Parameters
 SEED = 42
@@ -40,8 +54,8 @@ STREAM_INTERVAL = 200
 TARGET_PROBLEM_ID = "86e8e5"
 
 # Model paths (adjust to your Kaggle input paths)
-MODEL_PATH = "/kaggle/input/gpt-oss-120b"
-DRAFT_MODEL_PATH = "/kaggle/input/gpt-oss-120b-eagle-long-context"
+MODEL_PATH = "/kaggle/input/gpt-oss-120b/transformers/default/1"
+DRAFT_MODEL_PATH = "/kaggle/input/gpt/transformers/gpt-oss-120b-eagle3/1"
 
 print(f"{'='*80}")
 print(f"EAGLE Phase 2 Benchmark - Problem {TARGET_PROBLEM_ID}")
@@ -68,7 +82,7 @@ def start_vllm_server():
         "--max-cudagraph-capture-size",
         "2048",
         "--speculative-config",
-        f'{{"model":"{DRAFT_MODEL_PATH}","num_speculative_tokens":3,"method":"eagle3","draft_tensor_parallel_size":1}}',
+        f'{{"model":"{DRAFT_MODEL_PATH}","num_speculative_tokens":6,"method":"eagle3","draft_tensor_parallel_size":1}}',
         "--host",
         "0.0.0.0",
         "--port",
@@ -93,6 +107,7 @@ def start_vllm_server():
 
     def stream_output():
         for line in vllm_proc.stdout:
+            # This print will go to the TeeLogger
             print(f"[vLLM] {line}", end="", flush=True)
 
     threading.Thread(target=stream_output, daemon=True).start()
@@ -141,7 +156,9 @@ def run_benchmark():
         return
 
     # Load problem
-    df = pd.read_csv("/kaggle/working/reference.csv")
+    df = pd.read_csv(
+        "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv"
+    )
     problem_row = df[df["id"] == TARGET_PROBLEM_ID].iloc[0]
     problem_text = problem_row["problem"]
     ground_truth = problem_row["answer"]
@@ -270,6 +287,48 @@ def run_benchmark():
     print(f"Avg Tokens/Sample: {avg_tokens:.1f}")
     print(f"Global Decode Throughput: {global_tps:.2f} tok/s")
     print(f"{'='*80}\n")
+
+    # ==============================================================================
+    # DUMP FULL OUTPUTS TO JSON
+    # ==============================================================================
+    results_dump = []
+    for i, res in enumerate(parallel_results):
+        if res[0] is not None:
+            # Convert Harmony messages to serializable dicts
+            convo = []
+            for msg in res[0]:
+                content_list = []
+                for c in msg.content:
+                    if hasattr(c, "text"):
+                        content_list.append({"type": "text", "text": c.text})
+                    else:
+                        content_list.append({"type": "other", "repr": repr(c)})
+
+                convo.append(
+                    {
+                        "role": str(msg.author.role),
+                        "name": msg.author.name,
+                        "recipient": msg.recipient,
+                        "content": content_list,
+                    }
+                )
+
+            results_dump.append(
+                {
+                    "sample_id": i,
+                    "total_time": res[1],
+                    "tool_wait": res[2],
+                    "tokens": res[3],
+                    "conversation": convo,
+                }
+            )
+
+    output_json = f"/kaggle/working/results_{TARGET_PROBLEM_ID}_{int(time.time())}.json"
+    with open(output_json, "w") as f:
+        json.dump(results_dump, f, indent=2)
+
+    print(f"✓ Full conversation results dumped to: {output_json}")
+    print(f"✓ Console log saved to: {LOG_FILE}")
 
     # Cleanup
     os.killpg(os.getpgid(vllm_proc.pid), 9)
