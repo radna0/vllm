@@ -59,7 +59,7 @@ DRIFT_SRC = "/kaggle/working/vllm-drift/vllm"
 
 if os.path.exists(DRIFT_SRC):
     ! cp -rv {DRIFT_SRC}/* {VLLM_PATH}/
-    ! find {VLLM_PATH} -type d -name '__pycache__' -exec rm -rf {{}} + 2>/dev/null || true
+    ! find {VLLM_PATH} -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
     print("✓ vLLM successfully patched with Phase 2 logic")
 else:
     print("✗ Error: vllm-drift source not found")
@@ -71,7 +71,16 @@ os.environ["MAX_JOBS"] = "1"
 
 ! pip install . --no-build-isolation --target=/kaggle/working
 %cd /kaggle/working
-print("✓ vllm_eagle kernels built for H100")
+
+# CRITICAL: Verify vllm_eagle built successfully
+try:
+    import vllm_eagle
+    from vllm_eagle import ops as eagle_ops
+    print("✓ vllm_eagle kernels built for H100")
+    print(f"✓ vllm_eagle ops available: {dir(eagle_ops)}")
+except ImportError as e:
+    print(f"✗ ERROR: vllm_eagle import failed: {e}")
+    print("⚠️  Phase 2 will fall back to slower PyTorch implementation")
 ```
 
 ### Cell 4: Tokenizer Setup
