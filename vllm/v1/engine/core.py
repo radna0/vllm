@@ -48,6 +48,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     EngineCoreRequestType,
     FinishReason,
+    InterruptRequest,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
@@ -311,6 +312,15 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
+
+    def inject_interrupt(self, request: InterruptRequest) -> None:
+        """Inject asynchronous tool result into a request."""
+        self.scheduler.interrupt_manager.enqueue_interrupt(
+            request_id=request.request_id,
+            call_id=request.call_id,
+            payload=request.content,
+            status=request.status,
+        )
 
     def abort_requests(self, request_ids: list[str]):
         """Abort requests from the scheduler."""
@@ -955,6 +965,8 @@ class EngineCoreProc(EngineCore):
             self.add_request(req, request_wave)
         elif request_type == EngineCoreRequestType.ABORT:
             self.abort_requests(request)
+        elif request_type == EngineCoreRequestType.INTERRUPT:
+            self.inject_interrupt(request)
         elif request_type == EngineCoreRequestType.UTILITY:
             client_idx, call_id, method_name, args = request
             output = UtilityOutput(call_id)
@@ -986,11 +998,13 @@ class EngineCoreProc(EngineCore):
         arg_types = signature(method).parameters.values()
         assert len(args) <= len(arg_types)
         return tuple(
-            msgspec.convert(v, type=p.annotation)
-            if isclass(p.annotation)
-            and issubclass(p.annotation, msgspec.Struct)
-            and not isinstance(v, p.annotation)
-            else v
+            (
+                msgspec.convert(v, type=p.annotation)
+                if isclass(p.annotation)
+                and issubclass(p.annotation, msgspec.Struct)
+                and not isinstance(v, p.annotation)
+                else v
+            )
             for v, p in zip(args, arg_types)
         )
 
@@ -1076,6 +1090,10 @@ class EngineCoreProc(EngineCore):
                         except Exception:
                             self._handle_request_preproc_error(req)
                             continue
+                    elif request_type == EngineCoreRequestType.INTERRUPT:
+                        request = msgspec.msgpack.decode(
+                            data_frames[0].buffer, type=InterruptRequest
+                        )
                     else:
                         request = generic_decoder.decode(data_frames)
 

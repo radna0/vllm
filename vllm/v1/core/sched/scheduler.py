@@ -110,9 +110,9 @@ class Scheduler(SchedulerInterface):
         self.connector_prefix_cache_stats: PrefixCacheStats | None = None
         self.recompute_kv_load_failures = True
         if self.vllm_config.kv_transfer_config is not None:
-            assert not self.is_encoder_decoder, (
-                "Encoder-decoder models are not currently supported with KV connectors"
-            )
+            assert (
+                not self.is_encoder_decoder
+            ), "Encoder-decoder models are not currently supported with KV connectors"
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config,
                 role=KVConnectorRole.SCHEDULER,
@@ -224,7 +224,49 @@ class Scheduler(SchedulerInterface):
         if self.log_stats and vllm_config.observability_config.enable_mfu_metrics:
             self.perf_metrics = ModelMetrics(vllm_config)
 
+        # Async tool calling components
+        self.async_tool_calling = vllm_config.scheduler_config.async_tool_calling
+        self.token_monitor = None
+        self.interrupt_manager = None
+        self.trap_handler = None
+
+        self.heartbeat_count = 0
+
+        if self.async_tool_calling:
+            from vllm.v1.core.async_tools import (
+                HarmonyTokenMonitor,
+                InterruptManager,
+                TrapHandler,
+            )
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.token_monitor = HarmonyTokenMonitor()
+            self.interrupt_manager = InterruptManager(self)
+            self.trap_handler = TrapHandler()
+
+            # Thread pool for async tool execution
+            self.tool_executor = ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="tool_exec"
+            )
+
+            # Persistent state for tool execution: request_id -> {"globals": {}, "locals": {}}
+            self.tool_exec_states = defaultdict(lambda: {"globals": {}, "locals": {}})
+            self.active_tools = {}  # request_id -> {call_id -> Future}
+
+            # Initialize tokenizer once for async tool calling
+            from vllm.transformers_utils.tokenizer import get_tokenizer
+
+            self.tokenizer = get_tokenizer(
+                vllm_config.model_config.tokenizer,
+                trust_remote_code=vllm_config.model_config.tokenizer_mode == "auto",
+            )
+
     def schedule(self) -> SchedulerOutput:
+        self.heartbeat_count += 1
+        if (self.waiting or self.running) and self.heartbeat_count % 1000 == 0:
+            print(
+                f"[Heartbeat] schedule() | Waiting: {len(self.waiting)} | Running: {len(self.running)}"
+            )
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -252,6 +294,44 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+
+        # Async tool calling: Check for interruptible requests with pending interrupts
+        # and inject them via APPEND_PREFILL
+        for request in list(self.running):
+            if (
+                self.async_tool_calling
+                and request.async_tool_state
+                and self.token_monitor.should_inject_interrupts(
+                    request.async_tool_state
+                )
+            ):
+
+                try:
+                    # Inject interrupts
+                    interrupt_tokens = self.interrupt_manager.inject_interrupts(
+                        request, self.tokenizer
+                    )
+
+                    if interrupt_tokens:
+                        print(
+                            f"[DEBUG] Scheduler: Injecting {len(interrupt_tokens)} interrupt tokens for {request.request_id}"
+                        )
+                        # Append tokens to request's prompt
+                        if request.prompt_token_ids is not None:
+                            request.prompt_token_ids.extend(interrupt_tokens)
+                        request._all_token_ids.extend(interrupt_tokens)
+
+                        # Mark as APPEND_PREFILL to trigger KV cache update
+                        request.status = RequestStatus.APPEND_PREFILL
+                        request.num_computed_tokens = len(request._all_token_ids) - len(
+                            interrupt_tokens
+                        )
+
+                        print(
+                            f"[Scheduler] Injected {len(interrupt_tokens)} interrupt tokens for request {request.request_id}"
+                        )
+                except Exception as e:
+                    print(f"[Scheduler] Warning: Failed to inject interrupts: {e}")
 
         # First, schedule the RUNNING requests.
         req_index = 0
@@ -596,8 +676,17 @@ class Scheduler(SchedulerInterface):
                 )
 
                 if new_blocks is None:
+                    if self.heartbeat_count % 1000 == 0:
+                        print(
+                            f"[Heartbeat] Request {request.request_id} allocation FAILED | tokens: {num_new_tokens + num_external_computed_tokens}"
+                        )
                     # The request cannot be scheduled.
                     break
+                else:
+                    if self.heartbeat_count % 1000 == 0:
+                        print(
+                            f"[Heartbeat] Request {request.request_id} allocation SUCCESS"
+                        )
 
                 # KVTransfer: the connector uses this info to determine
                 # if a load is needed. Note that
@@ -771,9 +860,9 @@ class Scheduler(SchedulerInterface):
         NOTE: The request should be popped from the running queue outside of this
         method.
         """
-        assert request.status == RequestStatus.RUNNING, (
-            "Only running requests can be preempted"
-        )
+        assert (
+            request.status == RequestStatus.RUNNING
+        ), "Only running requests can be preempted"
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1149,6 +1238,151 @@ class Scheduler(SchedulerInterface):
 
             # Check for stop and update request status.
             if new_token_ids:
+                # Async tool calling: Process tokens through CML monitor
+                # We do this BEFORE filtering so the monitor sees all tokens,
+                # and internal-only tokens identified in this batch are filtered out.
+                visible_new_token_ids = list(new_token_ids)
+                first_visible_start_index = request.num_output_tokens
+
+                if request.async_tool_state:
+                    try:
+                        start_idx_in_sequence = request.num_output_tokens
+                        for i, token_id in enumerate(new_token_ids):
+                            token_text = self.tokenizer.decode([token_id])
+                            token_index = start_idx_in_sequence + i
+
+                            # Process token through monitor
+                            if self.async_tool_calling:
+                                events, is_internal = self.token_monitor.process_token(
+                                    token_id,
+                                    token_text,
+                                    token_index,
+                                    request.async_tool_state,
+                                )
+                            else:
+                                events, is_internal = [], False
+
+                            if is_internal:
+                                if not request.async_tool_state.harmony_buffer:
+                                    request.async_tool_state.harmony_buffer_start_index = (
+                                        token_index
+                                    )
+                                request.async_tool_state.harmony_buffer.append(token_id)
+                            else:
+                                # Flush buffer if not already flushed
+                                if request.async_tool_state.harmony_buffer:
+                                    if not visible_new_token_ids:
+                                        first_visible_start_index = (
+                                            request.async_tool_state.harmony_buffer_start_index
+                                        )
+                                    visible_new_token_ids.extend(
+                                        request.async_tool_state.harmony_buffer
+                                    )
+                                    request.async_tool_state.harmony_buffer = []
+                                    request.async_tool_state.harmony_buffer_start_index = (
+                                        None
+                                    )
+
+                                if not visible_new_token_ids:
+                                    first_visible_start_index = token_index
+                                visible_new_token_ids.append(token_id)
+
+                            # If monitor flagged a drop, clear buffer and current token
+                            if request.async_tool_state.harmony_should_drop_buffer:
+                                request.async_tool_state.harmony_buffer = []
+                                request.async_tool_state.harmony_buffer_start_index = (
+                                    None
+                                )
+                                # Remove current token if it was just added to visible_new_token_ids
+                                # (Though usually it was just added to the buffer)
+                                if (
+                                    visible_new_token_ids
+                                    and visible_new_token_ids[-1] == token_id
+                                ):
+                                    visible_new_token_ids.pop()
+                                request.async_tool_state.harmony_should_drop_buffer = (
+                                    False
+                                )
+
+                            if events:
+                                req_id = request.request_id
+                                try:
+                                    for event in events:
+                                        if event.type == "on_call_complete":
+                                            assert event.call_id is not None
+                                            assert event.call_body is not None
+
+                                            # Spawn background thread to execute tool
+                                            print(
+                                                f"[Scheduler] Spawning background thread for tool {event.call_id}"
+                                            )
+                                            future = self.tool_executor.submit(
+                                                self._execute_tool_async,
+                                                req_id,
+                                                event.call_id,
+                                                event.call_body,
+                                            )
+
+                                            # Track active tool
+                                            if req_id not in self.active_tools:
+                                                self.active_tools[req_id] = {}
+                                            self.active_tools[req_id][
+                                                event.call_id
+                                            ] = future
+
+                                            # Register callback for when tool completes
+                                            future.add_done_callback(
+                                                lambda f, rid=req_id, cid=event.call_id: self._on_tool_complete(
+                                                    rid, cid, f
+                                                )
+                                            )
+
+                                            # Record event
+                                            request.record_event(
+                                                EngineCoreEventType.TOOL_CALL,
+                                                metadata={
+                                                    "call_id": event.call_id,
+                                                    "call_body": event.call_body,
+                                                },
+                                            )
+                                        elif event.type == "on_trap":
+                                            # Pause request and wait for results
+                                            print(
+                                                f"[Scheduler] Trap detected for {req_id}, pausing..."
+                                            )
+                                            request.status = RequestStatus.WAIT_TRAP
+                                            if request.async_tool_state:
+                                                request.async_tool_state.trap_seen = (
+                                                    True
+                                                )
+                                            if self.trap_handler:
+                                                self.trap_handler.on_trap_detected(
+                                                    request, self.kv_cache_manager
+                                                )
+                                        elif event.type == "set_interruptible":
+                                            # Currently ignored, scheduler handles it
+                                            if request.async_tool_state:
+                                                request.async_tool_state.in_critical_section = (
+                                                    not event.interruptible
+                                                )
+                                except Exception as e:
+                                    import traceback
+
+                                    print(
+                                        f"[Scheduler-Error] Event processing failed for {req_id}: {e}"
+                                    )
+                                    traceback.print_exc()
+
+                        # NOTE: We no longer filter tokens here. All tokens pass through.
+                        # Filtering happens at API response level using harmony_filtered_token_indices.
+                    except Exception as e:
+                        import traceback
+
+                        print(
+                            f"[Scheduler-Error] Tool Monitor failed for {request.request_id}: {e}"
+                        )
+                        traceback.print_exc()
+
                 new_token_ids, stopped = self._update_request_with_output(
                     request, new_token_ids
                 )
@@ -1185,25 +1419,48 @@ class Scheduler(SchedulerInterface):
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
-                outputs[request.client_index].append(
-                    EngineCoreOutput(
-                        request_id=req_id,
-                        new_token_ids=new_token_ids,
-                        finish_reason=request.get_finished_reason(),
-                        new_logprobs=new_logprobs,
-                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
-                        stop_reason=request.stop_reason,
-                        events=request.take_events(),
-                        kv_transfer_params=kv_transfer_params,
-                        trace_headers=request.trace_headers,
-                        num_cached_tokens=request.num_cached_tokens,
-                        num_nans_in_logits=request.num_nans_in_logits,
+
+                # Filter harmony_filtered_token_indices for currently visible tokens
+                current_filtered_indices = None
+                if request.async_tool_state:
+                    all_filtered = (
+                        request.async_tool_state.harmony_filtered_token_indices
                     )
-                )
-            else:
-                # Invariant: EngineCore returns no partial prefill outputs.
-                assert not prompt_logprobs_tensors
+                    current_filtered_indices = [
+                        first_visible_start_index + idx
+                        for idx, token_id in enumerate(visible_new_token_ids)
+                        if (first_visible_start_index + idx) in all_filtered
+                    ]
+
+                finish_reason = request.get_finished_reason()
+                if (
+                    visible_new_token_ids
+                    or pooler_output is not None
+                    or kv_transfer_params
+                    or finish_reason is not None
+                ):
+                    # Add EngineCoreOutput for this Request.
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=req_id,
+                            new_token_ids=visible_new_token_ids,
+                            finish_reason=finish_reason,
+                            new_logprobs=new_logprobs,
+                            new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                            pooling_output=pooler_output,
+                            stop_reason=request.stop_reason,
+                            events=request.take_events(),
+                            kv_transfer_params=kv_transfer_params,
+                            harmony_filtered_token_indices=current_filtered_indices,
+                            first_token_index=first_visible_start_index,
+                            trace_headers=request.trace_headers,
+                            num_cached_tokens=request.num_cached_tokens,
+                            num_nans_in_logits=request.num_nans_in_logits,
+                        )
+                    )
+                else:
+                    # Invariant: EngineCore returns no partial prefill outputs.
+                    assert not prompt_logprobs_tensors
 
         # Remove the stopped requests from the running and waiting queues.
         if stopped_running_reqs:
@@ -1835,3 +2092,123 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+    # ==================== Async Tool Execution Methods ====================
+
+    def _init_tool_globals(self):
+        """Initialize a clean globals namespace for tool execution."""
+        return {
+            "__builtins__": __builtins__,
+            "math": __import__("math"),
+            "sympy": __import__("sympy"),
+            "itertools": __import__("itertools"),
+            "functools": __import__("functools"),
+            "collections": __import__("collections"),
+            "fractions": __import__("fractions"),
+        }
+
+    def _execute_tool_async(self, request_id: str, call_id: str, code: str):
+        """Execute tool code in background thread.
+
+        This method runs in a worker thread from the thread pool.
+        When execution completes, it queues the result for injection.
+        """
+        import io
+        import sys
+        import contextlib
+        import traceback as tb
+        import textwrap
+
+        try:
+            print(
+                f"[Scheduler] Executing tool {call_id} for request {request_id} in background..."
+            )
+
+            # 1. State Persistence: Retrieve or init globals for this request
+            # vLLM V1 appends suffixes for turns, so we use a stable prefix
+            session_id = request_id.split("-0-")[0]
+            state = self.tool_exec_states[session_id]
+            if not state["globals"]:
+                state["globals"] = self._init_tool_globals()
+
+            exec_globals = state["globals"]
+            exec_locals = state["locals"]
+
+            # 2. Indentation Handling: Fix possible leading whitespace from extraction
+            code = textwrap.dedent(code)
+            print(f"[Scheduler] Code ({len(code)} chars): {code[:100]}...")
+
+            # 3. Preprocess code: add print for last expression if needed
+            stdout_capture = io.StringIO()
+            code_lines = code.strip().split("\n")
+            if code_lines:
+                last_line = code_lines[-1].strip()
+                # If last line is a simple expression (not assignment, not control flow)
+                if last_line and not any(
+                    [
+                        "=" in last_line and "==" not in last_line,
+                        last_line.startswith(
+                            (
+                                "if ",
+                                "for ",
+                                "while ",
+                                "def ",
+                                "class ",
+                                "return ",
+                                "#",
+                                "print(",
+                            )
+                        ),
+                    ]
+                ):
+                    # Wrap last line to print its value
+                    code_lines[-1] = f"__result__ = {last_line}"
+                    code_lines.append("if __result__ is not None: print(__result__)")
+                code = "\n".join(code_lines)
+
+            # Execute with stdout capture and timeout
+            with contextlib.redirect_stdout(stdout_capture):
+                exec(code, exec_globals, exec_locals)
+
+            result = stdout_capture.getvalue()
+            if not result.strip():
+                result = "Code executed successfully (no output)"
+
+            print(f"[Scheduler] Tool {call_id} completed: {result[:100]}...")
+            return result.strip()
+
+        except Exception as e:
+            error_msg = f"[ERROR] {e}\n{tb.format_exc()}"
+            print(f"[Scheduler] Tool {call_id} failed: {error_msg}")
+            return error_msg
+
+    def _on_tool_complete(self, request_id: str, call_id: str, future):
+        """Callback when tool execution completes.
+
+        This is called by the thread pool when a tool finishes.
+        It formats the result and queues it for injection into the generation.
+        """
+        try:
+            result = future.result()
+
+            # Format as Harmony TOOL message
+            injection = (
+                f"<|channel|>tool<|recipient_start|>assistant<|recipient_end|>"
+                f"<|content_start|>{result}<|content_end|>"
+            )
+
+            # Queue interrupt for injection
+            print(f"[Scheduler] Queueing result injection for {call_id}")
+            self.interrupt_manager.enqueue_interrupt(request_id, call_id, injection)
+
+            # Remove from active tools
+            if request_id in self.active_tools:
+                self.active_tools[request_id].pop(call_id, None)
+                if not self.active_tools[request_id]:
+                    del self.active_tools[request_id]
+
+        except Exception as e:
+            import traceback
+
+            print(f"[Scheduler] Error in tool completion callback for {call_id}: {e}")
+            traceback.print_exc()

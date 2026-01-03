@@ -3,6 +3,7 @@
 
 import asyncio
 import time
+import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import cast
@@ -19,6 +20,8 @@ from vllm.entrypoints.openai.protocol import (
     CompletionResponseChoice,
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
+    DeltaToolCall,
+    DeltaFunctionCall,
     ErrorResponse,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
@@ -41,6 +44,7 @@ from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
+from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
@@ -369,6 +373,38 @@ class OpenAIServingCompletion(OpenAIServing):
                 # Prompt details are excluded from later streamed outputs
                 if prompt_token_ids is not None:
                     num_prompt_tokens[prompt_idx] = len(prompt_token_ids)
+
+                # Emit any background events (tool calls, waiting)
+                if res.events:
+                    tool_calls = []
+                    for event in res.events:
+                        if event.type == EngineCoreEventType.TOOL_CALL:
+                            tool_calls.append(
+                                DeltaToolCall(
+                                    id=event.metadata.get("call_id"),
+                                    type="function",
+                                    function=DeltaFunctionCall(
+                                        name="python",
+                                        arguments=event.metadata.get("call_body"),
+                                    ),
+                                    index=len(tool_calls),
+                                )
+                            )
+
+                    if tool_calls:
+                        chunk = CompletionStreamResponse(
+                            id=request_id,
+                            created=created_time,
+                            model=model_name,
+                            choices=[
+                                CompletionResponseStreamChoice(
+                                    index=0,
+                                    text="",
+                                    tool_calls=tool_calls,
+                                )
+                            ],
+                        )
+                        yield f"data: {chunk.model_dump_json(exclude_unset=False)}\n\n"
 
                 delta_token_ids: GenericSequence[int]
                 out_logprobs: GenericSequence[dict[int, Logprob] | None] | None

@@ -14,7 +14,7 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
 from vllm.tokenizers import TokenizerLike
-from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine import EngineCoreRequest, InterruptRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 
@@ -192,3 +192,8 @@ class EngineClient(ABC):
     async def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
         """Get supported tasks"""
         raise NotImplementedError
+
+    @abstractmethod
+    async def inject_interrupt(self, request: InterruptRequest) -> None:
+        """Inject asynchronous tool result into a request."""
+        ...

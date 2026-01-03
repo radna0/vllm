@@ -59,6 +59,7 @@ from vllm.entrypoints.openai.protocol import (
     TranslationRequest,
     TranslationResponseVariant,
 )
+from vllm.entrypoints.openai.async_tool_endpoint import async_tool_router
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_engine import OpenAIServing
@@ -881,6 +882,7 @@ def build_app(args: Namespace) -> FastAPI:
 
     register_sagemaker_routes(router)
     app.include_router(router)
+    app.include_router(async_tool_router)
 
     app.root_path = args.root_path
 

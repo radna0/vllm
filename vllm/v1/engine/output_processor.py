@@ -210,6 +210,7 @@ class RequestState:
         finish_reason: FinishReason | None,
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
+        events: list[Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -261,7 +262,7 @@ class RequestState:
             external_req_id = self.parent_req.external_req_id
 
         return self._new_request_output(
-            external_req_id, outputs, finished, kv_transfer_params
+            external_req_id, outputs, finished, kv_transfer_params, events
         )
 
     def _new_request_output(
@@ -270,6 +271,7 @@ class RequestState:
         outputs: list[CompletionOutput] | list[PoolingOutput],
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        events: list[Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         first_output = outputs[0]
         if isinstance(first_output, PoolingOutput):
@@ -304,6 +306,7 @@ class RequestState:
             outputs=cast(list[CompletionOutput], outputs),
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            events=events,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
         )
@@ -429,9 +432,11 @@ class OutputProcessor:
                         new_token_ids=[],
                         # Set pooling_output is not None to
                         # correctly enter the abort pooling branch
-                        pooling_output=torch.randn(0, device="cpu")
-                        if req_state.detokenizer is None
-                        else None,
+                        pooling_output=(
+                            torch.randn(0, device="cpu")
+                            if req_state.detokenizer is None
+                            else None
+                        ),
                         finish_reason=FinishReason.ABORT,
                         stop_reason=None,
                         kv_transfer_params=None,
@@ -523,6 +528,22 @@ class OutputProcessor:
             )
 
             new_token_ids = engine_core_output.new_token_ids
+
+            # 1.5) Filter harmony_filtered_token_indices from new_token_ids
+            # so the client never sees them.
+            if engine_core_output.harmony_filtered_token_indices:
+                filtered_set = set(engine_core_output.harmony_filtered_token_indices)
+                # Use absolute first_token_index from engine core
+                start_idx = engine_core_output.first_token_index
+
+                # Filter out tokens marked for hiding
+                visible_token_ids = []
+                for i, token_id in enumerate(new_token_ids):
+                    abs_idx = start_idx + i
+                    if abs_idx not in filtered_set:
+                        visible_token_ids.append(token_id)
+                new_token_ids = visible_token_ids
+
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -552,6 +573,7 @@ class OutputProcessor:
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                engine_core_output.events,
             ):
                 if req_state.queue is not None:
                     # AsyncLLM: put into queue for handling by generate().

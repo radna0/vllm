@@ -62,6 +62,7 @@ class EngineCoreRequest(
     cache_salt: str | None
     data_parallel_rank: int | None
     prompt_embeds: torch.Tensor | None = None
+    async_tool_calling: bool = False
 
     # Index of the client, used to ensure outputs are sent back to the same
     # client for this request when scaling out the front-end.
@@ -96,6 +97,8 @@ class EngineCoreEventType(enum.IntEnum):
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3
+    TOOL_CALL = 4
+    WAITING = 5
 
 
 class EngineCoreEvent(msgspec.Struct):
@@ -108,13 +111,17 @@ class EngineCoreEvent(msgspec.Struct):
 
     type: EngineCoreEventType
     timestamp: float
+    metadata: dict[str, Any] | None = None
 
     @classmethod
     def new_event(
-        cls, event_type: EngineCoreEventType, timestamp: float | None = None
+        cls,
+        event_type: EngineCoreEventType,
+        timestamp: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> "EngineCoreEvent":
         timestamp = time.monotonic() if timestamp is None else timestamp
-        return cls(event_type, timestamp)
+        return cls(event_type, timestamp, metadata)
 
 
 class EngineCoreOutput(
@@ -135,6 +142,13 @@ class EngineCoreOutput(
     stop_reason: int | str | None = None
     events: list[EngineCoreEvent] | None = None
     kv_transfer_params: dict[str, Any] | None = None
+
+    # Track token indices that should be filtered at the API level
+    # (e.g. Python tool call body tokens)
+    harmony_filtered_token_indices: list[int] | None = None
+
+    # Global index of the first token in new_token_ids
+    first_token_index: int = 0
 
     trace_headers: Mapping[str, str] | None = None
     # The number of tokens with prefix cache hits.
@@ -204,6 +218,7 @@ class EngineCoreRequestType(enum.Enum):
     UTILITY = b"\x03"
     # Sentinel used within EngineCoreProc.
     EXECUTOR_FAILED = b"\x04"
+    INTERRUPT = b"\x05"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):
@@ -221,3 +236,12 @@ class ReconfigureRankType(enum.IntEnum):
 
     KEEP_CURRENT_RANK = -1
     SHUTDOWN_CURRENT_RANK = -2
+
+
+class InterruptRequest(msgspec.Struct):
+    """Request to inject an asynchronous tool result (interrupt)."""
+
+    request_id: str
+    call_id: str
+    content: str
+    status: str

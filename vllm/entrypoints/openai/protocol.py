@@ -131,6 +131,22 @@ class ErrorResponse(OpenAIBaseModel):
     error: ErrorInfo
 
 
+class AsyncToolResultRequest(OpenAIBaseModel):
+    """Request to inject tool results into an in-flight async tool calling request."""
+
+    session_id: str = Field(
+        description="The request_id (session ID) of the in-flight request to inject results into."
+    )
+    call_id: str = Field(
+        description="The tool call ID that this result corresponds to."
+    )
+    content: str = Field(description="The tool execution result or error message.")
+    status: Literal["ok", "error"] = Field(
+        default="ok",
+        description="Status of the tool execution: 'ok' for success, 'error' for failure.",
+    )
+
+
 class VLLMValidationError(ValueError):
     """vLLM-specific validation error for request validation failures.
 
@@ -869,9 +885,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ),
             include_stop_str_in_output=self.include_stop_str_in_output,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
@@ -1187,6 +1203,23 @@ class CompletionRequest(OpenAIBaseModel):
         ),
     )
 
+    # Async tool calling parameters
+    async_tool_calling: bool = Field(
+        default=False,
+        description=(
+            "Enable async function tool calling. When enabled, tool calls "
+            "execute concurrently with generation, and tool results are "
+            "injected via interrupt mechanism without restarting the request."
+        ),
+    )
+    tool_protocol: Literal["cml", "harmony"] = Field(
+        default="cml",
+        description=(
+            "Tool calling protocol to use. 'cml' (Control Markup Language) or "
+            "'harmony' (OpenAI Harmony Response Format)."
+        ),
+    )
+
     # --8<-- [end:completion-extra-params]
 
     # Default sampling parameters for completion requests
@@ -1311,13 +1344,14 @@ class CompletionRequest(OpenAIBaseModel):
                 self.logits_processors, logits_processor_pattern
             ),
             truncate_prompt_tokens=self.truncate_prompt_tokens,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
+            async_tool_calling=self.async_tool_calling,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
 
@@ -1464,6 +1498,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    tool_calls: list["DeltaToolCall"] | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -2181,9 +2216,9 @@ class TranscriptionRequest(OpenAIBaseModel):
             frequency_penalty=self.frequency_penalty,
             repetition_penalty=repetition_penalty,
             presence_penalty=self.presence_penalty,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             extra_args=self.vllm_xargs,
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
@@ -2410,9 +2445,9 @@ class TranslationRequest(OpenAIBaseModel):
             temperature=temperature,
             max_tokens=max_tokens,
             seed=self.seed,
-            output_kind=RequestOutputKind.DELTA
-            if self.stream
-            else RequestOutputKind.FINAL_ONLY,
+            output_kind=(
+                RequestOutputKind.DELTA if self.stream else RequestOutputKind.FINAL_ONLY
+            ),
             skip_clone=True,  # Created fresh per request, safe to skip clone
         )
 

@@ -3,7 +3,9 @@
 
 import enum
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -27,6 +29,61 @@ if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_utils import BlockHash
 
 
+@dataclass
+class AsyncToolState:
+    """State for async tool calling (Harmony/CML)."""
+
+    # FSM state for Harmony parsing:
+    # TEXT | SEEN_START | IN_HEADER | IN_MESSAGE
+    fsm_state: str = "TEXT"
+
+    # Harmony Metadata
+    current_role: str | None = None
+    current_channel: str | None = None
+    current_recipient: str | None = None
+    current_content_type: str | None = None
+    current_call_id: str | None = None  # For CML support
+
+    # Critical section flag (true while inside a message header or non-text message)
+    in_critical_section: bool = False
+
+    # Token buffer for current captured block (header or message content)
+    capture_buffer_text: str = ""
+
+    # Pending interrupts (call_id, payload_text)
+    pending_interrupts: deque[tuple[str, str]] = field(default_factory=deque)
+
+    # Trap state (legacy/CML)
+    trap_seen: bool = False
+    trap_timestamp: float | None = None
+
+    # Call registry: call_id -> {status, submitted_at, finished_at}
+    call_registry: dict[str, dict] = field(default_factory=dict)
+
+    # Call registry: call_id -> {status, submitted_at, finished_at}
+    call_registry: dict[str, dict] = field(default_factory=dict)
+
+    # Partial marker buffer for incremental parsing
+    partial_marker_buffer: str = ""
+
+    # Harmony Monitor State (added for TRUE async)
+    harmony_in_potential_call: bool = False
+    harmony_filtering_body: bool = False
+    harmony_accumulated_text: list[str] = field(default_factory=list)
+    harmony_call_counter: int = 0
+    harmony_call_start_index: int | None = None  # Track where the call started
+
+    # Track token indices that should be filtered from API responses
+    # (we can't use is_internal=True because it breaks vLLM's token flow)
+    harmony_filtered_token_indices: set[int] = field(default_factory=set)
+
+    # Buffering support for early detection
+    harmony_is_buffering: bool = False
+    harmony_buffer: list[int] = field(default_factory=list)
+    harmony_buffer_start_index: int | None = None
+    harmony_should_drop_buffer: bool = False
+
+
 class Request:
     def __init__(
         self,
@@ -44,6 +101,7 @@ class Request:
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+        async_tool_calling: bool = False,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -64,6 +122,11 @@ class Request:
 
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
+
+        # Async tool calling state
+        self.async_tool_state: AsyncToolState | None = None
+        if async_tool_calling:
+            self.async_tool_state = AsyncToolState()
 
         if pooling_params is not None:
             # Pooling models.
@@ -158,6 +221,7 @@ class Request:
             priority=request.priority,
             trace_headers=request.trace_headers,
             block_hasher=block_hasher,
+            async_tool_calling=request.async_tool_calling,
         )
 
     def append_output_token_ids(
@@ -218,8 +282,9 @@ class Request:
         self,
         event_type: EngineCoreEventType,
         timestamp: float | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
-        self.events.append(EngineCoreEvent.new_event(event_type, timestamp))
+        self.events.append(EngineCoreEvent.new_event(event_type, timestamp, metadata))
 
     def take_events(self) -> list[EngineCoreEvent] | None:
         if not self.events:
@@ -248,6 +313,8 @@ class RequestStatus(enum.IntEnum):
     WAITING_FOR_FSM = enum.auto()
     WAITING_FOR_REMOTE_KVS = enum.auto()
     RUNNING = enum.auto()
+    APPEND_PREFILL = enum.auto()  # Injecting interrupt tokens (async tool calling)
+    WAIT_TRAP = enum.auto()  # Paused waiting for tool results (async tool calling)
     PREEMPTED = enum.auto()
     # Note: anything after PREEMPTED will be considered
     # as a finished status.

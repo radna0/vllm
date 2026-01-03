@@ -211,6 +211,7 @@ class SamplingParams(
     set to an integer k, will use only the last k tokens from the prompt
     (i.e., left truncation). If set to `None`, truncation is disabled."""
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    async_tool_calling: bool = False
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without
@@ -276,6 +277,7 @@ class SamplingParams(
         logit_bias: dict[int, float] | dict[str, float] | None = None,
         allowed_token_ids: list[int] | None = None,
         extra_args: dict[str, Any] | None = None,
+        async_tool_calling: bool = False,
         skip_clone: bool = False,
     ) -> "SamplingParams":
         if logit_bias is not None:
@@ -290,9 +292,9 @@ class SamplingParams(
             n=1 if n is None else n,
             presence_penalty=0.0 if presence_penalty is None else presence_penalty,
             frequency_penalty=0.0 if frequency_penalty is None else frequency_penalty,
-            repetition_penalty=1.0
-            if repetition_penalty is None
-            else repetition_penalty,
+            repetition_penalty=(
+                1.0 if repetition_penalty is None else repetition_penalty
+            ),
             temperature=1.0 if temperature is None else temperature,
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
@@ -317,6 +319,7 @@ class SamplingParams(
             logit_bias=logit_bias,
             allowed_token_ids=allowed_token_ids,
             extra_args=extra_args,
+            async_tool_calling=async_tool_calling,
             skip_clone=skip_clone,
         )
 
@@ -589,6 +592,7 @@ class SamplingParams(
             "spaces_between_special_tokens="
             f"{self.spaces_between_special_tokens}, "
             f"truncate_prompt_tokens={self.truncate_prompt_tokens}, "
+            f"async_tool_calling={self.async_tool_calling}, "
             f"structured_outputs={self.structured_outputs}, "
             f"extra_args={self.extra_args})"
         )

@@ -64,7 +64,25 @@ class LogprobsProcessor:
             num_logprobs=num_logprobs,
         )
 
-    def _update_sample_logprobs(self, logprobs_lists: LogprobsLists) -> None:
+    def update_from_output(
+        self,
+        output: EngineCoreOutput,
+    ) -> None:
+        if output.new_logprobs is not None:
+            self._update_sample_logprobs(
+                output.new_logprobs,
+                output.harmony_filtered_token_indices,
+                output.first_token_index,
+            )
+        if output.new_prompt_logprobs_tensors is not None:
+            self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)
+
+    def _update_sample_logprobs(
+        self,
+        logprobs_lists: LogprobsLists,
+        filtered_indices: list[int] | None = None,
+        first_token_index: int = 0,
+    ) -> None:
         """Update with sample logprobs from EngineCore.
 
         Outer lists are only of len > 1 if EngineCore made
@@ -72,6 +90,8 @@ class LogprobsProcessor:
 
         Args:
           logprobs_lists: the lists of logprob tokens, logprobs, and ranks.
+          filtered_indices: indices of tokens to filter out.
+          first_token_index: absolute index of the first token in this batch.
 
         """
 
@@ -80,10 +100,15 @@ class LogprobsProcessor:
         assert self.cumulative_logprob is not None
 
         token_ids_lst, logprobs_lst, ranks_lst, _ = logprobs_lists
+        filtered_set = set(filtered_indices) if filtered_indices else set()
 
-        for rank_np, logprobs_np, token_ids_np in zip(
-            ranks_lst, logprobs_lst, token_ids_lst
+        for i, (rank_np, logprobs_np, token_ids_np) in enumerate(
+            zip(ranks_lst, logprobs_lst, token_ids_lst)
         ):
+            # Check if this token should be filtered
+            if (first_token_index + i) in filtered_set:
+                continue
+
             rank = rank_np.tolist()
             logprobs = logprobs_np.tolist()
             token_ids = token_ids_np.tolist()
@@ -181,9 +206,3 @@ class LogprobsProcessor:
         if plp:
             self.prompt_logprobs = []
         return plp
-
-    def update_from_output(self, output: EngineCoreOutput) -> None:
-        if output.new_logprobs is not None:
-            self._update_sample_logprobs(output.new_logprobs)
-        if output.new_prompt_logprobs_tensors is not None:
-            self._update_prompt_logprobs(output.new_prompt_logprobs_tensors)

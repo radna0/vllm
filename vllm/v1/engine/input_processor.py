@@ -579,6 +579,11 @@ class InputProcessor:
             priority=priority,
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
+            async_tool_calling=(
+                getattr(sampling_params, "async_tool_calling", False)
+                if sampling_params is not None
+                else False
+            ),
         )
 
     def _validate_model_inputs(

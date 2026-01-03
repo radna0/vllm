@@ -137,6 +137,9 @@ class SchedulerConfig:
     speculative decoding and pipeline parallelism.
     """
 
+    async_tool_calling: bool = False
+    """If set to True, enable native async tool calling protocol (CML)."""
+
     stream_interval: int = Field(default=1, ge=1)
     """The interval (or buffer size) for streaming in terms of token length.
     A smaller value (1) makes streaming smoother by sending each token immediately,

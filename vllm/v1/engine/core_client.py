@@ -35,6 +35,7 @@ from vllm.v1.engine import (
     EngineCoreOutputs,
     EngineCoreRequest,
     EngineCoreRequestType,
+    InterruptRequest,
     ReconfigureDistributedRequest,
     ReconfigureRankType,
     UtilityOutput,
@@ -254,6 +255,9 @@ class EngineCoreClient(ABC):
     ) -> list[_R]:
         raise NotImplementedError
 
+    def inject_interrupt(self, request: InterruptRequest) -> None:
+        raise NotImplementedError
+
 
 class InprocClient(EngineCoreClient):
     """
@@ -283,6 +287,9 @@ class InprocClient(EngineCoreClient):
     def abort_requests(self, request_ids: list[str]) -> None:
         if len(request_ids) > 0:
             self.engine_core.abort_requests(request_ids)
+
+    def inject_interrupt(self, request: InterruptRequest) -> None:
+        self.engine_core.inject_interrupt(request)
 
     def shutdown(self) -> None:
         self.engine_core.shutdown()
@@ -753,6 +760,9 @@ class SyncMPClient(MPClient):
             self.engines_running = True
         self._send_input(EngineCoreRequestType.ADD, request)
 
+    def inject_interrupt(self, request: InterruptRequest) -> None:
+        self._send_input(EngineCoreRequestType.INTERRUPT, request)
+
     def abort_requests(self, request_ids: list[str]) -> None:
         if request_ids and not self.resources.engine_dead:
             self._send_input(EngineCoreRequestType.ABORT, request_ids)
@@ -959,6 +969,10 @@ class AsyncMPClient(MPClient):
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         request.client_index = self.client_index
         await self._send_input(EngineCoreRequestType.ADD, request)
+        self._ensure_output_queue_task()
+
+    async def inject_interrupt_async(self, request: InterruptRequest) -> None:
+        await self._send_input(EngineCoreRequestType.INTERRUPT, request)
         self._ensure_output_queue_task()
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -1284,9 +1298,9 @@ class DPLBAsyncMPClient(DPAsyncMPClient):
             f"different from cur_data_parallel_size {cur_data_parallel_size}"
         )
 
-        assert self.vllm_config.parallel_config.data_parallel_backend == "ray", (
-            "Only ray DP backend supports scaling elastic EP"
-        )
+        assert (
+            self.vllm_config.parallel_config.data_parallel_backend == "ray"
+        ), "Only ray DP backend supports scaling elastic EP"
 
         scale_up = new_data_parallel_size > cur_data_parallel_size
 
