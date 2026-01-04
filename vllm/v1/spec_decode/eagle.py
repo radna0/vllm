@@ -338,8 +338,10 @@ def sample_draft_tokens(
         is_greedy = temperature < _SAMPLING_EPS
         # Avoid division by zero for greedy requests
         temperature = torch.where(is_greedy, torch.ones_like(temperature), temperature)
+    # GOLD STANDARD: We stay in RAW logit domain for the primary sampling path.
+    logits_raw = logits
+
     # Deduplicate scaling if needed for probs or multi-sample
-    # We only compute this IF we are in a path that requires the full distribution
     logits_scaled = None
     if return_probs or num_samples > 1:
         logits_scaled = logits_raw / temperature.unsqueeze(-1)
