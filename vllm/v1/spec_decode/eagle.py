@@ -338,12 +338,11 @@ def sample_draft_tokens(
         is_greedy = temperature < _SAMPLING_EPS
         # Avoid division by zero for greedy requests
         temperature = torch.where(is_greedy, torch.ones_like(temperature), temperature)
-    else:
-        is_greedy = None
-
-    # GOLD STANDARD: We stay in RAW logit domain.
-    # We do NOT divide by temperature here. Scaling is handled by Gumbel noise.
-    logits_raw = logits
+    # Deduplicate scaling if needed for probs or multi-sample
+    # We only compute this IF we are in a path that requires the full distribution
+    logits_scaled = None
+    if return_probs or num_samples > 1:
+        logits_scaled = logits_raw / temperature.unsqueeze(-1)
 
     if num_samples == 1:
         # Optimized path (num_samples=1): Use FlashSampling/Logit-domain Gumbel-Max
@@ -402,20 +401,18 @@ def sample_draft_tokens(
             # This follows the original logic but optimized.
             # Note: For Return Probs, we use the standard softmax(y/T)
             # to match the rejection sampler's expectations.
-            logits_temp = logits_raw / temperature.unsqueeze(-1)
-            probs = torch.softmax(logits_temp, dim=-1)
+            probs = torch.softmax(logits_scaled, dim=-1)
             return draft_tokens, probs
     else:
         # Multi-sample path (tree decoding): Compute probs for multinomial
-        # We MUST divide by temperature here for the softmax distribution.
-        logits_temp = logits_raw / temperature.unsqueeze(-1)
-        probs = torch.softmax(logits_temp, dim=-1)
-
+        # We MUST use logit-domain filtering here to avoid OOM from prob-domain allocations.
         if ENABLE_DRAFT_SAMPLING:
-            # Draft filtering is done in probability space for the multinomial path
-            probs = _apply_sampling_filters(probs, sampling_metadata)
-            # Normalize after filtering
-            probs = probs / probs.sum(dim=-1, keepdim=True)
+            # Apply filters in logit domain (In-place)
+            logits_scaled = _apply_sampling_filters_logits(
+                logits_scaled, sampling_metadata
+            )
+
+        probs = torch.softmax(logits_scaled, dim=-1)
 
         # For multi-sample (tree decoding), sample without replacement
         draft_tokens = torch.multinomial(probs, num_samples, replacement=False)
