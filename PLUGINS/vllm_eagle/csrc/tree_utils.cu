@@ -285,3 +285,78 @@ void reconstruct_indices_from_tree_mask(
       (int)batch_size,
       (int)draft_token_num);
 }
+
+// Fused Metadata Update for Eagle Speculative Loop
+__global__ void fused_eagle_metadata_update_kernel(
+    int64_t* positions,        // [batch_size]
+    int32_t* seq_lens,         // [batch_size]
+    int64_t* slot_mapping,     // [batch_size]
+    int32_t* block_table,      // [batch_size, max_blocks]
+    const bool* is_terminated, // [batch_size]
+    int max_model_len,
+    int block_size,
+    int batch_size,
+    int max_blocks_per_seq) {
+    int bid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bid >= batch_size) return;
+
+    // Skip update if sequence is already terminated
+    if (is_terminated[bid]) return;
+
+    // 1. Update Position (clamped)
+    int64_t pos = positions[bid] + 1;
+    bool exceeds = pos >= max_model_len;
+    int64_t clamped_pos = exceeds ? 0 : pos;
+    positions[bid] = clamped_pos;
+
+    // 2. Update Seq Lens
+    int32_t slen = seq_lens[bid] + 1;
+    if (exceeds) slen = 1;
+    seq_lens[bid] = slen;
+
+    // 3. Update Slot Mapping
+    int64_t block_idx = clamped_pos / block_size;
+    // Bounds check for block_table
+    if (block_idx < max_blocks_per_seq) {
+        int32_t block_id = block_table[bid * max_blocks_per_seq + block_idx];
+        int64_t slot = (int64_t)block_id * block_size + (clamped_pos % block_size);
+        if (exceeds) slot = -1; // PADDING_SLOT_ID
+        slot_mapping[bid] = slot;
+    } else {
+        slot_mapping[bid] = -1;
+    }
+}
+
+void fused_eagle_metadata_update(
+    at::Tensor positions,
+    at::Tensor seq_lens,
+    at::Tensor slot_mapping,
+    at::Tensor block_table,
+    at::Tensor is_terminated,
+    int64_t max_model_len,
+    int64_t block_size) {
+    CHECK_INPUT(positions);
+    CHECK_INPUT(seq_lens);
+    CHECK_INPUT(slot_mapping);
+    CHECK_INPUT(block_table);
+    CHECK_INPUT(is_terminated);
+
+    int batch_size = positions.size(0);
+    int max_blocks_per_seq = block_table.size(1);
+
+    dim3 grid((batch_size + 127) / 128);
+    dim3 block(128);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(positions));
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    fused_eagle_metadata_update_kernel<<<grid, block, 0, stream>>>(
+        (int64_t*)positions.data_ptr(),
+        (int32_t*)seq_lens.data_ptr(),
+        (int64_t*)slot_mapping.data_ptr(),
+        (int32_t*)block_table.data_ptr(),
+        (const bool*)is_terminated.data_ptr(),
+        (int)max_model_len,
+        (int)block_size,
+        batch_size,
+        max_blocks_per_seq);
+}

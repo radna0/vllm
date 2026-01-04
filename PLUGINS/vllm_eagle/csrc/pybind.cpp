@@ -9,6 +9,15 @@ void build_tree_kernel_efficient(
     int64_t topk, int64_t depth, int64_t draft_token_num,
     int64_t tree_mask_mode);
 
+void fused_eagle_metadata_update(
+    at::Tensor positions,
+    at::Tensor seq_lens,
+    at::Tensor slot_mapping,
+    at::Tensor block_table,
+    at::Tensor is_terminated,
+    int64_t max_model_len,
+    int64_t block_size);
+
 void reconstruct_indices_from_tree_mask(
     torch::Tensor tree_mask, torch::Tensor verified_seq_len,
     torch::Tensor positions, torch::Tensor retrive_index,
@@ -55,6 +64,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "Build tree kernel efficient");
   m.def("reconstruct_indices_from_tree_mask", &reconstruct_indices_from_tree_mask, "Reconstruct indices from tree mask");
   m.def("tree_speculative_sampling_target_only", &tree_speculative_sampling_target_only, "Tree speculative sampling target only");
+  m.def("fused_eagle_metadata_update", &fused_eagle_metadata_update,
+      "Fused metadata update for Eagle speculative loop");
   m.def("apply_logit_filters", &apply_logit_filters, "Apply logit filters");
   m.def("fused_gumbel_sample", &fused_gumbel_sample, "Fused Gumbel-Max sampling");
   

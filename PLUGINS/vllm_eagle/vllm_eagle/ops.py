@@ -161,3 +161,25 @@ def fused_gumbel_sample_warp_optimized(
     _C.fused_gumbel_sample_warp_optimized(
         out_tokens, logits, seed, offset, min_p, temperatures
     )
+
+
+def fused_eagle_metadata_update(
+    positions: torch.Tensor,
+    seq_lens: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    block_table: torch.Tensor,
+    is_terminated: torch.Tensor,
+    max_model_len: int,
+    block_size: int,
+) -> None:
+    if _C is None:
+        raise ImportError("vllm_eagle C++ extension is not available")
+    _C.fused_eagle_metadata_update(
+        positions,
+        seq_lens,
+        slot_mapping,
+        block_table,
+        is_terminated,
+        max_model_len,
+        block_size,
+    )

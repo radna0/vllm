@@ -900,10 +900,16 @@ class EagleProposer:
         if batch_size_across_dp is not None:
             batch_size_across_dp[self.dp_rank] = input_batch_size
 
-        common_attn_metadata.num_actual_tokens = batch_size
-        common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+        # ISOLATION: Create a deep-cloned context for drafting to prevent
+        # ANY pollution of the main model's verification state.
+        # We must NOT modify the original common_attn_metadata in-place.
+        # copy() creates a new object, but we must also Ensure that
+        # tensors we modify are either replaced or cloned.
+        draft_common_metadata = copy(common_attn_metadata)
+        draft_common_metadata.num_actual_tokens = batch_size
+        draft_common_metadata.max_query_len = 1
+        draft_common_metadata.query_start_loc = self.arange[: batch_size + 1]
+        draft_common_metadata.query_start_loc_cpu = torch.from_numpy(
             self.token_arange_np[: batch_size + 1]
         ).clone()
 
@@ -924,8 +930,8 @@ class EagleProposer:
 
         # We use isolated tensors for drafting to allow the Main Model
         # to verify against the 'clean' state.
-        draft_seq_lens = common_attn_metadata.seq_lens.clone()
-        draft_slot_mapping = common_attn_metadata.slot_mapping.clone()
+        draft_seq_lens = draft_common_metadata.seq_lens.clone()
+        draft_slot_mapping = draft_common_metadata.slot_mapping.clone()
 
         # Rollback the isolated sequence lengths if there are rejected tokens.
         if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
@@ -954,7 +960,7 @@ class EagleProposer:
                     positions,
                     draft_seq_lens,
                     draft_slot_mapping,
-                    common_attn_metadata.block_table_tensor,
+                    draft_common_metadata.block_table_tensor,
                     is_terminated,
                     self.max_model_len,
                     self.block_size,
@@ -972,7 +978,7 @@ class EagleProposer:
                 draft_seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
                 block_numbers = clamped_positions // self.block_size
-                block_ids = common_attn_metadata.block_table_tensor.gather(
+                block_ids = draft_common_metadata.block_table_tensor.gather(
                     dim=1, index=block_numbers.view(-1, 1)
                 ).view(-1)
 
@@ -987,7 +993,7 @@ class EagleProposer:
 
             # Rebuild attention metadata using isolated state
             # This ensures common_attn_metadata used by the main model remains pristine.
-            draft_common_metadata = copy(common_attn_metadata)
+            # We already have draft_common_metadata, just update its tensors
             draft_common_metadata.seq_lens = draft_seq_lens
             draft_common_metadata.slot_mapping = draft_slot_mapping
             # Invalidate shadows to avoid H<>D sync on isolated state
@@ -1063,6 +1069,17 @@ class EagleProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+
+        # TELEMETRY: Inspect draft tokens for quality verification
+        if os.environ.get("VLLM_EAGLE_DEBUG", "0") == "1":
+            print(f"DEBUG: Draft Tokens (First 4 reqs): {draft_token_ids[:4].tolist()}")
+            if hasattr(common_attn_metadata, "num_actual_tokens"):
+                print(
+                    f"DEBUG: Original metadata num_actual_tokens: {common_attn_metadata.num_actual_tokens}"
+                )
+                print(
+                    f"DEBUG: Draft metadata num_actual_tokens: {draft_common_metadata.num_actual_tokens}"
+                )
 
         # Concatenate and store probs for rejection sampling
         if draft_probs_list:

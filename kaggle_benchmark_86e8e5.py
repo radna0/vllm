@@ -58,7 +58,10 @@ TEMPERATURE = 1.0
 TOP_P = 1.0
 MIN_P = 0.02
 MAX_ITER = 100  # Safety limit (actual limit is context length)
-TARGET_PROBLEM_ID = "424e18"
+TARGET_PROBLEM_IDS_STR = os.environ.get("TARGET_PROBLEM_IDS", "424e18")
+TARGET_PROBLEM_IDS = [
+    pid.strip() for pid in TARGET_PROBLEM_IDS_STR.split(",") if pid.strip()
+]
 
 # Model paths
 # Model paths (Environment aware)
@@ -82,7 +85,7 @@ TIR_PROMPT = """Please reason step by step and use the python tool to solve the 
 Finally, Return only the verified final answer in \\boxed{}, where the answer is an integer in [0, 99999]. Never guess."""
 
 print(f"{'='*80}")
-print(f"FULL TIR CORRECTNESS BENCHMARK - Problem {TARGET_PROBLEM_ID}")
+print(f"FULL TIR CORRECTNESS BENCHMARK - Target Problems: {TARGET_PROBLEM_IDS}")
 print(f"K={K} samples, MAX_ITER={MAX_ITER}, TEMP={TEMPERATURE}")
 print(f"{'='*80}\n")
 
@@ -273,11 +276,32 @@ def start_vllm_server():
     ]
 
     logfile_path = VLLM_LOG_PATH
-    with open(logfile_path, "w") as logfile:
-        process = subprocess.Popen(
-            command, stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True
-        )
-    print(f"vLLM server started. Logs: {logfile_path}")
+    print(f"vLLM server starting. Monitoring logs in real-time...")
+
+    # We use a pipe for stdout/stderr to stream to both file and console
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        text=True,
+        bufsize=1,
+    )
+
+    def log_streamer(pipe, log_path):
+        with open(log_path, "w") as f:
+            for line in iter(pipe.readline, ""):
+                sys.stdout.write(f"(vLLM Server) {line}")
+                sys.stdout.flush()
+                f.write(line)
+                f.flush()
+
+    # Start a background thread to echo logs
+    log_thread = threading.Thread(
+        target=log_streamer, args=(process.stdout, logfile_path), daemon=True
+    )
+    log_thread.start()
+
     return process
 
 
@@ -304,6 +328,19 @@ def extract_boxed_text(text):
 # ==============================================================================
 # MAIN BENCHMARK
 # ==============================================================================
+
+
+def load_reference_data(csv_path):
+    df = pd.read_csv(csv_path)
+    # Ensure columns match expected format
+    # "id", "problem", "answer"
+    # Create a dictionary {id: {"problem": ..., "answer": ...}}
+    ref_dict = {}
+    for _, row in df.iterrows():
+        ref_dict[row["id"]] = {"problem": row["problem"], "answer": row["answer"]}
+    return ref_dict
+
+
 def run_benchmark():
     from openai import OpenAI
     from transformers import set_seed
@@ -321,6 +358,13 @@ def run_benchmark():
     )
 
     set_seed(SEED)
+
+    # Load reference data
+    try:
+        ref_data = load_reference_data(REFERENCE_CSV_PATH)
+    except Exception as e:
+        print(f"Error loading reference data from {REFERENCE_CSV_PATH}: {e}")
+        ref_data = {}
 
     # Start server
     vllm_proc = start_vllm_server()
@@ -340,26 +384,11 @@ def run_benchmark():
             continue
     else:
         print("✗ Server failed to start.")
-        os.killpg(os.getpgid(vllm_proc.pid), 9)
+        try:
+            os.killpg(os.getpgid(vllm_proc.pid), 9)
+        except:
+            pass
         return
-
-    # Load problem
-    try:
-        df = pd.read_csv(REFERENCE_CSV_PATH)
-        problem_row = df[df["id"] == TARGET_PROBLEM_ID].iloc[0]
-        problem_text = problem_row["problem"]
-        ground_truth = problem_row["answer"]
-    except Exception as e:
-        print(f"Error loading problem: {e}")
-        # Fallback if CSV missiong
-        problem_text = "Problem 424e18 missing in CSV"
-        ground_truth = 21818
-
-    print(f"\n{'='*80}")
-    print(f"Target Problem: {TARGET_PROBLEM_ID}")
-    print(f"{problem_text[:500]}...")
-    print(f"Ground Truth: {ground_truth}")
-    print(f"{'='*80}\n")
 
     # Initialize encoding
     encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
@@ -370,170 +399,201 @@ def run_benchmark():
     for _ in range(K):
         python_pool.put(PythonTool())
 
-    # -------------------------------------------------------------------------
-    # TIR GENERATION OBJECTIVE
-    # -------------------------------------------------------------------------
-    def single_generate_tir(prompt, seed_offset=0):
-        tool = python_pool.get()
-        tool._ensure_session()
+    final_results_summary = []
 
-        messages = [
-            Message.from_role_and_content(
-                Role.SYSTEM,
-                SystemContent.new()
-                .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
-                .with_tools(tool.tool_config),
-            ),
-            Message.from_role_and_content(Role.USER, prompt),
-        ]
+    # Loop over problems
+    for pid in TARGET_PROBLEM_IDS:
+        print(f"\n{'='*80}")
+        print(f"BENCHMARKING PROBLEM: {pid}")
+        print(f"{'='*80}")
 
-        total_tokens = 0
-        iterations = 0
-        final_answer = None
+        if pid in ref_data:
+            problem_text = ref_data[pid]["problem"]
+            ground_truth = ref_data[pid]["answer"]
+        else:
+            print(f"Problem {pid} not found in reference CSV. Skipping.")
+            continue
 
-        print(f"[{seed_offset}] Starting reasoning...")
+        print(f"Ground Truth: {ground_truth}")
 
-        # IMPORTANT: Like the original Kaggle notebook, iterations continue until:
-        # 1. Context is full (max_tokens < 100)
-        # 2. Final answer is found (\\boxed{})
-        # 3. MAX_ITER safety limit is reached
-        # The actual limit is the 65k context window, not MAX_ITER.
+        # TIR GENERATION OBJECTIVE
+        def single_generate_tir(prompt, seed_offset=0):
+            tool = python_pool.get()
+            tool._ensure_session()
 
-        for turn in range(MAX_ITER):
-            iterations = turn + 1
+            messages = [
+                Message.from_role_and_content(
+                    Role.SYSTEM,
+                    SystemContent.new()
+                    .with_reasoning_effort(reasoning_effort=ReasoningEffort.HIGH)
+                    .with_tools(tool.tool_config),
+                ),
+                Message.from_role_and_content(Role.USER, prompt),
+            ]
 
-            p_ids = encoding.render_conversation_for_completion(
-                Conversation.from_messages(messages), Role.ASSISTANT
-            )
-            max_tokens = MAX_MODEL_LEN - len(p_ids)
-            if max_tokens < 100:
-                print(f"[{seed_offset}] Max context reached.")
-                break
+            total_tokens = 0
+            iterations = 0
+            final_answer = None
 
-            try:
-                # Streaming for early stop
-                stream = client.completions.create(
-                    model="gpt-oss",
-                    prompt=p_ids,
-                    max_tokens=2048,
-                    temperature=TEMPERATURE,
-                    top_p=TOP_P,
-                    seed=SEED + seed_offset,
-                    stream=True,
-                    extra_body=dict(
-                        min_p=MIN_P,
-                        stop_token_ids=stop_token_ids,
-                        return_token_ids=True,
-                    ),
-                    timeout=300,
+            print(f"[{seed_offset}] Starting reasoning...")
+
+            for turn in range(MAX_ITER):
+                iterations = turn + 1
+
+                p_ids = encoding.render_conversation_for_completion(
+                    Conversation.from_messages(messages), Role.ASSISTANT
                 )
+                max_tokens = MAX_MODEL_LEN - len(p_ids)
+                if max_tokens < 100:
+                    print(f"[{seed_offset}] Max context reached.")
+                    break
 
-                t_ids = []
-                t_text = ""
-                for chunk in stream:
-                    if not chunk.choices:
-                        continue
-                    chunk_ids = getattr(chunk.choices[0], "token_ids", [])
-                    chunk_text = getattr(chunk.choices[0], "text", "")
-                    t_ids.extend(chunk_ids)
-                    t_text += chunk_text
+                try:
+                    # Streaming for early stop
+                    stream = client.completions.create(
+                        model="gpt-oss",
+                        prompt=p_ids,
+                        max_tokens=2048,
+                        temperature=TEMPERATURE,
+                        top_p=TOP_P,
+                        seed=SEED + seed_offset,
+                        stream=True,
+                        extra_body=dict(
+                            min_p=MIN_P,
+                            stop_token_ids=stop_token_ids,
+                            return_token_ids=True,
+                        ),
+                        timeout=300,
+                    )
 
-                    if "}" in chunk_text:
-                        if extract_boxed_text(t_text) is not None:
-                            break
+                    t_ids = []
+                    t_text = ""
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        chunk_ids = getattr(chunk.choices[0], "token_ids", [])
+                        chunk_text = getattr(chunk.choices[0], "text", "")
+                        t_ids.extend(chunk_ids)
+                        t_text += chunk_text
 
-                stream.close()
-            except Exception as e:
-                print(f"[{seed_offset}] Error: {e}")
-                break
+                    stream.close()
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"[{seed_offset}] Error: {e}")
+                    break
 
-            if not t_ids:
-                break
-            total_tokens += len(t_ids)
+                if not t_ids:
+                    break
+                total_tokens += len(t_ids)
 
-            new_msgs = encoding.parse_messages_from_completion_tokens(
-                t_ids, Role.ASSISTANT
-            )
-            messages.extend(new_msgs)
-
-            last = messages[-1]
-            if last.channel == "final" or t_ids[-1] == 200002:
-                final_answer = extract_boxed_text(t_text)
-                break
-
-            if last.recipient == "python":
-                code = last.content[0].text
-                output = tool.execute(code)
-                messages.append(
-                    Message(
-                        author=Author(role=Role.TOOL, name="python"),
-                        content=[TextContent(text=output)],
-                    ).with_recipient("assistant")
+                new_msgs = encoding.parse_messages_from_completion_tokens(
+                    t_ids, Role.ASSISTANT
                 )
+                messages.extend(new_msgs)
 
-        python_pool.put(tool)
-        return {"answer": final_answer, "iter": iterations, "tokens": total_tokens}
+                last = messages[-1]
+                # Check 200002 explicitly for EAGLE early exit + standard final channel
+                if last.channel == "final" or (t_ids and t_ids[-1] == 200002):
+                    final_answer = extract_boxed_text(t_text)
+                    if final_answer is None and last.content:
+                        # Try extracting from message content as fallback
+                        if hasattr(last.content[0], "text"):
+                            final_answer = extract_boxed_text(last.content[0].text)
+                    break
 
-    # -------------------------------------------------------------------------
-    # RUN PARALLEL
-    # -------------------------------------------------------------------------
-    print(f"Running {K} parallel reasoning threads...")
-    start_time = time.time()
-    results = [None] * K
+                if last.recipient == "python":
+                    code = last.content[0].text
+                    output = tool.execute(code)
+                    if len(output) > 2000:
+                        output = (
+                            output[:2000] + "\n... (output truncated due to length)"
+                        )
+                    messages.append(
+                        Message(
+                            author=Author(role=Role.TOOL, name="python"),
+                            content=[TextContent(text=output)],
+                        ).with_recipient("assistant")
+                    )
 
-    def worker(i):
-        results[i] = single_generate_tir(problem_text + "\n\n" + TIR_PROMPT, i)
+            python_pool.put(tool)
+            return {"answer": final_answer, "iter": iterations, "tokens": total_tokens}
 
-    threads = []
-    for i in range(K):
-        t = threading.Thread(target=worker, args=(i,))
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()
+        print(f"Running {K} parallel reasoning threads for {pid}...")
+        start_time = time.time()
+        results = [None] * K
 
-    elapsed = time.time() - start_time
+        def worker(i):
+            results[i] = single_generate_tir(problem_text + "\n\n" + TIR_PROMPT, i)
 
-    # -------------------------------------------------------------------------
-    # AGGREGATE & REPORT
-    # -------------------------------------------------------------------------
-    ans_list = [r["answer"] for r in results if r]
-    valid_ans = [a for a in ans_list if a is not None]
+        threads = []
+        for i in range(K):
+            t = threading.Thread(target=worker, args=(i,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
 
-    if valid_ans:
-        c = Counter(valid_ans)
-        top_ans, top_cnt = c.most_common(1)[0]
-    else:
-        top_ans, top_cnt = 0, 0
+        elapsed = time.time() - start_time
 
-    is_correct = top_ans == ground_truth
+        # AGGREGATE & REPORT
+        ans_list = [r["answer"] for r in results if r]
+        valid_ans = [a for a in ans_list if a is not None]
 
-    print(f"\n{'='*80}")
-    print(f"FINAL CORRECTNESS RESULTS - {TARGET_PROBLEM_ID}")
-    print(f"{'='*80}")
-    print(f"Ground Truth: {ground_truth}")
-    print(f"Model Plurality: {top_ans} (Frequency: {top_cnt}/{K})")
-    print(f"Correct: {'✅ YES' if is_correct else '❌ NO'}")
-    print(f"Total Time: {elapsed:.2f}s")
-    print(f"Answers: {dict(Counter(ans_list))}")
-    print(f"{'='*80}\n")
+        if valid_ans:
+            c = Counter(valid_ans)
+            top_ans, top_cnt = c.most_common(1)[0]
+        else:
+            top_ans, top_cnt = 0, 0
 
-    output_data = {
-        "problem_id": TARGET_PROBLEM_ID,
-        "is_correct": bool(is_correct),
-        "ground_truth": int(ground_truth),
-        "model_answer": int(top_ans),
-        "accuracy": top_cnt / K,
-        "time": elapsed,
-        "raw_results": results,
-    }
+        # Cast to int for comparison/json
+        try:
+            gt_int = int(ground_truth)
+        except:
+            gt_int = str(ground_truth)
 
+        try:
+            ans_int = int(top_ans)
+        except:
+            ans_int = 0
+
+        is_correct = ans_int == gt_int
+
+        print(f"Problem {pid} Results:")
+        print(f"Model Plurality: {top_ans} (Frequency: {top_cnt}/{K})")
+        print(f"Correct: {'✅ YES' if is_correct else '❌ NO'}")
+        print(f"Time: {elapsed:.2f}s")
+        print(f"Answers: {dict(Counter(ans_list))}")
+
+        data_point = {
+            "problem_id": pid,
+            "is_correct": bool(is_correct),
+            "ground_truth": gt_int,
+            "model_answer": ans_int,
+            "accuracy": top_cnt / K,
+            "time": elapsed,
+            "raw_results": results,
+        }
+        final_results_summary.append(data_point)
+
+    # Clean up server
+    try:
+        os.killpg(os.getpgid(vllm_proc.pid), 9)
+    except:
+        pass
+
+    # Write Final JSON
     with open(RESULTS_JSON_PATH, "w") as f:
-        json.dump(output_data, f, indent=2)
+        json.dump(final_results_summary, f, indent=2)
 
-    # Cleanup
-    os.killpg(os.getpgid(vllm_proc.pid), 9)
+    print(f"\nBenchmark Complete. Results saved to {RESULTS_JSON_PATH}")
 
 
 if __name__ == "__main__":
-    run_benchmark()
+    import traceback
+
+    try:
+        run_benchmark()
+    except Exception as e:
+        print("\nFATAL ERROR DURING BENCHMARK STARTUP:")
+        traceback.print_exc()
+        sys.exit(1)
