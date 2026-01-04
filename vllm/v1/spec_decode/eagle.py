@@ -340,7 +340,7 @@ def sample_draft_tokens(
     logits_raw = logits
     batch_size = logits_raw.shape[0]
     device = logits_raw.device
-    draft_tokens = torch.empty((batch_size,), dtype=torch.int32, device=device)
+    draft_tokens = torch.full((batch_size,), -999, dtype=torch.int32, device=device)
 
     # Handle mixed greedy/random requests
     is_greedy = None
@@ -809,13 +809,51 @@ class EagleProposer:
             self.last_draft_probs = probs
             return draft_token_ids.view(-1, 1)
 
+        # Re-compute batch_size for the isolated metadata
+        batch_size = last_token_indices.size(0)
+
+        # RECONSTRUCTIVE ISOLATION: Explicitly create a NEW CommonAttentionMetadata
+        # from scratch for the draft pass. This eliminates "Ghost State" where
+        # shallow copies still alias internal tensors or shadow CPU caches.
+        # We move this to the START of propose() to protect Tree and Dynamic paths.
+        draft_common_metadata = CommonAttentionMetadata(
+            query_start_loc=self.arange[: batch_size + 1],
+            query_start_loc_cpu=torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            ).clone(),
+            seq_lens=common_attn_metadata.seq_lens.clone(),
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=batch_size,
+            max_query_len=1,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            block_table_tensor=common_attn_metadata.block_table_tensor.clone(),
+            slot_mapping=common_attn_metadata.slot_mapping.clone(),
+            causal=common_attn_metadata.causal,
+        )
+        # Ensure shadow caches are strictly invalidated/isolated.
+        draft_common_metadata._seq_lens_cpu = None
+        draft_common_metadata._num_computed_tokens_cpu = None
+
         # ISOLATION: Clone positions immediately to prevent view corruption.
-        # The fused kernel modifies positions in-place (Line 952), so we must
+        # The fused kernel modifies positions in-place, so we must
         # ensure target_positions (main model state) is never affected.
+        # ALIGNMENT: vLLM v1 provides target_positions as the "next" position (N).
+        # Since our loop and fused kernel increment BEFORE the first forward pass,
+        # we must subtract 1 here to ensure the first draft token is at N.
         if self.uses_mrope:
-            positions = target_positions[:, last_token_indices].clone()
+            positions = (target_positions[:, last_token_indices] - 1).clone()
         else:
-            positions = target_positions[last_token_indices].clone()
+            positions = (target_positions[last_token_indices] - 1).clone()
+
+        # Update the isolated draft tensors
+        # We also subtract 1 from seq_lens to align with the pre-increment loop
+        draft_seq_lens = draft_common_metadata.seq_lens - 1
+        draft_slot_mapping = draft_common_metadata.slot_mapping
+
+        # Propagate alignment to the metadata object for the first build.
+        draft_common_metadata.seq_lens = draft_seq_lens
+        draft_common_metadata.slot_mapping = draft_slot_mapping
+
         if self.method in (
             "deepseek_mtp",
             "ernie_mtp",
@@ -828,7 +866,7 @@ class EagleProposer:
 
         # Dynamic Eagle: use SGLang-style dynamic tree construction
         if self.use_dynamic_eagle:
-            seq_lens = common_attn_metadata.seq_lens[:batch_size]
+            seq_lens = draft_common_metadata.seq_lens[:batch_size]
             draft_tokens, retrive_index, retrive_next_token, retrive_next_sibling = (
                 self.propose_dynamic_tree(
                     batch_size=batch_size,
@@ -836,7 +874,7 @@ class EagleProposer:
                     positions=positions,
                     hidden_states=hidden_states,
                     seq_lens=seq_lens,
-                    common_attn_metadata=common_attn_metadata,
+                    common_attn_metadata=draft_common_metadata,
                 )
             )
             # Store tree structure for verification step
@@ -853,7 +891,7 @@ class EagleProposer:
                 logits=logits,
                 positions=positions,
                 hidden_states=hidden_states,
-                common_attn_metadata=common_attn_metadata,
+                common_attn_metadata=draft_common_metadata,
             )
             # [batch_size, num_tree_tokens]
             return torch.cat(draft_token_ids_list, dim=1)
@@ -900,18 +938,7 @@ class EagleProposer:
         if batch_size_across_dp is not None:
             batch_size_across_dp[self.dp_rank] = input_batch_size
 
-        # ISOLATION: Create a deep-cloned context for drafting to prevent
-        # ANY pollution of the main model's verification state.
-        # We must NOT modify the original common_attn_metadata in-place.
-        # copy() creates a new object, but we must also Ensure that
-        # tensors we modify are either replaced or cloned.
-        draft_common_metadata = copy(common_attn_metadata)
-        draft_common_metadata.num_actual_tokens = batch_size
-        draft_common_metadata.max_query_len = 1
-        draft_common_metadata.query_start_loc = self.arange[: batch_size + 1]
-        draft_common_metadata.query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[: batch_size + 1]
-        ).clone()
+        # Metadata is already isolated and reconstructed at the start of propose().
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -930,12 +957,11 @@ class EagleProposer:
 
         # We use isolated tensors for drafting to allow the Main Model
         # to verify against the 'clean' state.
-        draft_seq_lens = draft_common_metadata.seq_lens.clone()
-        draft_slot_mapping = draft_common_metadata.slot_mapping.clone()
-
-        # Rollback the isolated sequence lengths if there are rejected tokens.
-        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            draft_seq_lens -= num_rejected_tokens_gpu
+        # No need to clone again, they are already clones
+        # VLLM V1: The engine's scheduler already rolls back common_attn_metadata.seq_lens
+        # and target_positions before calling propose() based on verification results.
+        # Manual subtraction here causes a "Double Rollback" bug, leading to
+        # prefix corruption and 0% acceptance rate. We rely on the engine's state.
 
         for token_index in range(self.num_speculative_tokens - 1):
             # SYNC ELIMINATED: We remove is_terminated.all() check to avoid H<>D sync.
@@ -1072,7 +1098,9 @@ class EagleProposer:
 
         # TELEMETRY: Inspect draft tokens for quality verification
         if os.environ.get("VLLM_EAGLE_DEBUG", "0") == "1":
-            print(f"DEBUG: Draft Tokens (First 4 reqs): {draft_token_ids[:4].tolist()}")
+            print(
+                f"DEBUG: Draft Tokens (First 4 reqs): {draft_token_ids_list[-1][:4].tolist()}"
+            )
             if hasattr(common_attn_metadata, "num_actual_tokens"):
                 print(
                     f"DEBUG: Original metadata num_actual_tokens: {common_attn_metadata.num_actual_tokens}"
@@ -1080,6 +1108,10 @@ class EagleProposer:
                 print(
                     f"DEBUG: Draft metadata num_actual_tokens: {draft_common_metadata.num_actual_tokens}"
                 )
+                print(
+                    f"DEBUG: SeqLens (Orig vs Draft): {common_attn_metadata.seq_lens[0].item()} vs {draft_common_metadata.seq_lens[0].item()}"
+                )
+                print(f"DEBUG: Positions (First): {clamped_positions[0].item()}")
 
         # Concatenate and store probs for rejection sampling
         if draft_probs_list:
@@ -1326,12 +1358,20 @@ class EagleProposer:
             # ISOLATION: Clone seq_lens before arithmetic to prevent pollution
             # of main model state through the original common_attn_metadata.
             tree_seq_lens = common_attn_metadata.seq_lens.clone() + level_num_drafts
-            common_attn_metadata = replace(
-                common_attn_metadata,
+            # RECONSTRUCTIVE ISOLATION: Create a strictly decoupled metadata object
+            # for the next tree level. This ensures no shadow caches or tensors
+            # leak back to the original draft_common_metadata or verification pass.
+            common_attn_metadata = CommonAttentionMetadata(
                 query_start_loc=query_len * self.arange[: batch_size + 1],
+                query_start_loc_cpu=None,  # Invalidate shadow CPU cache
                 seq_lens=tree_seq_lens,
+                num_reqs=common_attn_metadata.num_reqs,
                 num_actual_tokens=batch_size * query_len,
                 max_query_len=query_len,
+                max_seq_len=common_attn_metadata.max_seq_len,
+                block_table_tensor=common_attn_metadata.block_table_tensor,
+                slot_mapping=common_attn_metadata.slot_mapping,
+                causal=common_attn_metadata.causal,
             )
             attn_metadata = tree_attn_metadata_builder.build_for_drafting(
                 common_attn_metadata=common_attn_metadata,

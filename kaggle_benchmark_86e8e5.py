@@ -261,7 +261,7 @@ def start_vllm_server():
         "--max-cudagraph-capture-size",
         "2048",
         "--speculative-config",
-        f'{{"model":"{DRAFT_MODEL_PATH}","num_speculative_tokens":5,"method":"eagle3","draft_tensor_parallel_size":1}}',
+        f'{{"model":"{DRAFT_MODEL_PATH}","num_speculative_tokens":{os.environ.get("NUM_SPECS", "5")},"method":"eagle3","draft_tensor_parallel_size":1}}',
         "--host",
         "0.0.0.0",
         "--port",

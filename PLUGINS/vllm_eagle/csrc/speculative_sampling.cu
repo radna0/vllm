@@ -251,7 +251,7 @@ __global__ void apply_logit_filters_kernel(
     float threshold = -1e34f;
 
     // 2. Min-P Threshold (using RAW logits per paper)
-    float min_p_threshold = s_max_logit + logf(row_min_p + 1e-10f);
+    float min_p_threshold = s_max_logit + logf(row_min_p + 1e-10f) - 1e-5f;
     threshold = fmaxf(threshold, min_p_threshold);
 
     // 3. Top-K Threshold (Binary Search if K is valid)
@@ -319,7 +319,8 @@ __global__ void fused_gumbel_sample_kernel(
     __syncthreads();
     
     // 2. Threshold from RAW distribution
-    float threshold = s_max_logit + logf(min_p[row] + 1e-10f);
+    // ROBUSTNESS FIX: Subtract epsilon to ensure stability
+    float threshold = s_max_logit + logf(min_p[row] + 1e-10f) - 1e-5f;
 
     // 3. Noise-Scaled Gumbel + ArgMax
     // argmax(logit + temp * gumbel)
@@ -362,7 +363,12 @@ __global__ void fused_gumbel_sample_kernel(
     ValIdx global_best = BlockReduceArgMax(temp_storage_argmax).Reduce(local_best, ArgMaxOp());
 
     if (threadIdx.x == 0) {
-        out_tokens[row] = global_best.idx;
+        // ROBUSTNESS FALLBACK: If sampling failed due to precision, use EOS (200002)
+        if (global_best.idx == -1) {
+            out_tokens[row] = 200002;
+        } else {
+            out_tokens[row] = global_best.idx;
+        }
     }
 }
 
