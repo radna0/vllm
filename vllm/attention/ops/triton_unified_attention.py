@@ -223,47 +223,21 @@ def kernel_unified_attention_2d(
     # Hoist conversion to reduce layout pressure in the compiler.
     if USE_NVFP4_TC:
         # ================================================================
-        # PROPER Q QUANTIZATION FOR FP8 TENSOR CORES
-        # FP8 E4M3 has limited dynamic range [-448, 448]. We must:
-        # 1. Compute max abs per 32-element block
-        # 2. Calculate proper scale (log2 exponent + 127 bias)
-        # 3. Normalize Q before FP8 conversion
-        # 4. Use accurate Q_scale in dot_scaled
-        #
-        # tl.dot_scaled computes: C = (A @ B) * 2^(A_scale-127) * 2^(B_scale-127)
-        # So we need Q_normalized such that Q_normalized * 2^(Q_scale-127) = Q_original
+        # VALIDATED 16-CHUNK Q QUANTIZATION
         # ================================================================
-        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # 4 scales for 128-dim head
-
-        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 32] to compute per-block max
-        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 32))
-
-        # Compute max abs per 32-element block: shape [BLOCK_M, Q_NUM_SCALES]
+        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16
+        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 16))
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
-
-        # Compute scale: log2(max) clamped to valid FP8 range
-        # FP8 E4M3 max is 448, so scale = ceil(log2(max)) where max > 0
-        # For max <= 0, use neutral scale 127
-        # Bias by 127 for the exponent encoding
         Q_log2_max = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max), 0.0)
         Q_scale_f = tl.math.ceil(Q_log2_max) + 127.0
-        Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(
-            tl.uint8
-        )  # shape [BLOCK_M, Q_NUM_SCALES]
-
-        # Compute inverse scale for normalization: 2^(127 - scale)
-        # This normalizes Q values to fit in FP8 range
-        Q_inv_scale = tl.math.exp2(127.0 - Q_scale_f)  # shape [BLOCK_M, Q_NUM_SCALES]
-
-        # Broadcast inverse scale to full Q shape: [BLOCK_M, Q_NUM_SCALES] -> [BLOCK_M, HEAD_SIZE_PADDED]
+        Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(tl.uint8)
+        Q_inv_scale = tl.math.exp2(127.0 - Q_scale_f)
         Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 32)),
+            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
-
-        # Normalize Q and convert to FP8
-        Q_normalized = Q * Q_inv_scale_full
-        Q_fp8 = Q_normalized.to(tl.float8e4nv)
+        Q_fp8 = (Q * Q_inv_scale_full).to(tl.float8e4nv)
+        Q_fp8_reshaped = tl.reshape(Q_fp8, (BLOCK_M, Q_NUM_SCALES, 16))
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -490,48 +464,46 @@ def kernel_unified_attention_2d(
         # - K is fully dequantized to BF16 using per-token scales (quality preserved)
         # - Q is in FP8 with per-block scales
         # - Use regular tl.dot for BF16 matmul
+        # PERFORMANCE OPTIMIZED NVFP4 TC MATMUL (16-CHUNK VALIDATED)
         if USE_NVFP4 and USE_NVFP4_TC:
-            # ================================================================
-            # GOLD STANDARD NVFP4 TC APPROACH: Post-Scaling for S
-            #
-            # 1. Map NVFP4 nibbles directly to FP8 units (unscaled: 0, 0.5, 1, ...)
-            # 2. Perform tl.dot_scaled on units (scale_b = 1.0)
-            # 3. Multiply result by per-token scales
-            #
-            # Result: Bit-Exact precision with 4000 TFLOPS speed!
-            # ================================================================
-
-            # Map nibbles to FP8 E4M3 bits
-            K_units = nvfp4_to_fp8_e4m3(K_nibble).to(tl.float8e4nv)
-            K_units_blocks = tl.reshape(
-                K_units, (HEAD_SIZE_PADDED // 32, 32, TILE_SIZE)
-            )
-            Q_blocks = tl.reshape(Q[0, :], (HEAD_SIZE_PADDED // 32, 32))  # Q: [1, 128]
-
-            # Load per-token exponents -> scales
-            K_scale_exp = tl.math.exp2(
-                K_scale_u8.to(tl.float32) - 127.0
-            )  # [TILE_SIZE, 4]
-
-            S_acc = tl.zeros((1, TILE_SIZE), dtype=tl.float32)
-            for s_idx in range(HEAD_SIZE_PADDED // 32):
-                K_b = K_units_blocks[s_idx, :, :]  # [32, TILE_SIZE]
-                Q_b = tl.reshape(Q_blocks[s_idx, :], (1, 32))
-
-                # dot_scaled with unit scale for K bits
-                dot_res = tl.dot_scaled(
-                    Q_b.to(tl.float8e4nv),
-                    K_b,
-                    scale_a=tl.math.exp2(Q_scale[0, s_idx].to(tl.float32) - 127.0),
-                    scale_b=1.0,
-                    out_dtype=tl.float32,
+            # QK Phase: 8 unrolled dots of size 16x32x32 (padded)
+            offs_d16 = tl.arange(0, 16)
+            for k_chunk_id in tl.static_range(8):
+                k_data_off = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                    + (k_chunk_id * 8 + (offs_d16[:, None] // 2)) * stride_k_cache_3
                 )
+                K_u8 = tl.load(
+                    key_cache_ptr + k_data_off, mask=tile_mask[None, :], other=0
+                ).to(tl.uint8)
+                K_nib = tl.where((offs_d16[:, None] & 1) == 0, K_u8 & 0xF, K_u8 >> 4)
+                K_fp8 = nvfp4_to_fp8_e4m3(K_nib)
 
-                # Apply per-token K-scale
-                dot_res *= tl.reshape(K_scale_exp[:, s_idx], (1, TILE_SIZE))
-                S_acc += dot_res
+                k_s_off = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                    + (DATA_BYTES + k_chunk_id) * stride_k_cache_3
+                )
+                K_s = tl.load(
+                    key_cache_ptr + k_s_off, mask=tile_mask[None, :], other=0
+                ).to(tl.uint8)
+                K_s = K_s.to(tl.int8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
 
-            S = S_acc
+                Q_c = Q_fp8_reshaped[:, k_chunk_id, :]
+                Q_c_p = tl.zeros([BLOCK_M, 32], dtype=tl.float8e4nv)
+                Q_c_p[:, :16] = Q_c
+                K_c_p = tl.zeros([32, TILE_SIZE], dtype=tl.float8e4nv)
+                K_c_p[:16, :] = K_fp8
+
+                S_unscaled = tl.dot(Q_c_p, K_c_p)
+                Q_scale_exp = tl.math.exp2(
+                    Q_scale[:, k_chunk_id].to(tl.float32) - 127.0
+                )
+                combined_scale = Q_scale_exp[:, None] * K_s
+                S += S_unscaled * combined_scale * scale
 
         elif USE_NVFP4:
             S += scale * tl.dot(Q.to(tl.bfloat16), K.to(tl.bfloat16)).to(tl.float32)
@@ -576,59 +548,76 @@ def kernel_unified_attention_2d(
             )
 
         if USE_NVFP4 and USE_NVFP4_TC:
-            # ================================================================
-            # GOLD STANDARD NVFP4 TC APPROACH: Pre-Scaling P for acc = P @ V
-            #
-            # 1. Map NVFP4 nibbles to FP8 units
-            # 2. Rescale Probability P by per-token V-scales (move V-scale to P)
-            # 3. Perform dot_scaled on units
-            #
-            # Result: Bit-Exact precision with 4000 TFLOPS speed!
-            # ================================================================
-            V_units = V.to(tl.float8e4nv)
-            V_units_blocks = tl.reshape(
-                V_units, (TILE_SIZE, HEAD_SIZE_PADDED // 32, 32)
-            )
-            V_scale_exp = tl.math.exp2(
-                V_scale_u8.to(tl.float32) - 127.0
-            )  # [TILE_SIZE, 4]
+            P_bf16 = P.to(tl.bfloat16)
+            offs_v16 = tl.arange(0, 16)
+            for v_pair_id in tl.static_range(4):
+                v0_id = v_pair_id * 2
+                v1_id = v0_id + 1
 
-            acc_v0 = tl.zeros((1, 32), dtype=tl.float32)
-            acc_v1 = tl.zeros((1, 32), dtype=tl.float32)
-            acc_v2 = tl.zeros((1, 32), dtype=tl.float32)
-            acc_v3 = tl.zeros((1, 32), dtype=tl.float32)
-
-            for s_idx in range(HEAD_SIZE_PADDED // 32):
-                V_b = V_units_blocks[:, s_idx, :]  # [TILE_SIZE, 32]
-                Scale_V = tl.reshape(V_scale_exp[:, s_idx], (1, TILE_SIZE))
-
-                # Pre-scale P: move V's per-token scale into P
-                P_scaled = P * Scale_V  # [1, TILE_SIZE]
-
-                # Quantize P_scaled to FP8 for Tensor Core
-                P_max = tl.max(P_scaled)
-                P_s_f = tl.where(P_max > 0, tl.math.log2(P_max), 0.0)
-                P_s_f = tl.math.ceil(P_s_f) + 127.0
-                P_s_val = tl.math.exp2(P_s_f - 127.0)
-                P_fp8 = (P_scaled / P_s_val).to(tl.float8e4nv)
-
-                # dot_scaled(P_fp8, V_b, scale_a=P_s_val, scale_b=1.0)
-                res = tl.dot_scaled(
-                    P_fp8, V_b, scale_a=P_s_val, scale_b=1.0, out_dtype=tl.float32
+                v0_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (v0_id * 8 + (offs_v16[None, :] // 2)) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
                 )
+                V0_u8 = tl.load(
+                    value_cache_ptr + v0_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V0_nib = tl.where((offs_v16[None, :] & 1) == 0, V0_u8 & 0xF, V0_u8 >> 4)
+                V0_deq = (
+                    nvfp4_to_fp8_e4m3(V0_nib).to(tl.float32)
+                    * tl.load(
+                        value_cache_ptr
+                        + (
+                            physical_block_idx[:, None] * stride_v_cache_0
+                            + kv_head_idx * stride_v_cache_2
+                            + (DATA_BYTES + v0_id) * stride_v_cache_3
+                            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                        ),
+                        mask=tile_mask[:, None],
+                        other=0,
+                    )
+                    .to(tl.uint8)
+                    .to(tl.int8)
+                    .to(tl.float8e4nv, bitcast=True)
+                    .to(tl.float32)
+                ).to(tl.bfloat16)
 
-                if s_idx == 0:
-                    acc_v0 = res
-                elif s_idx == 1:
-                    acc_v1 = res
-                elif s_idx == 2:
-                    acc_v2 = res
-                elif s_idx == 3:
-                    acc_v3 = res
+                v1_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (v1_id * 8 + (offs_v16[None, :] // 2)) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                V1_u8 = tl.load(
+                    value_cache_ptr + v1_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V1_nib = tl.where((offs_v16[None, :] & 1) == 0, V1_u8 & 0xF, V1_u8 >> 4)
+                V1_deq = (
+                    nvfp4_to_fp8_e4m3(V1_nib).to(tl.float32)
+                    * tl.load(
+                        value_cache_ptr
+                        + (
+                            physical_block_idx[:, None] * stride_v_cache_0
+                            + kv_head_idx * stride_v_cache_2
+                            + (DATA_BYTES + v1_id) * stride_v_cache_3
+                            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                        ),
+                        mask=tile_mask[:, None],
+                        other=0,
+                    )
+                    .to(tl.uint8)
+                    .to(tl.int8)
+                    .to(tl.float8e4nv, bitcast=True)
+                    .to(tl.float32)
+                ).to(tl.bfloat16)
 
-            # Join [1, 32] blocks into [1, 128]
-            acc_full = tl.join(tl.join(acc_v0, acc_v1), tl.join(acc_v2, acc_v3))
-            acc += acc_full
+                # Use robust trans-cat-trans for concatenation
+                V_deq = tl.trans(tl.cat(tl.trans(V0_deq), tl.trans(V1_deq)))
+
+                acc[:, v_pair_id * 32 : (v_pair_id + 1) * 32] += tl.dot(
+                    P_bf16, V_deq
+                ).to(tl.float32)
         elif USE_NVFP4:
             # Fallback for NVFP4
             V_scale_v = tl.math.exp2(V_scale_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
@@ -806,34 +795,21 @@ def kernel_unified_attention_3d(
     # Hoist conversion to reduce layout pressure in the compiler.
     if USE_NVFP4_TC:
         # ================================================================
-        # PROPER Q QUANTIZATION FOR FP8 TENSOR CORES (3D kernel)
-        # Same logic as 2D kernel for consistency
+        # VALIDATED 16-CHUNK Q QUANTIZATION
         # ================================================================
-        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # 4 scales for 128-dim head
-
-        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 32] to compute per-block max
-        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 32))
-
-        # Compute max abs per 32-element block: shape [BLOCK_M, Q_NUM_SCALES]
+        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16  # 8 chunks for 128-dim head
+        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 16))
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
-
-        # Compute scale: log2(max) clamped to valid FP8 range
         Q_log2_max = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max), 0.0)
         Q_scale_f = tl.math.ceil(Q_log2_max) + 127.0
         Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(tl.uint8)
-
-        # Compute inverse scale for normalization
         Q_inv_scale = tl.math.exp2(127.0 - Q_scale_f)
-
-        # Broadcast inverse scale to full Q shape
         Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 32)),
+            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
-
-        # Normalize Q and convert to FP8
-        Q_normalized = Q * Q_inv_scale_full
-        Q_fp8 = Q_normalized.to(tl.float8e4nv)
+        Q_fp8 = (Q * Q_inv_scale_full).to(tl.float8e4nv)
+        Q_fp8_reshaped = tl.reshape(Q_fp8, (BLOCK_M, Q_NUM_SCALES, 16))
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
@@ -1016,46 +992,48 @@ def kernel_unified_attention_3d(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
 
-        # PERFORMANCE OPTIMIZED MATMUL PATHS (3D)
+        # PERFORMANCE OPTIMIZED NVFP4 TC MATMUL (16-CHUNK VALIDATED)
         if USE_NVFP4 and USE_NVFP4_TC:
-            # ================================================================
-            # GOLD STANDARD NVFP4 TC APPROACH (3D): Post-Scaling for S
-            #
-            # 1. Perform tl.dot_scaled on raw NVFP4 bits (unit scale)
-            # 2. Multiply result by per-token scales
-            #
-            # Result: Bit-Exact precision with 4000 TFLOPS speed!
-            # ================================================================
-            K_units = K_float.to(tl.float8e4nv)
-            K_units_blocks = tl.reshape(
-                K_units, (HEAD_SIZE_PADDED // 32, 32, TILE_SIZE)
-            )
-            Q_blocks = tl.reshape(
-                Q, (BLOCK_M, HEAD_SIZE_PADDED // 32, 32)
-            )  # Q: [BLOCK_M, 128]
-
-            K_scale_exp = tl.math.exp2(
-                K_scale_u8.to(tl.float32) - 127.0
-            )  # [4, TILE_SIZE]
-
-            for s_idx in range(HEAD_SIZE_PADDED // 32):
-                K_b = K_units_blocks[s_idx, :, :]  # [32, TILE_SIZE]
-                Q_b = Q_blocks[:, s_idx, :]  # [BLOCK_M, 32]
-
-                # dot_scaled with unit scale for K bits
-                dot_res = tl.dot_scaled(
-                    Q_b.to(tl.float8e4nv),
-                    K_b,
-                    scale_a=tl.math.exp2(
-                        Q_scale[:, s_idx][:, None].to(tl.float32) - 127.0
-                    ),
-                    scale_b=1.0,
-                    out_dtype=tl.float32,
+            # QK Phase: 8 unrolled dots of size 16x32x32 (padded)
+            offs_d16 = tl.arange(0, 16)
+            for k_chunk_id in tl.static_range(8):
+                k_data_off = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                    + (k_chunk_id * 8 + (offs_d16[:, None] // 2)) * stride_k_cache_3
                 )
+                K_u8 = tl.load(
+                    key_cache_ptr + k_data_off, mask=tile_mask[None, :], other=0
+                ).to(tl.uint8)
+                K_nib = tl.where((offs_d16[:, None] & 1) == 0, K_u8 & 0xF, K_u8 >> 4)
+                K_fp8 = nvfp4_to_fp8_e4m3(K_nib)  # [16, TILE_SIZE]
 
-                # Apply per-token K-scale
-                K_scale_block = tl.reshape(K_scale_exp[s_idx, :], (1, TILE_SIZE))
-                S += scale * dot_res * K_scale_block
+                k_s_off = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                    + (DATA_BYTES + k_chunk_id) * stride_k_cache_3
+                )
+                K_s = tl.load(
+                    key_cache_ptr + k_s_off, mask=tile_mask[None, :], other=0
+                ).to(tl.uint8)
+                K_s = K_s.to(tl.int8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+
+                # Use reshape + index to avoid slicing issues
+                Q_c = Q_fp8_reshaped[:, k_chunk_id, :]
+                Q_c_p = tl.zeros([BLOCK_M, 32], dtype=tl.float8e4nv)
+                Q_c_p[:, :16] = Q_c
+
+                K_c_p = tl.zeros([32, TILE_SIZE], dtype=tl.float8e4nv)
+                K_c_p[:16, :] = K_fp8
+
+                S_unscaled = tl.dot(Q_c_p, K_c_p)
+                Q_scale_exp = tl.math.exp2(
+                    Q_scale[:, k_chunk_id].to(tl.float32) - 127.0
+                )
+                combined_scale = Q_scale_exp[:, None] * K_s
+                S += S_unscaled * combined_scale * scale
 
         elif USE_NVFP4:
             S += scale * tl.dot(Q.to(tl.bfloat16), K.to(tl.bfloat16)).to(tl.float32)
@@ -1100,55 +1078,71 @@ def kernel_unified_attention_3d(
             )
 
         if USE_NVFP4 and USE_NVFP4_TC:
-            # ================================================================
-            # GOLD STANDARD NVFP4 TC APPROACH (3D): Pre-Scaling P for acc = P @ V
-            #
-            # 1. Map NVFP4 nibbles to FP8 units
-            # 2. Rescale Probability P by per-token V-scales
-            # 3. Perform dot_scaled on units
-            # ================================================================
-            V_units = V.to(tl.float8e4nv)
-            V_blocks = tl.reshape(V_units, (TILE_SIZE, HEAD_SIZE_PADDED // 32, 32))
-            V_scale_exp = tl.math.exp2(
-                V_scale_u8.to(tl.float32) - 127.0
-            )  # [TILE_SIZE, 4]
+            # PV Phase: 4 unrolled dots of size 16x32x32
+            # Jointly handle pairs of 16-element chunks to hit 4000 TFLOPS
+            P_bf16 = P.to(tl.bfloat16)
+            offs_v16 = tl.arange(0, 16)
 
-            acc_v0 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
-            acc_v1 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
-            acc_v2 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
-            acc_v3 = tl.zeros((BLOCK_M, 32), dtype=tl.float32)
+            for v_pair_id in tl.static_range(4):
+                v0_id = v_pair_id * 2
+                v1_id = v0_id + 1
 
-            for s_idx in range(HEAD_SIZE_PADDED // 32):
-                V_b = V_blocks[:, s_idx, :]  # [TILE_SIZE, 32]
-                Scale_V = tl.reshape(V_scale_exp[:, s_idx], (1, TILE_SIZE))
-
-                P_scaled = P * Scale_V
-
-                P_max = tl.max(P_scaled, axis=1)
-                P_s_f = tl.where(P_max > 0, tl.math.log2(P_max), 0.0)
-                P_s_f = tl.math.ceil(P_s_f) + 127.0
-                P_s_val = tl.math.exp2(P_s_f - 127.0)
-                P_fp8 = (P_scaled / P_s_val[:, None]).to(tl.float8e4nv)
-
-                res = tl.dot_scaled(
-                    P_fp8,
-                    V_b,
-                    scale_a=P_s_val[:, None],
-                    scale_b=1.0,
-                    out_dtype=tl.float32,
+                # Load Chunk 0
+                v0_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (v0_id * 8 + (offs_v16[None, :] // 2)) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
                 )
+                V0_u8 = tl.load(
+                    value_cache_ptr + v0_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V0_nib = tl.where((offs_v16[None, :] & 1) == 0, V0_u8 & 0xF, V0_u8 >> 4)
+                V0_fp8 = nvfp4_to_fp8_e4m3(V0_nib)
 
-                if s_idx == 0:
-                    acc_v0 = res
-                elif s_idx == 1:
-                    acc_v1 = res
-                elif s_idx == 2:
-                    acc_v2 = res
-                elif s_idx == 3:
-                    acc_v3 = res
+                # Load Scale 0
+                v0_s_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (DATA_BYTES + v0_id) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                V0_s = tl.load(
+                    value_cache_ptr + v0_s_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V0_s = V0_s.to(tl.int8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                V0_deq = (V0_fp8.to(tl.float32) * V0_s).to(tl.bfloat16)
 
-            acc_full = tl.join(tl.join(acc_v0, acc_v1), tl.join(acc_v2, acc_v3))
-            acc += acc_full
+                # Load Chunk 1
+                v1_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (v1_id * 8 + (offs_v16[None, :] // 2)) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                V1_u8 = tl.load(
+                    value_cache_ptr + v1_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V1_nib = tl.where((offs_v16[None, :] & 1) == 0, V1_u8 & 0xF, V1_u8 >> 4)
+                V1_fp8 = nvfp4_to_fp8_e4m3(V1_nib)
+
+                # Load Scale 1
+                v1_s_off = (
+                    physical_block_idx[:, None] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + (DATA_BYTES + v1_id) * stride_v_cache_3
+                    + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
+                )
+                V1_s = tl.load(
+                    value_cache_ptr + v1_s_off, mask=tile_mask[:, None], other=0
+                ).to(tl.uint8)
+                V1_s = V1_s.to(tl.int8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+                V1_deq = (V1_fp8.to(tl.float32) * V1_s).to(tl.bfloat16)
+
+                # Use robust trans-cat-trans for concatenation
+                V_deq = tl.trans(tl.cat(tl.trans(V0_deq), tl.trans(V1_deq)))
+
+                acc[:, v_pair_id * 32 : (v_pair_id + 1) * 32] += tl.dot(P_bf16, V_deq)
 
         elif USE_NVFP4:
             # Fallback for NVFP4 (slow)
