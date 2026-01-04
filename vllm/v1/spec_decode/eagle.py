@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
 import os
+from copy import copy
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -808,10 +809,13 @@ class EagleProposer:
             self.last_draft_probs = probs
             return draft_token_ids.view(-1, 1)
 
+        # ISOLATION: Clone positions immediately to prevent view corruption.
+        # The fused kernel modifies positions in-place (Line 952), so we must
+        # ensure target_positions (main model state) is never affected.
         if self.uses_mrope:
-            positions = target_positions[:, last_token_indices]
+            positions = target_positions[:, last_token_indices].clone()
         else:
-            positions = target_positions[last_token_indices]
+            positions = target_positions[last_token_indices].clone()
         if self.method in (
             "deepseek_mtp",
             "ernie_mtp",
@@ -907,92 +911,91 @@ class EagleProposer:
         # to remove the "padding" (i.e. rejected tokens).
         # Only apply this adjustment when we have rejected tokens
         # (i.e., not the first proposal).
-        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
-            common_attn_metadata.seq_lens -= num_rejected_tokens_gpu
-            # Invalidate the CPU-side shadows to avoid H<>D sync.
-            common_attn_metadata._seq_lens_cpu = None
-            common_attn_metadata._num_computed_tokens_cpu = None
+        # NOTE: We do NOT modify common_attn_metadata in-place here
+        # to avoid polluting the state for the main model.
 
-        # Track termination per sequence in the batch
-        # GPT-OSS-120B primary EOS token is 200002
+        # Isolation: Clone metadata to prevent pollution of verification state
+        # Primary EOS token for GPT-OSS-120B
         eos_token_id = 200002
         is_terminated = (draft_token_ids == eos_token_id).view(-1)
 
+        # NOTE: positions is already cloned at creation (Line 815) to ensure
+        # target_positions is never polluted by drafter operations.
+
+        # We use isolated tensors for drafting to allow the Main Model
+        # to verify against the 'clean' state.
+        draft_seq_lens = common_attn_metadata.seq_lens.clone()
+        draft_slot_mapping = common_attn_metadata.slot_mapping.clone()
+
+        # Rollback the isolated sequence lengths if there are rejected tokens.
+        if self.num_speculative_tokens > 1 and num_rejected_tokens_gpu is not None:
+            draft_seq_lens -= num_rejected_tokens_gpu
+
         for token_index in range(self.num_speculative_tokens - 1):
-            # If all sequences are terminated, stop early
-            if is_terminated.all():
-                break
+            # SYNC ELIMINATED: We remove is_terminated.all() check to avoid H<>D sync.
+            # In speculative decoding, running a few extra drafter steps is faster
+            # than synchronous host-side branching.
 
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
-            # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
-            if self.uses_mrope:
-                positions += 1
-                # NOTE(woosuk): We should handle the case where the draft model
-                # generates tokens beyond the max model length.
-                # Since it is complex to remove such requests from the batch,
-                # we keep them in the batch but adjust the position ids
-                # and slot mappings to avoid the
-                # out-of-range access during the model execution.
-                # The draft tokens generated with this adjustment
-                # should be ignored.
-                exceeds_max_model_len = positions[0] >= self.max_model_len
-                # Mask out the position ids that exceed the max model length.
-                # Otherwise, we may get out-of-range error in RoPE.
-                clamped_positions = torch.where(
-                    exceeds_max_model_len.unsqueeze(0),
-                    torch.zeros_like(positions),
+
+            # FUSED METADATA UPDATE: Use optimized C++ kernel for all tensor updates
+            # This replaces 5+ Python operations and multiple kernel launches.
+            # QUALITY: We use isolated tensors (draft_*) and provide is_terminated
+            # to prevent updating metadata for finished sequences.
+            use_fused = os.environ.get("VLLM_EAGLE_PHASE2_FUSED", "1") == "1"
+            if (
+                use_fused
+                and eagle_ops is not None
+                and hasattr(eagle_ops, "fused_eagle_metadata_update")
+            ):
+                eagle_ops.fused_eagle_metadata_update(
                     positions,
+                    draft_seq_lens,
+                    draft_slot_mapping,
+                    common_attn_metadata.block_table_tensor,
+                    is_terminated,
+                    self.max_model_len,
+                    self.block_size,
                 )
+                clamped_positions = positions
             else:
-                positions += 1
+                # Fallback (Slow Python path)
+                # Skip updates for terminated sequences
+                mask = ~is_terminated
+                positions.add_(mask.long())
                 exceeds_max_model_len = positions >= self.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
-            # For data integrity when async scheduling, we shouldn't use in place
-            # operations in case they are modified in next step's `prepare_input`
-            # of main model.
-            # Increment the sequence lengths.
-            common_attn_metadata.seq_lens += 1
-            # For the requests that exceed the max model length, we set the
-            # sequence length to 1 to minimize their overheads in attention.
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Also update the CPU-side shadow; NOTE: this is hacky and should be
-            # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
-            if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu += 1
-            if common_attn_metadata._num_computed_tokens_cpu is not None:
-                common_attn_metadata._num_computed_tokens_cpu += 1
+                draft_seq_lens.add_(mask.int())
+                draft_seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Compute the slot mapping.
-            if self.uses_mrope:
-                # all dimensions of positions are the same
-                block_numbers = clamped_positions[0] // self.block_size
-            else:
                 block_numbers = clamped_positions // self.block_size
-            block_ids = common_attn_metadata.block_table_tensor.gather(
-                dim=1, index=block_numbers.view(-1, 1)
-            )
-            block_ids = block_ids.view(-1)
-            if self.uses_mrope:
-                common_attn_metadata.slot_mapping = (
-                    block_ids * self.block_size + clamped_positions[0] % self.block_size
-                )
-            else:
-                common_attn_metadata.slot_mapping = (
+                block_ids = common_attn_metadata.block_table_tensor.gather(
+                    dim=1, index=block_numbers.view(-1, 1)
+                ).view(-1)
+
+                new_slots = (
                     block_ids * self.block_size + clamped_positions % self.block_size
                 )
-            # Mask out the slot mappings that exceed the max model length.
-            # Otherwise, the KV cache will be inadvertently updated with the
-            # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID
-            )
+                new_slots.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+                # Only update non-terminated sequences
+                draft_slot_mapping = torch.where(
+                    is_terminated, draft_slot_mapping, new_slots
+                )
 
-            # Rebuild attention metadata
+            # Rebuild attention metadata using isolated state
+            # This ensures common_attn_metadata used by the main model remains pristine.
+            draft_common_metadata = copy(common_attn_metadata)
+            draft_common_metadata.seq_lens = draft_seq_lens
+            draft_common_metadata.slot_mapping = draft_slot_mapping
+            # Invalidate shadows to avoid H<>D sync on isolated state
+            draft_common_metadata._seq_lens_cpu = None
+            draft_common_metadata._num_computed_tokens_cpu = None
+
             attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
-                common_attn_metadata=common_attn_metadata, draft_index=token_index + 1
+                common_attn_metadata=draft_common_metadata, draft_index=token_index + 1
             )
             for layer_name in self.attn_layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
@@ -1039,7 +1042,13 @@ class EagleProposer:
                 seed=self.sampling_seed,
                 offset=self.seed_offset + 1 + token_index,
             )
+            # QUALITY: Mask draft tokens for already terminated sequences
+            draft_token_ids = torch.where(is_terminated, eos_token_id, draft_token_ids)
+
             if probs is not None:
+                # Mask probs for terminated sequences to be clean
+                # Probs are Cat-ed later, so masking here is good practice.
+                probs = torch.where(is_terminated.view(-1, 1), 0.0, probs)
                 draft_probs_list.append(probs)
             draft_token_ids_list.append(draft_token_ids)
 
@@ -1297,10 +1306,13 @@ class EagleProposer:
             # Build new attention metadata for the next level of drafts.
             # This is necessary to support tree attention.
             query_len = total_num_drafts
+            # ISOLATION: Clone seq_lens before arithmetic to prevent pollution
+            # of main model state through the original common_attn_metadata.
+            tree_seq_lens = common_attn_metadata.seq_lens.clone() + level_num_drafts
             common_attn_metadata = replace(
                 common_attn_metadata,
                 query_start_loc=query_len * self.arange[: batch_size + 1],
-                seq_lens=common_attn_metadata.seq_lens + level_num_drafts,
+                seq_lens=tree_seq_lens,
                 num_actual_tokens=batch_size * query_len,
                 max_query_len=query_len,
             )
