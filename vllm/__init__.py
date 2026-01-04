@@ -105,3 +105,37 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+# NVFP4 build 20260101113525
+# NVFP4 rebuild 20260101113817
+# rebuild 20260101114305
+# rebuild 20260101114840
+# nvfp4 dequant 20260101120235
+# e4m3 scale 20260101121056
+# selective dequant 20260101122246
+# eager mode 20260101122729
+# 65k eager 20260101122954
+# fixed kernels 20260101125838
+# triton upgrade 20260101130113
+# fixed install order 20260101130623
+# float8e4nv fix 20260101131924
+# bitcast fix 20260101132230
+# fp16-scales fix 20260101132643
+# jit-robustness fix 20260101133119
+# vectorized-kernels fix 20260101133515
+# mx-style-scales fix 20260101140230
+# loop-based-packing fix 20260101141000
+# unrolled-packing fix 20260101142530
+# vector-strided-packing fix 20260101143000
+# separated-load-packing fix 20260101143500
+# dequant-scale-format-fix 20260101144500
+# fp16-scales-packed-head-fix 20260101145500
+# nvfp4-1byte-exp-instrumented 20260101155800
+# nvfp4-syntax-fix 20260101160500
+# nvfp4-block-table-fix 20260101163000
+# nvfp4-nameerror-fix 20260101164500
+# nvfp4-dtype-fix 20260101165500
+# nvfp4-triton-sync-fix 20260101171500
+# nvfp4-triton-unroll-fix 20260101172500
+# nvfp4-triton-addressing-fix 20260101173500
+# nvfp4-diagnostic-zero-fix 20260101174500
+# nvfp4-final-coherence-fix 20260101180000
