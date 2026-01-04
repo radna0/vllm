@@ -336,6 +336,7 @@ def sample_draft_tokens(
     temperature = sampling_metadata.temperature
 
     # Handle mixed greedy/random requests
+    is_greedy = None
     if not sampling_metadata.all_random:
         is_greedy = temperature < _SAMPLING_EPS
         # Avoid division by zero for greedy requests
