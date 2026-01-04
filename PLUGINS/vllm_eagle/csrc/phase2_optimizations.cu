@@ -28,6 +28,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cub/cub.cuh>
+#include <curand_kernel.h>
 
 #define NEG_INF_VAL -1e34f
 #define WARP_SIZE 32
@@ -103,7 +104,8 @@ template <typename scalar_t>
 __global__ void fused_gumbel_sample_warp_optimized(
     int* out_tokens,
     const scalar_t* logits,          // [batch_size, vocab_size] (RAW LOGITS)
-    const float* uniform_samples,
+    const uint64_t seed,
+    const uint64_t offset,
     const float* min_p,
     const float* temperatures,       // [batch_size]
     const int batch_size,
@@ -113,7 +115,6 @@ __global__ void fused_gumbel_sample_warp_optimized(
     if (row >= batch_size) return;
 
     const scalar_t* row_logits = logits + row * vocab_size;
-    const float* row_u = uniform_samples + row * vocab_size;
 
     const int warp_id = threadIdx.x / WARP_SIZE;
     const int lane_id = threadIdx.x % WARP_SIZE;
@@ -173,7 +174,12 @@ __global__ void fused_gumbel_sample_warp_optimized(
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            float g_logit = logit + sample_scaled_gumbel(row_u[i], row_temp);
+            // Generate Gumbel noise on-the-fly using Philox RNG
+            curandStatePhilox4_32_10_t state;
+            curand_init(seed, row * vocab_size + i, offset, &state);
+            float u = curand_uniform(&state);
+            
+            float g_logit = logit + sample_scaled_gumbel(u, row_temp);
             if (g_logit > best_val) {
                 best_val = g_logit;
                 best_idx = i;
@@ -228,8 +234,8 @@ __global__ void fused_draft_verify_sample_kernel(
     int* num_accepted,               // Output: [batch_size]
     const scalar_t* draft_logits,       // Input: [batch_size, max_draft_len, vocab_size] (RAW)
     const scalar_t* target_logits,      // Input: [batch_size, max_draft_len+1, vocab_size] (RAW)
-    const float* uniform_samples,       // Input: [batch_size, max_draft_len, vocab_size]
-    const float* verify_samples,        // Input: [batch_size, max_draft_len]
+    const uint64_t seed,
+    const uint64_t offset,
     const float* min_p,                 // Input: [batch_size]
     const float* temperatures,          // Input: [batch_size]
     const int batch_size,
@@ -250,7 +256,6 @@ __global__ void fused_draft_verify_sample_kernel(
     for (int draft_pos = 0; draft_pos < max_draft_len; draft_pos++) {
         const scalar_t* draft_logits_pos = draft_logits + (row * max_draft_len + draft_pos) * vocab_size;
         const scalar_t* target_logits_pos = target_logits + (row * (max_draft_len + 1) + draft_pos) * vocab_size;
-        const float* uniform_pos = uniform_samples + (row * max_draft_len + draft_pos) * vocab_size;
 
         // Step 1: Find max draft logit for min_p filtering
         float local_max = NEG_INF_VAL;
@@ -283,7 +288,13 @@ __global__ void fused_draft_verify_sample_kernel(
         for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
             float logit = (float)draft_logits_pos[i];
             if (logit >= threshold) {
-                float g_logit = logit + sample_scaled_gumbel(uniform_pos[i], row_temp_inner);
+                // Generate Gumbel noise on-the-fly
+                curandStatePhilox4_32_10_t state;
+                uint64_t sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * (vocab_size + 1) + i;
+                curand_init(seed, sub_seq, offset, &state);
+                float u = curand_uniform(&state);
+                
+                float g_logit = logit + sample_scaled_gumbel(u, row_temp_inner);
                 if (g_logit > best_val) {
                     best_val = g_logit;
                     best_idx = i;
@@ -324,8 +335,14 @@ __global__ void fused_draft_verify_sample_kernel(
         float log_acceptance_prob = (target_logit_token - draft_logit_token) / fmaxf(row_temp, 1e-6f);
         float acceptance_prob = fminf(1.0f, expf(log_acceptance_prob));
         
+        // Generate verification sample on-the-fly
+        curandStatePhilox4_32_10_t v_state;
+        uint64_t v_sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * (vocab_size + 1) + vocab_size;
+        curand_init(seed, v_sub_seq, offset, &v_state);
+        float v_sample = curand_uniform(&v_state);
+        
         // Accept/reject decision
-        bool accepted = (verify_samples[row * max_draft_len + draft_pos] < acceptance_prob);
+        bool accepted = (v_sample < acceptance_prob);
         
         if (threadIdx.x == 0) {
             if (accepted) {
@@ -356,7 +373,8 @@ __global__ void fused_draft_verify_sample_kernel(
 void fused_gumbel_sample_warp_optimized(
     torch::Tensor& out_tokens,
     torch::Tensor& logits,
-    torch::Tensor& uniform_samples,
+    uint64_t seed,
+    uint64_t offset,
     torch::Tensor& min_p,
     torch::Tensor& temperatures
 ) {
@@ -369,7 +387,8 @@ void fused_gumbel_sample_warp_optimized(
         vllm_eagle_optimized::fused_gumbel_sample_warp_optimized<scalar_t><<<batch_size, 1024, 0, stream>>>(
             out_tokens.data_ptr<int>(),
             logits.data_ptr<scalar_t>(),
-            uniform_samples.data_ptr<float>(),
+            seed,
+            offset,
             min_p.data_ptr<float>(),
             temperatures.data_ptr<float>(),
             batch_size,
@@ -383,8 +402,8 @@ void fused_draft_verify_sample(
     torch::Tensor& num_accepted,
     torch::Tensor& draft_logits,
     torch::Tensor& target_logits,
-    torch::Tensor& uniform_samples,
-    torch::Tensor& verify_samples,
+    uint64_t seed,
+    uint64_t offset,
     torch::Tensor& min_p,
     torch::Tensor& temperatures
 ) {
@@ -400,8 +419,8 @@ void fused_draft_verify_sample(
             num_accepted.data_ptr<int>(),
             draft_logits.data_ptr<scalar_t>(),
             target_logits.data_ptr<scalar_t>(),
-            uniform_samples.data_ptr<float>(),
-            verify_samples.data_ptr<float>(),
+            seed,
+            offset,
             min_p.data_ptr<float>(),
             temperatures.data_ptr<float>(),
             batch_size,

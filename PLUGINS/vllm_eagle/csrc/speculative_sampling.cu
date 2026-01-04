@@ -196,6 +196,7 @@ void tree_speculative_sampling_target_only(
 
 // Optimized Kernels for FlashSampling
 #include <cub/cub.cuh>
+#include <curand_kernel.h>
 
 #define NEG_INF_VAL -1e34f
 
@@ -289,7 +290,8 @@ template <typename scalar_t>
 __global__ void fused_gumbel_sample_kernel(
     int* out_tokens,
     const scalar_t* logits,          // [batch_size, vocab_size] (RAW LOGITS)
-    const float* uniform_samples,
+    const uint64_t seed,
+    const uint64_t offset,
     const float* min_p,
     const float* temperatures,       // [batch_size]
     const int batch_size,
@@ -299,7 +301,6 @@ __global__ void fused_gumbel_sample_kernel(
     if (row >= batch_size) return;
 
     const scalar_t* row_logits = logits + row * vocab_size;
-    const float* row_u = uniform_samples + row * vocab_size;
     float temp = temperatures[row];
 
     // 1. Find Max Logit for Min-P filtering
@@ -328,7 +329,12 @@ __global__ void fused_gumbel_sample_kernel(
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            float g_logit = logit + sample_scaled_gumbel(row_u[i], temp);
+            // Generate Gumbel noise on-the-fly using Philox RNG
+            curandStatePhilox4_32_10_t state;
+            curand_init(seed, row * vocab_size + i, offset, &state);
+            float u = curand_uniform(&state);
+            
+            float g_logit = logit + sample_scaled_gumbel(u, temp);
             if (g_logit > best_val) {
                 best_val = g_logit;
                 best_idx = i;
@@ -382,9 +388,8 @@ void apply_logit_filters(torch::Tensor& logits, torch::Tensor& top_k,
 void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
                          torch::Tensor& top_k, torch::Tensor& top_p,
                          torch::Tensor& min_p, torch::Tensor& temperatures,
-                         torch::Tensor& uniform_samples) {
+                         uint64_t seed, uint64_t offset) {
     CHECK_INPUT(logits);
-    CHECK_INPUT(uniform_samples);
     int batch_size = logits.size(0);
     int vocab_size = logits.size(1);
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -394,7 +399,8 @@ void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
         vllm_eagle::fused_gumbel_sample_kernel<scalar_t><<<batch_size, 1024, 0, stream>>>(
             out_tokens.data_ptr<int>(),
             logits.data_ptr<scalar_t>(),
-            uniform_samples.data_ptr<float>(),
+            seed,
+            offset,
             min_p.data_ptr<float>(),
             temperatures.data_ptr<float>(),
             batch_size,

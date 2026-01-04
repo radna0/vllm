@@ -298,6 +298,8 @@ def sample_draft_tokens(
     sampling_metadata: "SamplingMetadata | None" = None,
     num_samples: int = 1,
     return_probs: bool = False,
+    seed: int = 42,
+    offset: int = 0,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sample draft tokens with temperature support.
 
@@ -353,13 +355,6 @@ def sample_draft_tokens(
             # This operates on RAW logits per the Gold Standard
             logits_raw = _apply_sampling_filters_logits(logits_raw, sampling_metadata)
 
-        # Fused Gumbel-Max sampling
-        # We pre-generate uniform samples to keep the kernel pure (no RNG dependency)
-        u = torch.empty_like(logits_raw, dtype=torch.float32).uniform_(1e-10, 1.0)
-        batch_size = logits_raw.shape[0]
-        device = logits_raw.device
-        draft_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
-
         if fused_gumbel_sample_warp_optimized is not None:
             # Phase 2: Warp-optimized Gumbel sampling using Noise-Scaling
             # argmax(logit + T*g)
@@ -369,7 +364,8 @@ def sample_draft_tokens(
             fused_gumbel_sample_warp_optimized(
                 draft_tokens,
                 logits_raw,
-                u,
+                seed,
+                offset,
                 min_p_tensor,
                 temperature,  # Pass temperature for noise scaling
             )
@@ -383,11 +379,14 @@ def sample_draft_tokens(
                 torch.full((batch_size,), 1.0, dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
                 temperature,  # Pass temperature
-                u,
+                seed,
+                offset,
             )
             draft_tokens = draft_tokens.to(torch.int64)
         else:
             # Fallback (Manual argmax(logits + T*gumbel))
+            # We still generate noise here if the kernel is missing
+            u = torch.empty_like(logits_raw, dtype=torch.float32).uniform_(1e-10, 1.0)
             gumbel = -torch.log(-torch.log(u))
             draft_tokens = (logits_raw + temperature.unsqueeze(-1) * gumbel).argmax(
                 dim=-1
@@ -496,6 +495,12 @@ class EagleProposer:
         self.input_ids = torch.zeros(
             self.max_num_tokens, dtype=torch.int32, device=device
         )
+
+        # RNG state for in-kernel sampling
+        # We use a base seed and a rotating offset to ensure randomness across steps
+        self.sampling_seed = 42
+        self.seed_offset = 0
+
         self.uses_mrope = self.vllm_config.model_config.uses_mrope
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
@@ -788,8 +793,13 @@ class EagleProposer:
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             draft_token_ids, probs = sample_draft_tokens(
-                logits, sampling_metadata, return_probs=True
+                logits,
+                sampling_metadata,
+                return_probs=True,
+                seed=self.sampling_seed,
+                offset=self.seed_offset,
             )
+            self.seed_offset += 1
             self.last_draft_probs = probs
             return draft_token_ids.view(-1, 1)
 
@@ -841,7 +851,11 @@ class EagleProposer:
 
         # First draft token with temperature awareness
         draft_token_ids, probs = sample_draft_tokens(
-            logits, sampling_metadata, return_probs=True
+            logits,
+            sampling_metadata,
+            return_probs=True,
+            seed=self.sampling_seed,
+            offset=self.seed_offset,
         )
         if probs is not None:
             draft_probs_list.append(probs)
@@ -1005,7 +1019,11 @@ class EagleProposer:
             logits = self.model.compute_logits(last_hidden_states[:batch_size])
             # Use temperature-aware sampling
             draft_token_ids, probs = sample_draft_tokens(
-                logits, sampling_metadata, return_probs=True
+                logits,
+                sampling_metadata,
+                return_probs=True,
+                seed=self.sampling_seed,
+                offset=self.seed_offset + 1 + token_index,
             )
             if probs is not None:
                 draft_probs_list.append(probs)
@@ -1018,6 +1036,9 @@ class EagleProposer:
         if draft_probs_list:
             # Shape: [batch_size * num_speculative_tokens, vocab_size]
             self.last_draft_probs = torch.cat(draft_probs_list, dim=0)
+
+        # Increment offset for next proposal step
+        self.seed_offset += self.num_speculative_tokens
 
         return draft_token_ids
 
