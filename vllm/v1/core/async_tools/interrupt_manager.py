@@ -109,8 +109,8 @@ class InterruptManager:
             interrupt_text = payload
             tokens = tokenizer.encode(interrupt_text)
 
-            # Mark as internal-only (don't show to user in output)
-            request.async_tool_state.internal_only_token_ids.update(tokens)
+            # Note: tokens are added to prompt/all_token_ids in scheduler,
+            # which naturally filters them from output_token_ids.
 
             interrupt_tokens.extend(tokens)
             print(f"[InterruptManager] Injecting interrupt: {interrupt_text[:100]}...")

@@ -237,17 +237,15 @@ class Scheduler(SchedulerInterface):
                 HarmonyTokenMonitor,
                 InterruptManager,
                 TrapHandler,
+                JupyterToolExecutor,
             )
-            from concurrent.futures import ThreadPoolExecutor
 
             self.token_monitor = HarmonyTokenMonitor()
             self.interrupt_manager = InterruptManager(self)
             self.trap_handler = TrapHandler()
 
-            # Thread pool for async tool execution
-            self.tool_executor = ThreadPoolExecutor(
-                max_workers=4, thread_name_prefix="tool_exec"
-            )
+            # Robust Jupyter executor with pooling
+            self.jupyter_executor = JupyterToolExecutor(pool_size=8)
 
             # Persistent state for tool execution: request_id -> {"globals": {}, "locals": {}}
             self.tool_exec_states = defaultdict(lambda: {"globals": {}, "locals": {}})
@@ -1312,30 +1310,39 @@ class Scheduler(SchedulerInterface):
                                             assert event.call_id is not None
                                             assert event.call_body is not None
 
-                                            # Spawn background thread to execute tool
+                                            # Execute tool using pooled Jupyter kernels
                                             print(
-                                                f"[Scheduler] Spawning background thread for tool {event.call_id}"
-                                            )
-                                            future = self.tool_executor.submit(
-                                                self._execute_tool_async,
-                                                req_id,
-                                                event.call_id,
-                                                event.call_body,
+                                                f"[Scheduler] Executing tool {event.call_id} in background..."
                                             )
 
-                                            # Track active tool
+                                            # We still use a thread for the executor.execute call
+                                            # because we want to return to scheduler loop immediately.
+                                            # The jupyter_executor itself handles the kernel assignment.
+                                            import threading
+
+                                            def run_and_callback():
+                                                try:
+                                                    result = (
+                                                        self.jupyter_executor.execute(
+                                                            req_id, event.call_body
+                                                        )
+                                                    )
+                                                    self._on_tool_complete(
+                                                        req_id, event.call_id, result
+                                                    )
+                                                except Exception as e:
+                                                    print(
+                                                        f"[Scheduler] Executor error: {e}"
+                                                    )
+
+                                            threading.Thread(
+                                                target=run_and_callback, daemon=True
+                                            ).start()
+
+                                            # Track active tool count
                                             if req_id not in self.active_tools:
-                                                self.active_tools[req_id] = {}
-                                            self.active_tools[req_id][
-                                                event.call_id
-                                            ] = future
-
-                                            # Register callback for when tool completes
-                                            future.add_done_callback(
-                                                lambda f, rid=req_id, cid=event.call_id: self._on_tool_complete(
-                                                    rid, cid, f
-                                                )
-                                            )
+                                                self.active_tools[req_id] = set()
+                                            self.active_tools[req_id].add(event.call_id)
 
                                             # Record event
                                             request.record_event(
@@ -1346,19 +1353,12 @@ class Scheduler(SchedulerInterface):
                                                 },
                                             )
                                         elif event.type == "on_trap":
-                                            # Pause request and wait for results
+                                            # TRUE ASYNC: Do NOT pause on tool call traps.
+                                            # We only pause if it's a non-tool trap that requires human input.
+                                            # For now, we'll just log it.
                                             print(
-                                                f"[Scheduler] Trap detected for {req_id}, pausing..."
+                                                f"[Scheduler] Trap ignored for {req_id} (True Async Mode)"
                                             )
-                                            request.status = RequestStatus.WAIT_TRAP
-                                            if request.async_tool_state:
-                                                request.async_tool_state.trap_seen = (
-                                                    True
-                                                )
-                                            if self.trap_handler:
-                                                self.trap_handler.on_trap_detected(
-                                                    request, self.kv_cache_manager
-                                                )
                                         elif event.type == "set_interruptible":
                                             # Currently ignored, scheduler handles it
                                             if request.async_tool_state:
@@ -1545,7 +1545,7 @@ class Scheduler(SchedulerInterface):
         request: Request,
         new_token_ids: list[int],
     ) -> tuple[list[int], bool]:
-        # Append generated tokens and check for stop. Note that if
+        # Append generated tokens and check for stop.
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
         stopped = False
@@ -1555,6 +1555,20 @@ class Scheduler(SchedulerInterface):
             # Check for stop and update request state.
             # This must be called before we make the EngineCoreOutput.
             stopped = check_stop(request, self.max_model_len)
+
+            # TRUE ASYNC: If model want to stop but we have tools in flight,
+            # prevent stopping and keep it RUNNING so we can inject results.
+            if stopped and self.active_tools.get(request.request_id):
+                print(
+                    f"[Scheduler] Request {request.request_id} hit stop token but has active tools. Keeping alive."
+                )
+                stopped = False
+                request.status = RequestStatus.RUNNING
+                # Optional: We could set it to WAIT_TRAP here if we want to pause
+                # but the user said "continues reasoning".
+                # If it hit EOS, it stopped reasoning. But we stay RUNNING so
+                # the scheduler loop keeps checking it.
+
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
@@ -2095,117 +2109,22 @@ class Scheduler(SchedulerInterface):
 
     # ==================== Async Tool Execution Methods ====================
 
-    def _init_tool_globals(self):
-        """Initialize a clean globals namespace for tool execution."""
-        return {
-            "__builtins__": __builtins__,
-            "math": __import__("math"),
-            "sympy": __import__("sympy"),
-            "np": __import__("numpy"),
-            "numpy": __import__("numpy"),
-            "itertools": __import__("itertools"),
-            "functools": __import__("functools"),
-            "collections": __import__("collections"),
-            "fractions": __import__("fractions"),
-        }
-
-    def _execute_tool_async(self, request_id: str, call_id: str, code: str):
-        """Execute tool code in background thread.
-
-        This method runs in a worker thread from the thread pool.
-        When execution completes, it queues the result for injection.
-        """
-        import io
-        import sys
-        import contextlib
-        import traceback as tb
-        import textwrap
-
-        try:
-            print(
-                f"[Scheduler] Executing tool {call_id} for request {request_id} in background..."
-            )
-
-            # 1. State Persistence: Retrieve or init globals for this request
-            # vLLM V1 appends suffixes for turns, so we use a stable prefix
-            session_id = request_id.split("-0-")[0]
-            state = self.tool_exec_states[session_id]
-            if not state["globals"]:
-                state["globals"] = self._init_tool_globals()
-
-            exec_globals = state["globals"]
-            exec_locals = state["locals"]
-
-            # 2. Indentation Handling: Fix possible leading whitespace from extraction
-            code = textwrap.dedent(code)
-            print(f"[Scheduler] Code ({len(code)} chars): {code[:100]}...")
-
-            # 3. Preprocess code: add print for last expression if needed
-            stdout_capture = io.StringIO()
-            code_lines = code.strip().split("\n")
-            if code_lines:
-                last_line = code_lines[-1].strip()
-                # If last line is a simple expression (not assignment, not control flow)
-                if last_line and not any(
-                    [
-                        "=" in last_line and "==" not in last_line,
-                        last_line.startswith(
-                            (
-                                "if ",
-                                "for ",
-                                "while ",
-                                "def ",
-                                "class ",
-                                "return ",
-                                "#",
-                                "print(",
-                            )
-                        ),
-                    ]
-                ):
-                    # Wrap last line to print its value
-                    code_lines[-1] = f"__result__ = {last_line}"
-                    code_lines.append("if __result__ is not None: print(__result__)")
-                code = "\n".join(code_lines)
-
-            # Execute with stdout capture and timeout
-            with contextlib.redirect_stdout(stdout_capture):
-                exec(code, exec_globals, exec_locals)
-
-            result = stdout_capture.getvalue()
-            if not result.strip():
-                result = "Code executed successfully (no output)"
-
-            print(f"[Scheduler] Tool {call_id} completed: {result[:100]}...")
-            return result.strip()
-
-        except Exception as e:
-            error_msg = f"[ERROR] {e}\n{tb.format_exc()}"
-            print(f"[Scheduler] Tool {call_id} failed: {error_msg}")
-            return error_msg
-
-    def _on_tool_complete(self, request_id: str, call_id: str, future):
+    def _on_tool_complete(self, request_id: str, call_id: str, result: str):
         """Callback when tool execution completes.
 
-        This is called by the thread pool when a tool finishes.
         It formats the result and queues it for injection into the generation.
         """
         try:
-            result = future.result()
-
-            # Format as Harmony TOOL message
-            injection = (
-                f"<|channel|>tool<|recipient_start|>assistant<|recipient_end|>"
-                f"<|content_start|>{result}<|content_end|>"
-            )
+            # Format as standard Harmony TOOL message
+            injection = f"<|start|><|channel|>tool<|message|>{result}<|end|>"
 
             # Queue interrupt for injection
-            print(f"[Scheduler] Queueing result injection for {call_id}")
+            print(f"[Scheduler] Result ready for {call_id}, queueing injection.")
             self.interrupt_manager.enqueue_interrupt(request_id, call_id, injection)
 
             # Remove from active tools
             if request_id in self.active_tools:
-                self.active_tools[request_id].pop(call_id, None)
+                self.active_tools[request_id].discard(call_id)
                 if not self.active_tools[request_id]:
                     del self.active_tools[request_id]
 
