@@ -914,13 +914,9 @@ class EagleProposer:
             common_attn_metadata._num_computed_tokens_cpu = None
 
         # Track termination per sequence in the batch
-        # GPT-OSS-120B EOS tokens: 200002, 199999, 200012
-        eos_token_ids = torch.tensor(
-            [199999, 200002, 200012],
-            device=draft_token_ids.device,
-            dtype=torch.int32,
-        )
-        is_terminated = torch.any(draft_token_ids.view(-1, 1) == eos_token_ids, dim=1)
+        # GPT-OSS-120B primary EOS token is 200002
+        eos_token_id = 200002
+        is_terminated = (draft_token_ids == eos_token_id).view(-1)
 
         for token_index in range(self.num_speculative_tokens - 1):
             # If all sequences are terminated, stop early
@@ -1048,14 +1044,12 @@ class EagleProposer:
             draft_token_ids_list.append(draft_token_ids)
 
             # Update termination status for next iteration
-            is_terminated |= torch.any(
-                draft_token_ids.view(-1, 1) == eos_token_ids, dim=1
-            )
+            is_terminated |= (draft_token_ids == eos_token_id).view(-1)
 
         # Pad the list to full num_speculative_tokens if we broke early
         while len(draft_token_ids_list) < self.num_speculative_tokens:
-            # Pad with a primary EOS to ensure safety (200002)
-            pad_tokens = torch.full_like(draft_token_ids_list[0], 200002)
+            # Pad with EOS to ensure safety
+            pad_tokens = torch.full_like(draft_token_ids_list[0], eos_token_id)
             draft_token_ids_list.append(pad_tokens)
 
         # [batch_size, num_speculative_tokens]
