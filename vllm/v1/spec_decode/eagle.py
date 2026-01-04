@@ -333,7 +333,13 @@ def sample_draft_tokens(
         return tokens
 
     assert sampling_metadata.temperature is not None
-    temperature = sampling_metadata.temperature
+    temperature = sampling_metadata.temperature.to(torch.float32)
+
+    # GOLD STANDARD: We stay in RAW logit domain for the primary sampling path.
+    logits_raw = logits
+    batch_size = logits_raw.shape[0]
+    device = logits_raw.device
+    draft_tokens = torch.empty((batch_size,), dtype=torch.int32, device=device)
 
     # Handle mixed greedy/random requests
     is_greedy = None
@@ -341,8 +347,6 @@ def sample_draft_tokens(
         is_greedy = temperature < _SAMPLING_EPS
         # Avoid division by zero for greedy requests
         temperature = torch.where(is_greedy, torch.ones_like(temperature), temperature)
-    # GOLD STANDARD: We stay in RAW logit domain for the primary sampling path.
-    logits_raw = logits
 
     # Deduplicate scaling if needed for probs or multi-sample
     logits_scaled = None
@@ -909,7 +913,20 @@ class EagleProposer:
             common_attn_metadata._seq_lens_cpu = None
             common_attn_metadata._num_computed_tokens_cpu = None
 
+        # Track termination per sequence in the batch
+        # GPT-OSS-120B EOS tokens: 200002, 199999, 200012
+        eos_token_ids = torch.tensor(
+            [199999, 200002, 200012],
+            device=draft_token_ids.device,
+            dtype=torch.int32,
+        )
+        is_terminated = torch.any(draft_token_ids.view(-1, 1) == eos_token_ids, dim=1)
+
         for token_index in range(self.num_speculative_tokens - 1):
+            # If all sequences are terminated, stop early
+            if is_terminated.all():
+                break
+
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -1029,6 +1046,17 @@ class EagleProposer:
             if probs is not None:
                 draft_probs_list.append(probs)
             draft_token_ids_list.append(draft_token_ids)
+
+            # Update termination status for next iteration
+            is_terminated |= torch.any(
+                draft_token_ids.view(-1, 1) == eos_token_ids, dim=1
+            )
+
+        # Pad the list to full num_speculative_tokens if we broke early
+        while len(draft_token_ids_list) < self.num_speculative_tokens:
+            # Pad with a primary EOS to ensure safety (200002)
+            pad_tokens = torch.full_like(draft_token_ids_list[0], 200002)
+            draft_token_ids_list.append(pad_tokens)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)

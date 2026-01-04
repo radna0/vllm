@@ -137,8 +137,27 @@ def fused_gumbel_sample(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     min_p: torch.Tensor,
-    uniform_samples: torch.Tensor,
+    temperatures: torch.Tensor,
+    seed: int,
+    offset: int,
 ) -> None:
     if _C is None:
         raise ImportError("vllm_eagle C++ extension is not available")
-    _C.fused_gumbel_sample(out_tokens, logits, top_k, top_p, min_p, uniform_samples)
+    _C.fused_gumbel_sample(
+        out_tokens, logits, top_k, top_p, min_p, temperatures, seed, offset
+    )
+
+
+def fused_gumbel_sample_warp_optimized(
+    out_tokens: torch.Tensor,
+    logits: torch.Tensor,
+    seed: int,
+    offset: int,
+    min_p: torch.Tensor,
+    temperatures: torch.Tensor,
+) -> None:
+    if _C is None:
+        raise ImportError("vllm_eagle C++ extension is not available")
+    _C.fused_gumbel_sample_warp_optimized(
+        out_tokens, logits, seed, offset, min_p, temperatures
+    )

@@ -326,12 +326,15 @@ __global__ void fused_gumbel_sample_kernel(
     float best_val = -1e34f;
     int best_idx = -1;
 
+    // PRE-INITIALIZE RNG once per thread to avoid bottleneck
+    curandStatePhilox4_32_10_t state;
+    // We use (seed, row*vocab_size + threadIdx.x, offset) as base
+    curand_init(seed, row * 1024 + threadIdx.x, offset, &state);
+
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            // Generate Gumbel noise on-the-fly using Philox RNG
-            curandStatePhilox4_32_10_t state;
-            curand_init(seed, row * vocab_size + i, offset, &state);
+            // Use the already initialized state to generate noise
             float u = curand_uniform(&state);
             
             float g_logit = logit + sample_scaled_gumbel(u, temp);
@@ -373,7 +376,7 @@ void apply_logit_filters(torch::Tensor& logits, torch::Tensor& top_k,
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     at::cuda::CUDAGuard device_guard(logits.device());
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "apply_logit_filters", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, logits.scalar_type(), "apply_logit_filters", [&] {
         vllm_eagle::apply_logit_filters_kernel<scalar_t><<<batch_size, 1024, 0, stream>>>(
             logits.data_ptr<scalar_t>(),
             top_k.data_ptr<int>(),
@@ -395,7 +398,7 @@ void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     at::cuda::CUDAGuard device_guard(logits.device());
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "fused_gumbel_sample", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, logits.scalar_type(), "fused_gumbel_sample", [&] {
         vllm_eagle::fused_gumbel_sample_kernel<scalar_t><<<batch_size, 1024, 0, stream>>>(
             out_tokens.data_ptr<int>(),
             logits.data_ptr<scalar_t>(),

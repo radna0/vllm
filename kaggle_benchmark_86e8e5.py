@@ -39,7 +39,10 @@ class TeeLogger:
         return self.terminal.isatty()
 
 
-LOG_FILE = "/kaggle/working/correctness_benchmark_log.txt"
+# Environment-aware logging
+LOG_FILE = os.environ.get("LOG_FILE", "/kaggle/working/correctness_benchmark_log.txt")
+# Ensure directory exists for logs
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 sys.stdout = TeeLogger(LOG_FILE)
 sys.stderr = sys.stdout
 
@@ -58,8 +61,21 @@ MAX_ITER = 100  # Safety limit (actual limit is context length)
 TARGET_PROBLEM_ID = "424e18"
 
 # Model paths
-MODEL_PATH = "/kaggle/input/gpt-oss-120b/transformers/default/1"
-DRAFT_MODEL_PATH = "/kaggle/input/gpt/transformers/gpt-oss-120b-eagle3/1"
+# Model paths (Environment aware)
+MODEL_PATH = os.environ.get(
+    "MODEL_PATH", "/kaggle/input/gpt-oss-120b/transformers/default/1"
+)
+DRAFT_MODEL_PATH = os.environ.get(
+    "DRAFT_MODEL_PATH", "/kaggle/input/gpt/transformers/gpt-oss-120b-eagle3/1"
+)
+REFERENCE_CSV_PATH = os.environ.get(
+    "REFERENCE_CSV_PATH",
+    "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv",
+)
+VLLM_LOG_PATH = os.environ.get("VLLM_LOG_PATH", "/kaggle/working/vllm.log")
+RESULTS_JSON_PATH = os.environ.get(
+    "RESULTS_JSON_PATH", "/kaggle/working/correctness_results.json"
+)
 
 # TIR Prompt (exactly as in Kaggle notebook)
 TIR_PROMPT = """Please reason step by step and use the python tool to solve the math problem.
@@ -256,7 +272,7 @@ def start_vllm_server():
         "--trust-remote-code",
     ]
 
-    logfile_path = "/kaggle/working/vllm.log"
+    logfile_path = VLLM_LOG_PATH
     with open(logfile_path, "w") as logfile:
         process = subprocess.Popen(
             command, stdout=logfile, stderr=subprocess.STDOUT, start_new_session=True
@@ -329,9 +345,7 @@ def run_benchmark():
 
     # Load problem
     try:
-        df = pd.read_csv(
-            "/kaggle/input/ai-mathematical-olympiad-progress-prize-3/reference.csv"
-        )
+        df = pd.read_csv(REFERENCE_CSV_PATH)
         problem_row = df[df["id"] == TARGET_PROBLEM_ID].iloc[0]
         problem_text = problem_row["problem"]
         ground_truth = problem_row["answer"]
@@ -514,7 +528,7 @@ def run_benchmark():
         "raw_results": results,
     }
 
-    with open("/kaggle/working/correctness_results.json", "w") as f:
+    with open(RESULTS_JSON_PATH, "w") as f:
         json.dump(output_data, f, indent=2)
 
     # Cleanup

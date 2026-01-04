@@ -171,12 +171,14 @@ __global__ void fused_gumbel_sample_warp_optimized(
     float best_val = NEG_INF_VAL;
     int best_idx = -1;
 
+    // PRE-INITIALIZE RNG once per thread to avoid bottleneck
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, row * 1024 + threadIdx.x, offset, &state);
+
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            // Generate Gumbel noise on-the-fly using Philox RNG
-            curandStatePhilox4_32_10_t state;
-            curand_init(seed, row * vocab_size + i, offset, &state);
+            // Use the already initialized state to generate noise
             float u = curand_uniform(&state);
             
             float g_logit = logit + sample_scaled_gumbel(u, row_temp);
@@ -280,18 +282,21 @@ __global__ void fused_draft_verify_sample_kernel(
 
         threshold = s_max_draft + logf(min_p[row] + 1e-10f);
 
-        // Step 2: Sample draft token using Noise-Scaling Gumbel-Max
+        // Step 2: Sample draft token using Gumbel-Max
         float best_val = NEG_INF_VAL;
         int best_idx = -1;
         float row_temp_inner = temperatures[row];
 
+        // PRE-INITIALIZE RNG once per draft position (or better, once per kernel)
+        // We use (seed, (row * max_draft_len + draft_pos) * 1024 + threadIdx.x, offset)
+        curandStatePhilox4_32_10_t state;
+        uint64_t base_sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * 1024 + threadIdx.x;
+        curand_init(seed, base_sub_seq, offset, &state);
+
         for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
             float logit = (float)draft_logits_pos[i];
             if (logit >= threshold) {
-                // Generate Gumbel noise on-the-fly
-                curandStatePhilox4_32_10_t state;
-                uint64_t sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * (vocab_size + 1) + i;
-                curand_init(seed, sub_seq, offset, &state);
+                // Use the already initialized state
                 float u = curand_uniform(&state);
                 
                 float g_logit = logit + sample_scaled_gumbel(u, row_temp_inner);
@@ -335,9 +340,9 @@ __global__ void fused_draft_verify_sample_kernel(
         float log_acceptance_prob = (target_logit_token - draft_logit_token) / fmaxf(row_temp, 1e-6f);
         float acceptance_prob = fminf(1.0f, expf(log_acceptance_prob));
         
-        // Generate verification sample on-the-fly
+        // Generate verification sample on-the-fly (init once per draft_pos)
         curandStatePhilox4_32_10_t v_state;
-        uint64_t v_sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * (vocab_size + 1) + vocab_size;
+        uint64_t v_sub_seq = (uint64_t(row) * max_draft_len + draft_pos) * 1024 + 1023; // Use a high index for v_state
         curand_init(seed, v_sub_seq, offset, &v_state);
         float v_sample = curand_uniform(&v_state);
         
@@ -383,7 +388,7 @@ void fused_gumbel_sample_warp_optimized(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     at::cuda::CUDAGuard device_guard(logits.device());
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(logits.scalar_type(), "fused_gumbel_sample_warp_optimized", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, logits.scalar_type(), "fused_gumbel_sample_warp_optimized", [&] {
         vllm_eagle_optimized::fused_gumbel_sample_warp_optimized<scalar_t><<<batch_size, 1024, 0, stream>>>(
             out_tokens.data_ptr<int>(),
             logits.data_ptr<scalar_t>(),
@@ -413,7 +418,7 @@ void fused_draft_verify_sample(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     at::cuda::CUDAGuard device_guard(draft_logits.device());
 
-    AT_DISPATCH_FLOATING_TYPES_AND_HALF(draft_logits.scalar_type(), "fused_draft_verify_sample", [&] {
+    AT_DISPATCH_FLOATING_TYPES_AND2(at::ScalarType::Half, at::ScalarType::BFloat16, draft_logits.scalar_type(), "fused_draft_verify_sample", [&] {
         vllm_eagle_optimized::fused_draft_verify_sample_kernel<scalar_t><<<batch_size, 1024, 0, stream>>>(
             accepted_tokens.data_ptr<int>(),
             num_accepted.data_ptr<int>(),
