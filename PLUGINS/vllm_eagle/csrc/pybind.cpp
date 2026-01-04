@@ -28,15 +28,17 @@ void apply_logit_filters(torch::Tensor& logits, torch::Tensor& top_k,
                          torch::Tensor& top_p, torch::Tensor& min_p);
 
 void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
-                         torch::Tensor& top_p, torch::Tensor& top_k,
-                         torch::Tensor& min_p, torch::Tensor& uniform_samples);
+                         torch::Tensor& top_k, torch::Tensor& top_p,
+                         torch::Tensor& min_p, torch::Tensor& temperatures,
+                         torch::Tensor& uniform_samples);
 
 // Phase 2 Optimizations
 void fused_gumbel_sample_warp_optimized(
     torch::Tensor& out_tokens,
     torch::Tensor& logits,
     torch::Tensor& uniform_samples,
-    torch::Tensor& min_p);
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures);
 
 void fused_draft_verify_sample(
     torch::Tensor& accepted_tokens,
@@ -45,7 +47,8 @@ void fused_draft_verify_sample(
     torch::Tensor& target_logits,
     torch::Tensor& uniform_samples,
     torch::Tensor& verify_samples,
-    torch::Tensor& min_p);
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "Build tree kernel efficient");

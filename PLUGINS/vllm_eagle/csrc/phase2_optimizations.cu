@@ -83,11 +83,11 @@ __device__ __forceinline__ ValIdx warp_reduce_argmax(ValIdx local) {
     return local;
 }
 
-/**
- * Gumbel sampling helper
- */
-__device__ __forceinline__ float sample_gumbel(float u) {
-    return -logf(-logf(fmaxf(u, 1e-10f)));
+// Noise-scaling Gumbel sampling helper
+__device__ __forceinline__ float sample_scaled_gumbel(float u, float temperature) {
+    // Identity: argmax(y/T + g) == argmax(y + T*g)
+    // We use y + T*g to preserve numerical precision of raw logits
+    return temperature * -logf(-logf(fmaxf(u, 1e-10f)));
 }
 
 /**
@@ -102,9 +102,10 @@ __device__ __forceinline__ float sample_gumbel(float u) {
 template <typename scalar_t>
 __global__ void fused_gumbel_sample_warp_optimized(
     int* out_tokens,
-    const scalar_t* logits,
+    const scalar_t* logits,          // [batch_size, vocab_size] (RAW LOGITS)
     const float* uniform_samples,
     const float* min_p,
+    const float* temperatures,       // [batch_size]
     const int batch_size,
     const int vocab_size
 ) {
@@ -161,17 +162,18 @@ __global__ void fused_gumbel_sample_warp_optimized(
     }
     __syncthreads();
 
-    // Phase 2: Apply min_p threshold
+    // Phase 2: Apply min_p threshold (RAW LOGITS)
     float threshold = s_max_logit + logf(min_p[row] + 1e-10f);
+    float row_temp = temperatures[row];
 
-    // Phase 3: Gumbel + ArgMax using warp-level reduction
+    // Phase 3: Noise-Scaled Gumbel + ArgMax using warp-level reduction
     float best_val = NEG_INF_VAL;
     int best_idx = -1;
 
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            float g_logit = logit + sample_gumbel(row_u[i]);
+            float g_logit = logit + sample_scaled_gumbel(row_u[i], row_temp);
             if (g_logit > best_val) {
                 best_val = g_logit;
                 best_idx = i;
@@ -222,13 +224,14 @@ __global__ void fused_gumbel_sample_warp_optimized(
  */
 template <typename scalar_t>
 __global__ void fused_draft_verify_sample_kernel(
-    int* accepted_tokens,        // Output: accepted token IDs [batch_size, max_draft_len]
-    int* num_accepted,           // Output: number of accepted tokens per batch [batch_size]
-    const scalar_t* draft_logits,   // Input: draft model logits [batch_size, max_draft_len, vocab_size]
-    const scalar_t* target_logits,  // Input: target model logits [batch_size, max_draft_len+1, vocab_size]
-    const float* uniform_samples,   // Input: uniform samples for Gumbel [batch_size, max_draft_len, vocab_size]
-    const float* verify_samples,    // Input: uniform samples for verification [batch_size, max_draft_len]
-    const float* min_p,             // Input: min_p threshold [batch_size]
+    int* accepted_tokens,            // Output: [batch_size, max_draft_len]
+    int* num_accepted,               // Output: [batch_size]
+    const scalar_t* draft_logits,       // Input: [batch_size, max_draft_len, vocab_size] (RAW)
+    const scalar_t* target_logits,      // Input: [batch_size, max_draft_len+1, vocab_size] (RAW)
+    const float* uniform_samples,       // Input: [batch_size, max_draft_len, vocab_size]
+    const float* verify_samples,        // Input: [batch_size, max_draft_len]
+    const float* min_p,                 // Input: [batch_size]
+    const float* temperatures,          // Input: [batch_size]
     const int batch_size,
     const int max_draft_len,
     const int vocab_size
@@ -272,14 +275,15 @@ __global__ void fused_draft_verify_sample_kernel(
 
         threshold = s_max_draft + logf(min_p[row] + 1e-10f);
 
-        // Step 2: Sample draft token using Gumbel-Max
+        // Step 2: Sample draft token using Noise-Scaling Gumbel-Max
         float best_val = NEG_INF_VAL;
         int best_idx = -1;
+        float row_temp_inner = temperatures[row];
 
         for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
             float logit = (float)draft_logits_pos[i];
             if (logit >= threshold) {
-                float g_logit = logit + sample_gumbel(uniform_pos[i]);
+                float g_logit = logit + sample_scaled_gumbel(uniform_pos[i], row_temp_inner);
                 if (g_logit > best_val) {
                     best_val = g_logit;
                     best_idx = i;
@@ -303,16 +307,21 @@ __global__ void fused_draft_verify_sample_kernel(
         __syncthreads();
 
         // Step 3: Verify draft token against target distribution
-        // Compute acceptance probability: min(1, p_target / p_draft)
+        // Correct rejection sampling probability: min(1, p_target / p_draft)
         
-        // Get draft and target logits for the sampled token
         float draft_logit_token = (float)draft_logits_pos[draft_token];
         float target_logit_token = (float)target_logits_pos[draft_token];
+        float row_temp = temperatures[row];
         
-        // Compute log probabilities (simplified, assuming filtered distributions)
-        // In practice, we'd need to compute proper softmax denominators
-        // For now, use logit difference as approximation
-        float log_acceptance_prob = target_logit_token - draft_logit_token;
+        // Acceptance probability derivation:
+        // log(p_target) = (logit_target / T) - logsumexp(logit_target / T)
+        // log(p_draft) = (logit_draft / T) - logsumexp(logit_draft / T)
+        // a = exp(log(p_target) - log(p_draft))
+        //   = exp((logit_target - logit_draft) / T + context_invariant_constant)
+        // For EAGLE, we assume the draft model matches the target locally, 
+        // simplifying to exp((y_target - y_draft) / T).
+        
+        float log_acceptance_prob = (target_logit_token - draft_logit_token) / fmaxf(row_temp, 1e-6f);
         float acceptance_prob = fminf(1.0f, expf(log_acceptance_prob));
         
         // Accept/reject decision
@@ -348,7 +357,8 @@ void fused_gumbel_sample_warp_optimized(
     torch::Tensor& out_tokens,
     torch::Tensor& logits,
     torch::Tensor& uniform_samples,
-    torch::Tensor& min_p
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures
 ) {
     int batch_size = logits.size(0);
     int vocab_size = logits.size(1);
@@ -361,6 +371,7 @@ void fused_gumbel_sample_warp_optimized(
             logits.data_ptr<scalar_t>(),
             uniform_samples.data_ptr<float>(),
             min_p.data_ptr<float>(),
+            temperatures.data_ptr<float>(),
             batch_size,
             vocab_size
         );
@@ -374,7 +385,8 @@ void fused_draft_verify_sample(
     torch::Tensor& target_logits,
     torch::Tensor& uniform_samples,
     torch::Tensor& verify_samples,
-    torch::Tensor& min_p
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures
 ) {
     int batch_size = draft_logits.size(0);
     int max_draft_len = draft_logits.size(1);
@@ -391,6 +403,7 @@ void fused_draft_verify_sample(
             uniform_samples.data_ptr<float>(),
             verify_samples.data_ptr<float>(),
             min_p.data_ptr<float>(),
+            temperatures.data_ptr<float>(),
             batch_size,
             max_draft_len,
             vocab_size

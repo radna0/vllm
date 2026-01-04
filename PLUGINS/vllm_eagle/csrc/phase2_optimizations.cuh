@@ -12,7 +12,8 @@ void fused_gumbel_sample_warp_optimized(
     torch::Tensor& out_tokens,
     torch::Tensor& logits,
     torch::Tensor& uniform_samples,
-    torch::Tensor& min_p
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures
 );
 
 // Fused draft-verify-sample kernel
@@ -23,5 +24,6 @@ void fused_draft_verify_sample(
     torch::Tensor& target_logits,
     torch::Tensor& uniform_samples,
     torch::Tensor& verify_samples,
-    torch::Tensor& min_p
+    torch::Tensor& min_p,
+    torch::Tensor& temperatures
 );

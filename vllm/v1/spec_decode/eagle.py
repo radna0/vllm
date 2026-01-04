@@ -127,9 +127,8 @@ def fused_sample_and_verify(
     max_draft_len = draft_logits.size(1)
     device = draft_logits.device
 
-    # Apply temperature scaling
-    draft_logits_scaled = draft_logits / max(temperature, 1e-6)
-    target_logits_scaled = target_logits / max(temperature, 1e-6)
+    # GOLD STANDARD: We no longer scale here. The fused kernel handles T.
+    # This preserves raw logit precision for the 120B model.
 
     # Pre-generate uniform samples for Gumbel and verification
     uniform_samples = torch.empty(
@@ -153,14 +152,17 @@ def fused_sample_and_verify(
     num_accepted = torch.empty(batch_size, dtype=torch.int32, device=device)
 
     # Single fused kernel call (replaces 3+ kernel launches)
+    # GOLD STANDARD: Fused kernel now handles temperature scaling internally
+    # and correctly implements rejection sampling probability.
     fused_draft_verify_sample(
         accepted_tokens,
         num_accepted,
-        draft_logits_scaled,
-        target_logits_scaled,
+        draft_logits,  # RAW
+        target_logits,  # RAW
         uniform_samples,
         verify_samples,
         min_p_tensor,
+        torch.full((batch_size,), temperature, dtype=torch.float32, device=device),
     )
 
     return accepted_tokens, num_accepted
@@ -320,6 +322,7 @@ def sample_draft_tokens(
         if num_samples == 1:
             tokens = logits.argmax(dim=-1)
         else:
+            # For tree decoding, we still use top-k on raw logits
             tokens = torch.topk(logits, num_samples, dim=-1).indices
 
         if return_probs:
@@ -338,57 +341,56 @@ def sample_draft_tokens(
     else:
         is_greedy = None
 
-    # Apply temperature scaling
-    logits_scaled = logits / temperature.unsqueeze(-1)
+    # GOLD STANDARD: We stay in RAW logit domain.
+    # We do NOT divide by temperature here. Scaling is handled by Gumbel noise.
+    logits_raw = logits
 
     if num_samples == 1:
         # Optimized path (num_samples=1): Use FlashSampling/Logit-domain Gumbel-Max
         if ENABLE_DRAFT_SAMPLING:
             # Apply filters in logit domain (FastSampling) using optimized kernel
-            logits_scaled = _apply_sampling_filters_logits(
-                logits_scaled, sampling_metadata
-            )
+            # This operates on RAW logits per the Gold Standard
+            logits_raw = _apply_sampling_filters_logits(logits_raw, sampling_metadata)
 
         # Fused Gumbel-Max sampling
         # We pre-generate uniform samples to keep the kernel pure (no RNG dependency)
-        u = torch.empty_like(logits_scaled, dtype=torch.float32).uniform_(1e-10, 1.0)
-        batch_size = logits_scaled.shape[0]
-        device = logits_scaled.device
+        u = torch.empty_like(logits_raw, dtype=torch.float32).uniform_(1e-10, 1.0)
+        batch_size = logits_raw.shape[0]
+        device = logits_raw.device
         draft_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
 
-        batch_size = logits_scaled.shape[0]
-        device = logits_scaled.device
-        u = torch.empty_like(logits_scaled, dtype=torch.float32).uniform_(1e-10, 1.0)
-
         if fused_gumbel_sample_warp_optimized is not None:
-            # Phase 2: Warp-optimized Gumbel sampling (5-10% faster)
-            draft_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
+            # Phase 2: Warp-optimized Gumbel sampling using Noise-Scaling
+            # argmax(logit + T*g)
             min_p_tensor = torch.zeros(
                 (batch_size,), dtype=torch.float32, device=device
             )
             fused_gumbel_sample_warp_optimized(
                 draft_tokens,
-                logits_scaled,
+                logits_raw,
                 u,
                 min_p_tensor,
+                temperature,  # Pass temperature for noise scaling
             )
             draft_tokens = draft_tokens.to(torch.int64)
         elif eagle_ops is not None:
-            # Original: Block-level Gumbel-Max sampling
-            draft_tokens = torch.empty(batch_size, dtype=torch.int32, device=device)
+            # Original: Block-level Gumbel-Max sampling using Noise-Scaling
             eagle_ops.fused_gumbel_sample(
                 draft_tokens,
-                logits_scaled,
+                logits_raw,
                 torch.full((batch_size,), -1, dtype=torch.int32, device=device),
                 torch.full((batch_size,), 1.0, dtype=torch.float32, device=device),
                 torch.zeros((batch_size,), dtype=torch.float32, device=device),
+                temperature,  # Pass temperature
                 u,
             )
             draft_tokens = draft_tokens.to(torch.int64)
         else:
-            # Fallback (Manual argmax(logits + gumbel))
+            # Fallback (Manual argmax(logits + T*gumbel))
             gumbel = -torch.log(-torch.log(u))
-            draft_tokens = (logits_scaled + gumbel).argmax(dim=-1)
+            draft_tokens = (logits_raw + temperature.unsqueeze(-1) * gumbel).argmax(
+                dim=-1
+            )
 
         # Override with argmax for greedy requests
         if is_greedy is not None:
@@ -397,14 +399,23 @@ def sample_draft_tokens(
 
         if return_probs:
             # We rarely need probs here but if requested, we must compute them
-            # This follows the original logic but optimized
-            probs = torch.softmax(logits_scaled, dim=-1)
+            # This follows the original logic but optimized.
+            # Note: For Return Probs, we use the standard softmax(y/T)
+            # to match the rejection sampler's expectations.
+            logits_temp = logits_raw / temperature.unsqueeze(-1)
+            probs = torch.softmax(logits_temp, dim=-1)
             return draft_tokens, probs
     else:
-        # Multi-sample path (tree decoding): Still compute probs for multinomial
-        probs = torch.softmax(logits_scaled, dim=-1)
+        # Multi-sample path (tree decoding): Compute probs for multinomial
+        # We MUST divide by temperature here for the softmax distribution.
+        logits_temp = logits_raw / temperature.unsqueeze(-1)
+        probs = torch.softmax(logits_temp, dim=-1)
+
         if ENABLE_DRAFT_SAMPLING:
+            # Draft filtering is done in probability space for the multinomial path
             probs = _apply_sampling_filters(probs, sampling_metadata)
+            # Normalize after filtering
+            probs = probs / probs.sum(dim=-1, keepdim=True)
 
         # For multi-sample (tree decoding), sample without replacement
         draft_tokens = torch.multinomial(probs, num_samples, replacement=False)

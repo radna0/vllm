@@ -201,14 +201,16 @@ void tree_speculative_sampling_target_only(
 
 namespace vllm_eagle {
 
-// Gumbel sampling helper
-__device__ __forceinline__ float sample_gumbel(float u) {
-    return -logf(-logf(fmaxf(u, 1e-10f)));
+// Noise-scaling Gumbel sampling helper
+__device__ __forceinline__ float sample_scaled_gumbel(float u, float temperature) {
+    // Identity: argmax(y/T + g) == argmax(y + T*g)
+    // We use y + T*g to preserve numerical precision of raw logits
+    return temperature * -logf(-logf(fmaxf(u, 1e-10f)));
 }
 
 template <typename scalar_t>
 __global__ void apply_logit_filters_kernel(
-    scalar_t* logits,          // [batch_size, vocab_size]
+    scalar_t* logits,          // [batch_size, vocab_size] (RAW LOGITS)
     const int* top_k,          // [batch_size]
     const float* top_p,        // [batch_size]
     const float* min_p,        // [batch_size]
@@ -220,10 +222,9 @@ __global__ void apply_logit_filters_kernel(
 
     scalar_t* row_logits = logits + row * vocab_size;
     int row_top_k = top_k[row];
-    float row_top_p = top_p[row];
     float row_min_p = min_p[row];
     
-    // 1. Find Max Logit (for Min-P and initial bounds)
+    // 1. Find Max Logit from RAW distribution
     float local_max = -1e34f;
     float local_min = 1e34f;
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
@@ -248,7 +249,7 @@ __global__ void apply_logit_filters_kernel(
 
     float threshold = -1e34f;
 
-    // 2. Min-P Threshold
+    // 2. Min-P Threshold (using RAW logits per paper)
     float min_p_threshold = s_max_logit + logf(row_min_p + 1e-10f);
     threshold = fmaxf(threshold, min_p_threshold);
 
@@ -276,11 +277,6 @@ __global__ void apply_logit_filters_kernel(
         }
         threshold = fmaxf(threshold, lo);
     }
-
-    // 4. Top-P (Nucleus) - Approximate via sorting Top-K elements if K is reasonably small
-    // Here we apply the current threshold and then optionally refine with Top-P in Python
-    // OR we do a single-pass mask here. Scaling Top-P to 128k is hard without full sort.
-    // For now, we apply the tighter of Min-P and Top-K.
     
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         if ((float)row_logits[i] < threshold) {
@@ -292,9 +288,10 @@ __global__ void apply_logit_filters_kernel(
 template <typename scalar_t>
 __global__ void fused_gumbel_sample_kernel(
     int* out_tokens,
-    const scalar_t* logits,
+    const scalar_t* logits,          // [batch_size, vocab_size] (RAW LOGITS)
     const float* uniform_samples,
     const float* min_p,
+    const float* temperatures,       // [batch_size]
     const int batch_size,
     const int vocab_size
 ) {
@@ -303,44 +300,35 @@ __global__ void fused_gumbel_sample_kernel(
 
     const scalar_t* row_logits = logits + row * vocab_size;
     const float* row_u = uniform_samples + row * vocab_size;
+    float temp = temperatures[row];
 
-    // 1. Find Max/Min Logit
+    // 1. Find Max Logit for Min-P filtering
     float local_max = -1e34f;
-    float local_min = 1e34f;
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-        float val = (float)row_logits[i];
-        local_max = fmaxf(local_max, val);
-        local_min = fminf(local_min, val);
+        local_max = fmaxf(local_max, (float)row_logits[i]);
     }
 
     typedef cub::BlockReduce<float, 1024> BlockReduceFloat;
     __shared__ typename BlockReduceFloat::TempStorage temp_storage_f;
     float aggregate_max = BlockReduceFloat(temp_storage_f).Reduce(local_max, cub::Max());
     __syncthreads();
-    float aggregate_min = BlockReduceFloat(temp_storage_f).Reduce(local_min, cub::Min());
 
     __shared__ float s_max_logit;
-    __shared__ float s_min_logit;
-    if (threadIdx.x == 0) {
-        s_max_logit = aggregate_max;
-        s_min_logit = aggregate_min;
-    }
+    if (threadIdx.x == 0) s_max_logit = aggregate_max;
     __syncthreads();
-
-    // 2. Binary Search for Top-K (We use a fixed K=50 for this fused op as a heuristic if top_k isn't passed)
-    // In our eagle.py, we already applied filters in _apply_sampling_filters_logits, 
-    // so here we should ideally use the mask. But we can also re-apply min_p here for safety.
     
+    // 2. Threshold from RAW distribution
     float threshold = s_max_logit + logf(min_p[row] + 1e-10f);
 
-    // 3. Gumbel + ArgMax
+    // 3. Noise-Scaled Gumbel + ArgMax
+    // argmax(logit + temp * gumbel)
     float best_val = -1e34f;
     int best_idx = -1;
 
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
         float logit = (float)row_logits[i];
         if (logit >= threshold) {
-            float g_logit = logit + sample_gumbel(row_u[i]);
+            float g_logit = logit + sample_scaled_gumbel(row_u[i], temp);
             if (g_logit > best_val) {
                 best_val = g_logit;
                 best_idx = i;
@@ -393,7 +381,8 @@ void apply_logit_filters(torch::Tensor& logits, torch::Tensor& top_k,
 
 void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
                          torch::Tensor& top_k, torch::Tensor& top_p,
-                         torch::Tensor& min_p, torch::Tensor& uniform_samples) {
+                         torch::Tensor& min_p, torch::Tensor& temperatures,
+                         torch::Tensor& uniform_samples) {
     CHECK_INPUT(logits);
     CHECK_INPUT(uniform_samples);
     int batch_size = logits.size(0);
@@ -407,6 +396,7 @@ void fused_gumbel_sample(torch::Tensor& out_tokens, torch::Tensor& logits,
             logits.data_ptr<scalar_t>(),
             uniform_samples.data_ptr<float>(),
             min_p.data_ptr<float>(),
+            temperatures.data_ptr<float>(),
             batch_size,
             vocab_size
         );
