@@ -74,7 +74,7 @@ def nvfp4_to_fp8_e4m3(nibble):
     bits = tl.where(is_neg, bits | 0x80, bits)
 
     # Bitcast to float8e4nv
-    return bits.to(tl.int8).to(tl.float8e4nv, bitcast=True)
+    return bits.to(tl.uint8).to(tl.float8e4nv, bitcast=True)
 
 
 @triton.jit
@@ -240,28 +240,21 @@ def kernel_unified_attention_2d(
         # Compute max abs per 16-element block: shape [BLOCK_M, Q_NUM_SCALES]
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
 
-        # Compute scale: log2(max/6) clamped to valid FP8 range
+        # Compute scale: max/6 for continuous float32 scaling
         # Normalizing to 6.0 instead of 1.0 provides higher SNR (matches NVFP4 range)
-        LOG2_6: tl.constexpr = 2.58496250072  # log2(6.0)
-        Q_log2_scaled = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max) - LOG2_6, -20.0)
-        Q_scale_f = tl.math.ceil(Q_log2_scaled) + 127.0
-        Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(
-            tl.uint8
-        )  # shape [BLOCK_M, Q_NUM_SCALES]
+        Q_scale_f32 = tl.where(Q_abs_max > 0, Q_abs_max / 6.0, 1e-5)
 
-        # Compute inverse scale for normalization: 2^(127 - scale)
-        # This normalizes Q values to fit in FP8 range
-        Q_inv_scale = tl.math.exp2(127.0 - Q_scale_f)  # shape [BLOCK_M, Q_NUM_SCALES]
-
-        # Broadcast inverse scale to full Q shape: [BLOCK_M, Q_NUM_SCALES] -> [BLOCK_M, HEAD_SIZE_PADDED]
-        Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+        # Broadcast scale to full Q shape: [BLOCK_M, Q_NUM_SCALES] -> [BLOCK_M, HEAD_SIZE_PADDED]
+        Q_scale_f32_full = tl.reshape(
+            tl.broadcast_to(Q_scale_f32[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
 
         # Normalize Q and convert to FP8
-        Q_normalized = Q * Q_inv_scale_full
-        Q_fp8 = Q_normalized.to(tl.float8e4nv)
+        Q_fp8 = (Q / Q_scale_f32_full).to(tl.float8e4nv)
+
+        # We'll use Q_scale_f32 later for dequantization
+        # [BLOCK_M, Q_NUM_SCALES]
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -381,7 +374,7 @@ def kernel_unified_attention_2d(
             K_scale_u8 = tl.load(
                 key_cache_ptr + k_scale_base + offs_ks[None, :] * stride_k_cache_3,
                 mask=k_scale_mask,
-                other=127,
+                other=0x38,
             ).to(tl.uint8)
 
             # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 8]
@@ -435,7 +428,7 @@ def kernel_unified_attention_2d(
                 tile_mask[:, None], (TILE_SIZE, V_NUM_SCALES)
             )
             V_scale_u8 = tl.load(
-                value_cache_ptr + v_scale_off, mask=v_scale_mask, other=127
+                value_cache_ptr + v_scale_off, mask=v_scale_mask, other=0x38
             ).to(tl.uint8)
         else:
             V = V_load
@@ -475,15 +468,17 @@ def kernel_unified_attention_2d(
         # PERFORMANCE OPTIMIZED MATMUL PATHS
         if USE_NVFP4 and USE_NVFP4_TC:
             # Manual dequantization instead of dot_scaled to avoid strict shape requirements
-            Q_scale_v = tl.math.exp2(Q_scale.to(tl.float32) - 127.0).to(tl.bfloat16)
+            # Q_scale_f32 is [BLOCK_M, Q_NUM_SCALES]
             Q_scale_full = tl.reshape(
-                tl.broadcast_to(Q_scale_v[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+                tl.broadcast_to(Q_scale_f32[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
                 (BLOCK_M, HEAD_SIZE_PADDED),
             )
-            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full
+            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full.to(tl.bfloat16)
 
-            K_scale_v = tl.math.exp2(K_scale_reduced.to(tl.float32) - 127.0).to(
-                tl.bfloat16
+            K_scale_v = (
+                K_scale_reduced.to(tl.uint8)
+                .to(tl.float8e4nv, bitcast=True)
+                .to(tl.bfloat16)
             )
             # K is (d, t) = (64, 32). K_scale_v is (t, d//16) = (32, 4).
             # Need K_scale_full to be (64, 32).
@@ -542,7 +537,9 @@ def kernel_unified_attention_2d(
 
         if USE_NVFP4:
             # Dequantize V with 32-element scale groups (4 scales per 128-dim head)
-            V_scale_v = tl.math.exp2(V_scale_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
+            V_scale_v = (
+                V_scale_u8.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            )
             # Broadcast each scale to 16 elements: [TILE_SIZE, 8] -> [TILE_SIZE, 8, 16] -> [TILE_SIZE, 128]
             V_scale_full = tl.reshape(
                 tl.broadcast_to(
@@ -729,24 +726,17 @@ def kernel_unified_attention_3d(
         # Compute max abs per 16-element block: shape [BLOCK_M, Q_NUM_SCALES]
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
 
-        # Compute scale: log2(max/6) clamped to valid FP8 range
-        LOG2_6: tl.constexpr = 2.58496250072  # log2(6.0)
-        Q_log2_scaled = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max) - LOG2_6, -20.0)
-        Q_scale_f = tl.math.ceil(Q_log2_scaled) + 127.0
-        Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(tl.uint8)
+        # Compute scale: max/6 for continuous float32 scaling
+        Q_scale_f32 = tl.where(Q_abs_max > 0, Q_abs_max / 6.0, 1e-10)
 
-        # Compute inverse scale for normalization
-        Q_inv_scale = tl.math.exp2(127.0 - Q_scale_f)
-
-        # Broadcast inverse scale to full Q shape
-        Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+        # Broadcast scale to full Q shape
+        Q_scale_f32_full = tl.reshape(
+            tl.broadcast_to(Q_scale_f32[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
 
-        # Normalize Q and convert to FP8
-        Q_normalized = Q * Q_inv_scale_full
-        Q_fp8 = Q_normalized.to(tl.float8e4nv)
+        # Normalize and convert to FP8
+        Q_fp8 = (Q / Q_scale_f32_full).to(tl.float8e4nv)
 
     # context length for this particular sequences
     context_len = seq_len - cur_batch_query_len
@@ -844,7 +834,7 @@ def kernel_unified_attention_3d(
             K_scale_u8 = tl.load(
                 key_cache_ptr + k_scale_base + offs_ks[None, :] * stride_k_cache_3,
                 mask=k_scale_mask,
-                other=127,
+                other=0x38,
             ).to(tl.uint8)
 
             # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 8]
@@ -895,7 +885,7 @@ def kernel_unified_attention_3d(
                 tile_mask[:, None], (TILE_SIZE, V_NUM_SCALES)
             )
             V_scale_u8 = tl.load(
-                value_cache_ptr + v_scale_off, mask=v_scale_mask, other=127
+                value_cache_ptr + v_scale_off, mask=v_scale_mask, other=0x38
             ).to(tl.uint8)
         else:
             V = V_load[:, :HEAD_SIZE] if HEAD_SIZE_PADDED > HEAD_SIZE else V_load
@@ -935,15 +925,17 @@ def kernel_unified_attention_3d(
         # PERFORMANCE OPTIMIZED MATMUL PATHS (3D)
         if USE_NVFP4 and USE_NVFP4_TC:
             # Manual dequantization instead of dot_scaled (consistent with 2D kernel)
-            Q_scale_v = tl.math.exp2(Q_scale.to(tl.float32) - 127.0).to(tl.bfloat16)
+            # Q_scale_f32 is [BLOCK_Q, Q_NUM_SCALES]
             Q_scale_full = tl.reshape(
-                tl.broadcast_to(Q_scale_v[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+                tl.broadcast_to(Q_scale_f32[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
                 (BLOCK_M, HEAD_SIZE_PADDED),
             )
-            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full
+            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full.to(tl.bfloat16)
 
-            K_scale_v = tl.math.exp2(K_scale_reduced.to(tl.float32) - 127.0).to(
-                tl.bfloat16
+            K_scale_v = (
+                K_scale_reduced.to(tl.uint8)
+                .to(tl.float8e4nv, bitcast=True)
+                .to(tl.bfloat16)
             )
             # K is (d, t) = (64, 32). K_scale_v is (t, d//16) = (32, 4).
             # Need K_scale_full to be (64, 32).
@@ -1002,7 +994,9 @@ def kernel_unified_attention_3d(
 
         if USE_NVFP4:
             # Dequantize V with 16-element scale groups (8 scales per 128-dim head)
-            V_scale_v = tl.math.exp2(V_scale_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
+            V_scale_v = (
+                V_scale_u8.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+            )
             # Broadcast each scale to 16 elements: [TILE_SIZE, 8] -> [TILE_SIZE, 8, 16] -> [TILE_SIZE, 128]
             V_scale_full = tl.reshape(
                 tl.broadcast_to(
