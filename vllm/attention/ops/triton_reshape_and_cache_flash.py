@@ -239,7 +239,7 @@ def triton_reshape_and_cache_flash(
         try:
             import vllm_nvfp4
 
-            print("DEBUG: Using vllm_nvfp4.reshape_and_cache CUDA kernel")
+            # print("DEBUG: Using vllm_nvfp4.reshape_and_cache CUDA kernel")
             vllm_nvfp4.reshape_and_cache(
                 key, value, key_cache, value_cache, slot_mapping
             )

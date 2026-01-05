@@ -233,20 +233,18 @@ def kernel_unified_attention_2d(
         # tl.dot_scaled computes: C = (A @ B) * 2^(A_scale-127) * 2^(B_scale-127)
         # So we need Q_normalized such that Q_normalized * 2^(Q_scale-127) = Q_original
         # ================================================================
-        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # 4 scales for 128-dim head
+        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16  # 8 scales for 128-dim head
+        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 16] to compute per-block max
+        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 16))
 
-        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 32] to compute per-block max
-        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 32))
-
-        # Compute max abs per 32-element block: shape [BLOCK_M, Q_NUM_SCALES]
+        # Compute max abs per 16-element block: shape [BLOCK_M, Q_NUM_SCALES]
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
 
-        # Compute scale: log2(max) clamped to valid FP8 range
-        # FP8 E4M3 max is 448, so scale = ceil(log2(max)) where max > 0
-        # For max <= 0, use neutral scale 127
-        # Bias by 127 for the exponent encoding
-        Q_log2_max = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max), 0.0)
-        Q_scale_f = tl.math.ceil(Q_log2_max) + 127.0
+        # Compute scale: log2(max/6) clamped to valid FP8 range
+        # Normalizing to 6.0 instead of 1.0 provides higher SNR (matches NVFP4 range)
+        LOG2_6: tl.constexpr = 2.58496250072  # log2(6.0)
+        Q_log2_scaled = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max) - LOG2_6, -20.0)
+        Q_scale_f = tl.math.ceil(Q_log2_scaled) + 127.0
         Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(
             tl.uint8
         )  # shape [BLOCK_M, Q_NUM_SCALES]
@@ -257,7 +255,7 @@ def kernel_unified_attention_2d(
 
         # Broadcast inverse scale to full Q shape: [BLOCK_M, Q_NUM_SCALES] -> [BLOCK_M, HEAD_SIZE_PADDED]
         Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 32)),
+            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
 
@@ -362,11 +360,11 @@ def kernel_unified_attention_2d(
             K = nvfp4_to_fp8_e4m3(K_nibble)
 
             # ================================================================
-            # Load K scales (u8) - CUDA now uses 32-element groups
-            # So we have HEAD_SIZE_PADDED // 32 = 4 scales per head
-            # tl.dot_scaled requires rhs_scale shape [N, K // 32] = [TILE_SIZE, 4]
+            # Load K scales (u8) - CUDA now uses 16-element groups
+            # So we have HEAD_SIZE_PADDED // 16 = 8 scales per head
+            # tl.dot_scaled requires rhs_scale shape [N, K // 16] = [TILE_SIZE, 8]
             # ================================================================
-            K_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # = 4 for head_size=128
+            K_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16  # = 8 for head_size=128
             offs_ks = tl.arange(0, K_NUM_SCALES)
 
             k_scale_base = (
@@ -379,15 +377,14 @@ def kernel_unified_attention_2d(
                 tile_mask[:, None], (TILE_SIZE, K_NUM_SCALES)
             )
 
-            # Load scales directly - no max() reduction needed
-            # CUDA stores 4 scales at positions: DATA_BYTES + [0, 1, 2, 3]
+            # Load scales directly - CUDA stores 8 scales at positions: DATA_BYTES + [0, 1, ..., 7]
             K_scale_u8 = tl.load(
                 key_cache_ptr + k_scale_base + offs_ks[None, :] * stride_k_cache_3,
                 mask=k_scale_mask,
                 other=127,
             ).to(tl.uint8)
 
-            # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 4]
+            # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 8]
             # This matches tl.dot_scaled rhs_scale requirement exactly
             K_scale_reduced = K_scale_u8
         else:
@@ -422,11 +419,11 @@ def kernel_unified_attention_2d(
             V = nvfp4_to_fp8_e4m3(V_nibble)
 
             # ================================================================
-            # Load V scales (u8) - CUDA now uses 32-element groups
-            # So we have HEAD_SIZE_PADDED // 32 = 4 scales per head
-            # Stored at positions: DATA_BYTES + [0, 1, 2, 3]
+            # Load V scales (u8) - CUDA now uses 16-element groups
+            # So we have HEAD_SIZE_PADDED // 16 = 8 scales per head
+            # Stored at positions: DATA_BYTES + [0, 1, ..., 7]
             # ================================================================
-            V_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # = 4 for head_size=128
+            V_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16  # = 8 for head_size=128
             offs_vs = tl.arange(0, V_NUM_SCALES)
             v_scale_off = (
                 physical_block_idx[:, None] * stride_v_cache_0
@@ -477,14 +474,30 @@ def kernel_unified_attention_2d(
 
         # PERFORMANCE OPTIMIZED MATMUL PATHS
         if USE_NVFP4 and USE_NVFP4_TC:
-            S += scale * tl.dot_scaled(
-                Q_fp8,
-                Q_scale,
-                "e4m3",
-                K,
-                K_scale_reduced,
-                "e4m3",
+            # Manual dequantization instead of dot_scaled to avoid strict shape requirements
+            Q_scale_v = tl.math.exp2(Q_scale.to(tl.float32) - 127.0).to(tl.bfloat16)
+            Q_scale_full = tl.reshape(
+                tl.broadcast_to(Q_scale_v[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+                (BLOCK_M, HEAD_SIZE_PADDED),
             )
+            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full
+
+            K_scale_v = tl.math.exp2(K_scale_reduced.to(tl.float32) - 127.0).to(
+                tl.bfloat16
+            )
+            # K is (d, t) = (64, 32). K_scale_v is (t, d//16) = (32, 4).
+            # Need K_scale_full to be (64, 32).
+            K_scale_full = tl.trans(
+                tl.reshape(
+                    tl.broadcast_to(
+                        K_scale_v[:, :, None], (TILE_SIZE, K_NUM_SCALES, 16)
+                    ),
+                    (TILE_SIZE, HEAD_SIZE_PADDED),
+                )
+            )
+            K_deq = K.to(tl.bfloat16) * K_scale_full
+
+            S += scale * tl.dot(Q_deq, K_deq).to(tl.float32)
         elif USE_NVFP4:
             S += scale * tl.dot(Q.to(tl.bfloat16), K.to(tl.bfloat16)).to(tl.float32)
         elif K.dtype.is_fp8():
@@ -530,10 +543,10 @@ def kernel_unified_attention_2d(
         if USE_NVFP4:
             # Dequantize V with 32-element scale groups (4 scales per 128-dim head)
             V_scale_v = tl.math.exp2(V_scale_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
-            # Broadcast each scale to 32 elements: [TILE_SIZE, 4] -> [TILE_SIZE, 4, 32] -> [TILE_SIZE, 128]
+            # Broadcast each scale to 16 elements: [TILE_SIZE, 8] -> [TILE_SIZE, 8, 16] -> [TILE_SIZE, 128]
             V_scale_full = tl.reshape(
                 tl.broadcast_to(
-                    V_scale_v[:, :, None], (TILE_SIZE, HEAD_SIZE_PADDED // 32, 32)
+                    V_scale_v[:, :, None], (TILE_SIZE, HEAD_SIZE_PADDED // 16, 16)
                 ),
                 (TILE_SIZE, HEAD_SIZE_PADDED),
             )
@@ -707,17 +720,19 @@ def kernel_unified_attention_3d(
         # PROPER Q QUANTIZATION FOR FP8 TENSOR CORES (3D kernel)
         # Same logic as 2D kernel for consistency
         # ================================================================
-        Q_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # 4 scales for 128-dim head
+        Q_NUM_SCALES: tl.constexpr = (
+            HEAD_SIZE_PADDED // 16
+        )  # 16-element granularity for Hopper wgmma.scaled
+        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 16] to compute per-block max
+        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 16))
 
-        # Reshape Q to [BLOCK_M, Q_NUM_SCALES, 32] to compute per-block max
-        Q_reshaped = tl.reshape(Q, (BLOCK_M, Q_NUM_SCALES, 32))
-
-        # Compute max abs per 32-element block: shape [BLOCK_M, Q_NUM_SCALES]
+        # Compute max abs per 16-element block: shape [BLOCK_M, Q_NUM_SCALES]
         Q_abs_max = tl.max(tl.abs(Q_reshaped), axis=2)
 
-        # Compute scale: log2(max) clamped to valid FP8 range
-        Q_log2_max = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max), 0.0)
-        Q_scale_f = tl.math.ceil(Q_log2_max) + 127.0
+        # Compute scale: log2(max/6) clamped to valid FP8 range
+        LOG2_6: tl.constexpr = 2.58496250072  # log2(6.0)
+        Q_log2_scaled = tl.where(Q_abs_max > 0, tl.math.log2(Q_abs_max) - LOG2_6, -20.0)
+        Q_scale_f = tl.math.ceil(Q_log2_scaled) + 127.0
         Q_scale = tl.maximum(tl.minimum(Q_scale_f, 255.0), 0.0).to(tl.uint8)
 
         # Compute inverse scale for normalization
@@ -725,7 +740,7 @@ def kernel_unified_attention_3d(
 
         # Broadcast inverse scale to full Q shape
         Q_inv_scale_full = tl.reshape(
-            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 32)),
+            tl.broadcast_to(Q_inv_scale[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
             (BLOCK_M, HEAD_SIZE_PADDED),
         )
 
@@ -808,12 +823,11 @@ def kernel_unified_attention_3d(
             K_nibble = tl.where((offs_d[:, None] & 1) == 0, K_u8 & 0xF, K_u8 >> 4)
             K = nvfp4_to_fp8_e4m3(K_nibble)
 
+            # Load K scales (u8) - CUDA now uses 16-element groups
+            # So we have HEAD_SIZE_PADDED // 16 = 8 scales per head (for 128-dim head)
+            # tl.dot_scaled requires rhs_scale shape [N, K // 16] = [TILE_SIZE, 8]
             # ================================================================
-            # Load K scales (u8) - CUDA now uses 32-element groups
-            # So we have HEAD_SIZE_PADDED // 32 = 4 scales per head
-            # tl.dot_scaled requires rhs_scale shape [N, K // 32] = [TILE_SIZE, 4]
-            # ================================================================
-            K_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # = 4 for head_size=128
+            K_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16
             offs_ks = tl.arange(0, K_NUM_SCALES)
 
             k_scale_base = (
@@ -826,15 +840,14 @@ def kernel_unified_attention_3d(
                 tile_mask[:, None], (TILE_SIZE, K_NUM_SCALES)
             )
 
-            # Load scales directly - no max() reduction needed
-            # CUDA stores 4 scales at positions: DATA_BYTES + [0, 1, 2, 3]
+            # Load scales directly - CUDA stores 8 scales at positions: DATA_BYTES + [0, 1, ..., 7]
             K_scale_u8 = tl.load(
                 key_cache_ptr + k_scale_base + offs_ks[None, :] * stride_k_cache_3,
                 mask=k_scale_mask,
                 other=127,
             ).to(tl.uint8)
 
-            # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 4]
+            # K_scale_u8 shape: [TILE_SIZE, K_NUM_SCALES] = [32, 8]
             # This matches tl.dot_scaled rhs_scale requirement exactly
             K_scale_reduced = K_scale_u8
 
@@ -866,12 +879,11 @@ def kernel_unified_attention_3d(
             V_nibble = tl.where((offs_d[None, :] & 1) == 0, V_u8 & 0xF, V_u8 >> 4)
             V = nvfp4_to_fp8_e4m3(V_nibble)
 
+            # Load V scales (u8) - CUDA now uses 16-element groups
+            # So we have HEAD_SIZE_PADDED // 16 = 8 scales per head
+            # Stored at positions: DATA_BYTES + [0, 1, ..., 7]
             # ================================================================
-            # Load V scales (u8) - CUDA now uses 32-element groups
-            # So we have HEAD_SIZE_PADDED // 32 = 4 scales per head
-            # Stored at positions: DATA_BYTES + [0, 1, 2, 3]
-            # ================================================================
-            V_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 32  # = 4 for head_size=128
+            V_NUM_SCALES: tl.constexpr = HEAD_SIZE_PADDED // 16  # = 8 for head_size=128
             offs_vs = tl.arange(0, V_NUM_SCALES)
             v_scale_off = (
                 physical_block_idx[:, None] * stride_v_cache_0
@@ -922,14 +934,30 @@ def kernel_unified_attention_3d(
 
         # PERFORMANCE OPTIMIZED MATMUL PATHS (3D)
         if USE_NVFP4 and USE_NVFP4_TC:
-            S += scale * tl.dot_scaled(
-                Q_fp8,
-                Q_scale,
-                "e4m3",
-                K,
-                K_scale_reduced,
-                "e4m3",
+            # Manual dequantization instead of dot_scaled (consistent with 2D kernel)
+            Q_scale_v = tl.math.exp2(Q_scale.to(tl.float32) - 127.0).to(tl.bfloat16)
+            Q_scale_full = tl.reshape(
+                tl.broadcast_to(Q_scale_v[:, :, None], (BLOCK_M, Q_NUM_SCALES, 16)),
+                (BLOCK_M, HEAD_SIZE_PADDED),
             )
+            Q_deq = Q_fp8.to(tl.bfloat16) * Q_scale_full
+
+            K_scale_v = tl.math.exp2(K_scale_reduced.to(tl.float32) - 127.0).to(
+                tl.bfloat16
+            )
+            # K is (d, t) = (64, 32). K_scale_v is (t, d//16) = (32, 4).
+            # Need K_scale_full to be (64, 32).
+            K_scale_full = tl.trans(
+                tl.reshape(
+                    tl.broadcast_to(
+                        K_scale_v[:, :, None], (TILE_SIZE, K_NUM_SCALES, 16)
+                    ),
+                    (TILE_SIZE, HEAD_SIZE_PADDED),
+                )
+            )
+            K_deq = K.to(tl.bfloat16) * K_scale_full
+
+            S += scale * tl.dot(Q_deq, K_deq).to(tl.float32)
         elif USE_NVFP4:
             S += scale * tl.dot(Q.to(tl.bfloat16), K.to(tl.bfloat16)).to(tl.float32)
         elif K.dtype.is_fp8():
@@ -973,12 +1001,12 @@ def kernel_unified_attention_3d(
             )
 
         if USE_NVFP4:
-            # Dequantize V with 32-element scale groups (4 scales per 128-dim head)
+            # Dequantize V with 16-element scale groups (8 scales per 128-dim head)
             V_scale_v = tl.math.exp2(V_scale_u8.to(tl.float32) - 127.0).to(tl.bfloat16)
-            # Broadcast each scale to 32 elements: [TILE_SIZE, 4] -> [TILE_SIZE, 4, 32] -> [TILE_SIZE, 128]
+            # Broadcast each scale to 16 elements: [TILE_SIZE, 8] -> [TILE_SIZE, 8, 16] -> [TILE_SIZE, 128]
             V_scale_full = tl.reshape(
                 tl.broadcast_to(
-                    V_scale_v[:, :, None], (TILE_SIZE, HEAD_SIZE_PADDED // 32, 32)
+                    V_scale_v[:, :, None], (TILE_SIZE, HEAD_SIZE_PADDED // 16, 16)
                 ),
                 (TILE_SIZE, HEAD_SIZE_PADDED),
             )
