@@ -39,6 +39,9 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.ops.bad_words import apply_bad_words
+from vllm.v1.sample.ops.penalties import apply_all_penalties
+from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import (
@@ -56,6 +59,37 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 logger = init_logger(__name__)
 
 PADDING_SLOT_ID = -1
+
+
+def _apply_logits_processors_for_draft(
+    logits: torch.Tensor, sampling_metadata: "SamplingMetadata"
+) -> torch.Tensor:
+    """Align drafter preprocessing with the main sampler."""
+    bad_words_token_ids = sampling_metadata.bad_words_token_ids
+    any_penalties_or_bad_words = (
+        bool(bad_words_token_ids) or not sampling_metadata.no_penalties
+    )
+    output_token_ids = sampling_metadata.output_token_ids
+
+    if sampling_metadata.allowed_token_ids_mask is not None:
+        logits.masked_fill_(sampling_metadata.allowed_token_ids_mask, float("-inf"))
+
+    if bad_words_token_ids:
+        apply_bad_words(logits, bad_words_token_ids, output_token_ids)
+
+    for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+        logits = processor.apply(logits)
+
+    if any_penalties_or_bad_words and not sampling_metadata.no_penalties:
+        logits = apply_all_penalties(
+            logits,
+            sampling_metadata.prompt_token_ids,
+            sampling_metadata.presence_penalties,
+            sampling_metadata.frequency_penalties,
+            sampling_metadata.repetition_penalties,
+            output_token_ids,
+        )
+    return logits
 
 
 def sample_draft_tokens(
@@ -79,57 +113,49 @@ def sample_draft_tokens(
         If return_probs=False: Token IDs [batch_size] or [batch_size, num_samples]
         If return_probs=True: (token_ids, probs) where probs is [batch_size, vocab_size]
     """
-    # Fast path: no metadata or all greedy
-    if sampling_metadata is None or sampling_metadata.all_greedy:
+    if sampling_metadata is None:
         if num_samples == 1:
             tokens = logits.argmax(dim=-1)
         else:
             tokens = torch.topk(logits, num_samples, dim=-1).indices
+        return (tokens, None) if return_probs else tokens
 
-        if return_probs:
-            # For greedy, we set draft_prob=1 (handled by rejection sampler)
-            return tokens, None
-        return tokens
+    logits = logits.to(torch.float32)
+    logits = _apply_logits_processors_for_draft(logits, sampling_metadata)
+
+    greedy_tokens = None
+    if not sampling_metadata.all_random:
+        greedy_tokens = logits.argmax(dim=-1)
+        if sampling_metadata.all_greedy:
+            return (greedy_tokens, None) if return_probs else greedy_tokens
 
     assert sampling_metadata.temperature is not None
     temperature = sampling_metadata.temperature
-
-    # Handle mixed greedy/random requests
     if not sampling_metadata.all_random:
-        is_greedy = temperature < _SAMPLING_EPS
-        # Avoid division by zero for greedy requests
-        temperature = torch.where(is_greedy, torch.ones_like(temperature), temperature)
-    else:
-        is_greedy = None
+        temperature = torch.where(temperature < _SAMPLING_EPS, 1.0, temperature)
 
-    # Apply temperature scaling
-    logits_scaled = logits / temperature.unsqueeze(-1)
-    probs = logits_scaled.softmax(dim=-1, dtype=torch.float32)
+    logits = logits / temperature.unsqueeze(-1)
+
+    for processor in sampling_metadata.logitsprocs.argmax_invariant:
+        logits = processor.apply(logits)
+
+    logits = apply_top_k_top_p(logits, sampling_metadata.top_k, sampling_metadata.top_p)
+
+    probs = logits.softmax(dim=-1, dtype=torch.float32)
 
     if num_samples == 1:
-        # Gumbel-max trick for efficient sampling
         u = torch.empty_like(probs).uniform_(1e-10, 1.0)
         gumbel = -torch.log(-torch.log(u))
         draft_tokens = (probs.log() + gumbel).argmax(dim=-1)
-
-        # Override with argmax for greedy requests
-        if is_greedy is not None:
-            greedy_tokens = logits.argmax(dim=-1)
-            draft_tokens = torch.where(is_greedy, greedy_tokens, draft_tokens)
     else:
-        # For multi-sample (tree decoding), sample without replacement
         draft_tokens = torch.multinomial(probs, num_samples, replacement=False)
 
-        # Override with topk for greedy requests
-        if is_greedy is not None:
-            greedy_tokens = torch.topk(logits, num_samples, dim=-1).indices
-            # Expand is_greedy for broadcasting
-            is_greedy_expanded = is_greedy.unsqueeze(-1).expand_as(draft_tokens)
-            draft_tokens = torch.where(is_greedy_expanded, greedy_tokens, draft_tokens)
+    if greedy_tokens is not None:
+        draft_tokens = torch.where(
+            sampling_metadata.temperature < _SAMPLING_EPS, greedy_tokens, draft_tokens
+        )
 
-    if return_probs:
-        return draft_tokens, probs
-    return draft_tokens
+    return (draft_tokens, probs) if return_probs else draft_tokens
 
 
 class EagleProposer:
